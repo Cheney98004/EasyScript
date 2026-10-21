@@ -64,5 +64,10 @@ private:
     bool call(Value callee, uint8_t argCount);
     bool callValue(Value callee, uint8_t argCount);
 
+    bool invokeArrayMethod(ObjArray* arr, const std::string& name, uint8_t argCount, Value receiver);
+    bool invokeStringMethod(ObjString* str, const std::string& name, uint8_t argCount, Value receiver);
+    bool invokeMapMethod(ObjMap* map, const std::string& name, uint8_t argCount, Value receiver);
+    bool invokeRangeMethod(ObjRange* rng, const std::string& name, uint8_t argCount, Value receiver);
+
     void resetStack();
 };

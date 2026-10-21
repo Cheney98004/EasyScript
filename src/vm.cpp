@@ -5,6 +5,8 @@
 #include <sstream>
 #include <cmath>
 #include <fstream>
+#include <algorithm>
+#include <cctype>
 
 // -----------------------------------------------------------------------------
 // 原生函式預設實作
@@ -231,6 +233,448 @@ bool VM::call(Value callee, uint8_t argCount) {
     }
 
     runtimeError("Can only call functions and classes.");
+    return false;
+}
+
+// -----------------------------------------------------------------------------
+// 容器內建方法調用實作 (Built-in Collection Methods)
+// -----------------------------------------------------------------------------
+
+bool VM::invokeArrayMethod(ObjArray* arr, const std::string& name, uint8_t argCount, Value receiver) {
+    Value* args = argCount > 0 ? &stack[stack.size() - argCount] : nullptr;
+
+    auto finish = [this, argCount](Value result) {
+        stack.resize(stack.size() - argCount - 1);
+        push(result);
+        return true;
+    };
+
+    if (name == "length" || name == "size") {
+        if (argCount != 0) {
+            runtimeError("Expected 0 arguments for '%s'.", name.c_str());
+            return false;
+        }
+        return finish(Value(static_cast<int64_t>(arr->elements.size())));
+    }
+    if (name == "push") {
+        for (int i = 0; i < argCount; ++i) {
+            arr->elements.push_back(args[i]);
+        }
+        return finish(Value(static_cast<int64_t>(arr->elements.size())));
+    }
+    if (name == "pop") {
+        if (argCount != 0) {
+            runtimeError("Expected 0 arguments for 'pop'.");
+            return false;
+        }
+        if (arr->elements.empty()) return finish(Value());
+        Value back = arr->elements.back();
+        arr->elements.pop_back();
+        return finish(back);
+    }
+    if (name == "insert") {
+        if (argCount != 2 || !args[0].isInt()) {
+            runtimeError("insert(index: int, value) requires 2 arguments.");
+            return false;
+        }
+        int64_t idx = *args[0].asInt();
+        if (idx < 0) idx = 0;
+        if (idx > static_cast<int64_t>(arr->elements.size())) idx = arr->elements.size();
+        arr->elements.insert(arr->elements.begin() + idx, args[1]);
+        return finish(Value());
+    }
+    if (name == "removeAt") {
+        if (argCount != 1 || !args[0].isInt()) {
+            runtimeError("removeAt(index: int) requires 1 integer argument.");
+            return false;
+        }
+        int64_t idx = *args[0].asInt();
+        if (idx < 0 || static_cast<size_t>(idx) >= arr->elements.size()) {
+            runtimeError("Array index out of bounds: %lld.", idx);
+            return false;
+        }
+        Value removed = arr->elements[idx];
+        arr->elements.erase(arr->elements.begin() + idx);
+        return finish(removed);
+    }
+    if (name == "clear") {
+        if (argCount != 0) {
+            runtimeError("Expected 0 arguments for 'clear'.");
+            return false;
+        }
+        arr->elements.clear();
+        return finish(Value());
+    }
+    if (name == "contains") {
+        if (argCount != 1) {
+            runtimeError("Expected 1 argument for 'contains'.");
+            return false;
+        }
+        bool found = false;
+        for (const auto& elem : arr->elements) {
+            if (elem == args[0]) { found = true; break; }
+        }
+        return finish(Value(found));
+    }
+    if (name == "indexOf") {
+        if (argCount != 1) {
+            runtimeError("Expected 1 argument for 'indexOf'.");
+            return false;
+        }
+        int64_t foundIdx = -1;
+        for (size_t i = 0; i < arr->elements.size(); ++i) {
+            if (arr->elements[i] == args[0]) {
+                foundIdx = static_cast<int64_t>(i);
+                break;
+            }
+        }
+        return finish(Value(foundIdx));
+    }
+    if (name == "join") {
+        std::string delim = ",";
+        if (argCount == 1) {
+            delim = valueToString(args[0]);
+        } else if (argCount > 1) {
+            runtimeError("join() expects 0 or 1 argument.");
+            return false;
+        }
+        std::string result;
+        for (size_t i = 0; i < arr->elements.size(); ++i) {
+            if (i > 0) result += delim;
+            result += valueToString(arr->elements[i]);
+        }
+        GcHandle strH = heap.allocateString(std::move(result));
+        return finish(Value(strH));
+    }
+    if (name == "slice") {
+        if (argCount < 1 || argCount > 2 || !args[0].isInt()) {
+            runtimeError("slice(start: int, [end: int]) expects 1 or 2 integer arguments.");
+            return false;
+        }
+        int64_t len = static_cast<int64_t>(arr->elements.size());
+        int64_t start = *args[0].asInt();
+        if (start < 0) start += len;
+        if (start < 0) start = 0;
+        if (start > len) start = len;
+
+        int64_t end = len;
+        if (argCount == 2) {
+            if (!args[1].isInt()) {
+                runtimeError("slice end index must be an integer.");
+                return false;
+            }
+            end = *args[1].asInt();
+            if (end < 0) end += len;
+            if (end < 0) end = 0;
+            if (end > len) end = len;
+        }
+
+        std::vector<Value> sub;
+        if (start < end) {
+            sub.assign(arr->elements.begin() + start, arr->elements.begin() + end);
+        }
+        GcHandle newArr = heap.allocateArray(std::move(sub));
+        return finish(Value(newArr));
+    }
+    if (name == "reverse") {
+        if (argCount != 0) {
+            runtimeError("Expected 0 arguments for 'reverse'.");
+            return false;
+        }
+        std::reverse(arr->elements.begin(), arr->elements.end());
+        return finish(receiver);
+    }
+
+    runtimeError("Array has no method '%s'.", name.c_str());
+    return false;
+}
+
+bool VM::invokeStringMethod(ObjString* str, const std::string& name, uint8_t argCount, Value receiver) {
+    Value* args = argCount > 0 ? &stack[stack.size() - argCount] : nullptr;
+
+    auto finish = [this, argCount](Value result) {
+        stack.resize(stack.size() - argCount - 1);
+        push(result);
+        return true;
+    };
+
+    if (name == "length" || name == "size") {
+        if (argCount != 0) {
+            runtimeError("Expected 0 arguments for '%s'.", name.c_str());
+            return false;
+        }
+        return finish(Value(static_cast<int64_t>(str->text.size())));
+    }
+    if (name == "substring" || name == "slice") {
+        if (argCount < 1 || argCount > 2 || !args[0].isInt()) {
+            runtimeError("%s(start: int, [end: int]) expects 1 or 2 integer arguments.", name.c_str());
+            return false;
+        }
+        int64_t len = static_cast<int64_t>(str->text.size());
+        int64_t start = *args[0].asInt();
+        if (start < 0) start += len;
+        if (start < 0) start = 0;
+        if (start > len) start = len;
+
+        int64_t end = len;
+        if (argCount == 2) {
+            if (!args[1].isInt()) {
+                runtimeError("End index must be an integer.");
+                return false;
+            }
+            end = *args[1].asInt();
+            if (end < 0) end += len;
+            if (end < 0) end = 0;
+            if (end > len) end = len;
+        }
+
+        std::string sub = (start < end) ? str->text.substr(start, end - start) : "";
+        GcHandle newStr = heap.allocateString(std::move(sub));
+        return finish(Value(newStr));
+    }
+    if (name == "indexOf") {
+        if (argCount < 1 || argCount > 2) {
+            runtimeError("indexOf(target: string, [start: int]) expects 1 or 2 arguments.");
+            return false;
+        }
+        std::string target = valueToString(args[0]);
+        size_t startPos = 0;
+        if (argCount == 2) {
+            if (!args[1].isInt()) {
+                runtimeError("Start position must be an integer.");
+                return false;
+            }
+            startPos = std::max(int64_t(0), *args[1].asInt());
+        }
+        size_t pos = str->text.find(target, startPos);
+        int64_t res = (pos == std::string::npos) ? -1 : static_cast<int64_t>(pos);
+        return finish(Value(res));
+    }
+    if (name == "contains") {
+        if (argCount != 1) {
+            runtimeError("contains(target: string) expects 1 argument.");
+            return false;
+        }
+        std::string target = valueToString(args[0]);
+        bool found = (str->text.find(target) != std::string::npos);
+        return finish(Value(found));
+    }
+    if (name == "startsWith") {
+        if (argCount != 1) {
+            runtimeError("startsWith(prefix: string) expects 1 argument.");
+            return false;
+        }
+        std::string prefix = valueToString(args[0]);
+        bool sw = str->text.starts_with(prefix);
+        return finish(Value(sw));
+    }
+    if (name == "endsWith") {
+        if (argCount != 1) {
+            runtimeError("endsWith(suffix: string) expects 1 argument.");
+            return false;
+        }
+        std::string suffix = valueToString(args[0]);
+        bool ew = str->text.ends_with(suffix);
+        return finish(Value(ew));
+    }
+    if (name == "toUpper") {
+        if (argCount != 0) {
+            runtimeError("toUpper() expects 0 arguments.");
+            return false;
+        }
+        std::string res = str->text;
+        for (char& c : res) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        GcHandle newStr = heap.allocateString(std::move(res));
+        return finish(Value(newStr));
+    }
+    if (name == "toLower") {
+        if (argCount != 0) {
+            runtimeError("toLower() expects 0 arguments.");
+            return false;
+        }
+        std::string res = str->text;
+        for (char& c : res) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        GcHandle newStr = heap.allocateString(std::move(res));
+        return finish(Value(newStr));
+    }
+    if (name == "trim") {
+        if (argCount != 0) {
+            runtimeError("trim() expects 0 arguments.");
+            return false;
+        }
+        const std::string& s = str->text;
+        size_t first = s.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos) {
+            return finish(Value(heap.allocateString("")));
+        }
+        size_t last = s.find_last_not_of(" \t\r\n");
+        return finish(Value(heap.allocateString(s.substr(first, last - first + 1))));
+    }
+    if (name == "split") {
+        if (argCount > 1) {
+            runtimeError("split([delimiter: string]) expects 0 or 1 argument.");
+            return false;
+        }
+        std::string delim = (argCount == 1) ? valueToString(args[0]) : " ";
+        std::vector<Value> parts;
+        if (delim.empty()) {
+            for (char c : str->text) {
+                parts.push_back(Value(heap.allocateString(std::string(1, c))));
+            }
+        } else {
+            size_t start = 0;
+            size_t pos = 0;
+            while ((pos = str->text.find(delim, start)) != std::string::npos) {
+                std::string token = str->text.substr(start, pos - start);
+                parts.push_back(Value(heap.allocateString(std::move(token))));
+                start = pos + delim.length();
+            }
+            parts.push_back(Value(heap.allocateString(str->text.substr(start))));
+        }
+        GcHandle arrH = heap.allocateArray(std::move(parts));
+        return finish(Value(arrH));
+    }
+    if (name == "replace") {
+        if (argCount != 2) {
+            runtimeError("replace(from: string, to: string) expects 2 arguments.");
+            return false;
+        }
+        std::string from = valueToString(args[0]);
+        std::string to = valueToString(args[1]);
+        if (from.empty()) {
+            return finish(receiver);
+        }
+        std::string res = str->text;
+        size_t startPos = 0;
+        while ((startPos = res.find(from, startPos)) != std::string::npos) {
+            res.replace(startPos, from.length(), to);
+            startPos += to.length();
+        }
+        GcHandle newStr = heap.allocateString(std::move(res));
+        return finish(Value(newStr));
+    }
+
+    runtimeError("String has no method '%s'.", name.c_str());
+    return false;
+}
+
+bool VM::invokeMapMethod(ObjMap* map, const std::string& name, uint8_t argCount, Value /*receiver*/) {
+    Value* args = argCount > 0 ? &stack[stack.size() - argCount] : nullptr;
+
+    auto finish = [this, argCount](Value result) {
+        stack.resize(stack.size() - argCount - 1);
+        push(result);
+        return true;
+    };
+
+    if (name == "length" || name == "size") {
+        if (argCount != 0) {
+            runtimeError("Expected 0 arguments for '%s'.", name.c_str());
+            return false;
+        }
+        return finish(Value(static_cast<int64_t>(map->table.size())));
+    }
+    if (name == "has" || name == "contains") {
+        if (argCount != 1) {
+            runtimeError("has(key) expects 1 argument.");
+            return false;
+        }
+        return finish(Value(map->table.find(args[0]) != map->table.end()));
+    }
+    if (name == "remove") {
+        if (argCount != 1) {
+            runtimeError("remove(key) expects 1 argument.");
+            return false;
+        }
+        auto it = map->table.find(args[0]);
+        if (it != map->table.end()) {
+            Value val = it->second;
+            map->table.erase(it);
+            return finish(val);
+        }
+        return finish(Value());
+    }
+    if (name == "keys") {
+        if (argCount != 0) {
+            runtimeError("keys() expects 0 arguments.");
+            return false;
+        }
+        std::vector<Value> keys;
+        keys.reserve(map->table.size());
+        for (const auto& [k, v] : map->table) {
+            keys.push_back(k);
+        }
+        GcHandle arrH = heap.allocateArray(std::move(keys));
+        return finish(Value(arrH));
+    }
+    if (name == "values") {
+        if (argCount != 0) {
+            runtimeError("values() expects 0 arguments.");
+            return false;
+        }
+        std::vector<Value> vals;
+        vals.reserve(map->table.size());
+        for (const auto& [k, v] : map->table) {
+            vals.push_back(v);
+        }
+        GcHandle arrH = heap.allocateArray(std::move(vals));
+        return finish(Value(arrH));
+    }
+    if (name == "clear") {
+        if (argCount != 0) {
+            runtimeError("clear() expects 0 arguments.");
+            return false;
+        }
+        map->table.clear();
+        return finish(Value());
+    }
+
+    runtimeError("Map has no method '%s'.", name.c_str());
+    return false;
+}
+
+bool VM::invokeRangeMethod(ObjRange* rng, const std::string& name, uint8_t argCount, Value /*receiver*/) {
+    auto finish = [this, argCount](Value result) {
+        stack.resize(stack.size() - argCount - 1);
+        push(result);
+        return true;
+    };
+
+    if (name == "start") {
+        if (argCount != 0) { runtimeError("start expects 0 arguments."); return false; }
+        return finish(Value(rng->start));
+    }
+    if (name == "end") {
+        if (argCount != 0) { runtimeError("end expects 0 arguments."); return false; }
+        return finish(Value(rng->end));
+    }
+    if (name == "step") {
+        if (argCount != 0) { runtimeError("step expects 0 arguments."); return false; }
+        return finish(Value(rng->step));
+    }
+    if (name == "length" || name == "size") {
+        if (argCount != 0) { runtimeError("length expects 0 arguments."); return false; }
+        int64_t len = 0;
+        if (rng->step > 0 && rng->end > rng->start) {
+            len = (rng->end - rng->start + rng->step - 1) / rng->step;
+        } else if (rng->step < 0 && rng->end < rng->start) {
+            len = (rng->start - rng->end - rng->step - 1) / (-rng->step);
+        }
+        return finish(Value(len));
+    }
+    if (name == "toArray") {
+        if (argCount != 0) { runtimeError("toArray() expects 0 arguments."); return false; }
+        std::vector<Value> elems;
+        if (rng->step > 0) {
+            for (int64_t v = rng->start; v < rng->end; v += rng->step) elems.push_back(Value(v));
+        } else if (rng->step < 0) {
+            for (int64_t v = rng->start; v > rng->end; v += rng->step) elems.push_back(Value(v));
+        }
+        GcHandle arrH = heap.allocateArray(std::move(elems));
+        return finish(Value(arrH));
+    }
+
+    runtimeError("Range has no method '%s'.", name.c_str());
     return false;
 }
 
@@ -754,12 +1198,61 @@ InterpretResult VM::run(size_t stopDepth) {
 
                 Value target = pop();
                 if (!target.isObject()) {
-                    runtimeError("Only instances and modules have properties.");
+                    runtimeError("Only instances, modules, and collections have properties.");
+                    return InterpretResult::RUNTIME_ERROR;
+                }
+
+                GcObject* gcObj = heap.get(*target.asObject());
+                if (!gcObj) {
+                    runtimeError("Invalid object handle.");
+                    return InterpretResult::RUNTIME_ERROR;
+                }
+
+                // 支援容器屬性讀取
+                if (auto* arr = gcObj->as<ObjArray>()) {
+                    if (strObj->text == "length" || strObj->text == "size") {
+                        push(Value(static_cast<int64_t>(arr->elements.size())));
+                        break;
+                    }
+                    runtimeError("Undefined array property '%s'.", strObj->text.c_str());
+                    return InterpretResult::RUNTIME_ERROR;
+                }
+                if (auto* str = gcObj->as<ObjString>()) {
+                    if (strObj->text == "length" || strObj->text == "size") {
+                        push(Value(static_cast<int64_t>(str->text.size())));
+                        break;
+                    }
+                    runtimeError("Undefined string property '%s'.", strObj->text.c_str());
+                    return InterpretResult::RUNTIME_ERROR;
+                }
+                if (auto* map = gcObj->as<ObjMap>()) {
+                    if (strObj->text == "length" || strObj->text == "size") {
+                        push(Value(static_cast<int64_t>(map->table.size())));
+                        break;
+                    }
+                    runtimeError("Undefined map property '%s'.", strObj->text.c_str());
+                    return InterpretResult::RUNTIME_ERROR;
+                }
+                if (auto* rng = gcObj->as<ObjRange>()) {
+                    if (strObj->text == "start") { push(Value(rng->start)); break; }
+                    if (strObj->text == "end") { push(Value(rng->end)); break; }
+                    if (strObj->text == "step") { push(Value(rng->step)); break; }
+                    if (strObj->text == "length" || strObj->text == "size") {
+                        int64_t len = 0;
+                        if (rng->step > 0 && rng->end > rng->start) {
+                            len = (rng->end - rng->start + rng->step - 1) / rng->step;
+                        } else if (rng->step < 0 && rng->end < rng->start) {
+                            len = (rng->start - rng->end - rng->step - 1) / (-rng->step);
+                        }
+                        push(Value(len));
+                        break;
+                    }
+                    runtimeError("Undefined range property '%s'.", strObj->text.c_str());
                     return InterpretResult::RUNTIME_ERROR;
                 }
 
                 // 支援 ObjModule 屬性存取 (e.g. Math.PI)
-                if (auto* mod = heap.getAs<ObjModule>(*target.asObject())) {
+                if (auto* mod = gcObj->as<ObjModule>()) {
                     auto it = mod->exports.find(strObj->text);
                     if (it != mod->exports.end()) {
                         push(it->second);
@@ -769,9 +1262,9 @@ InterpretResult VM::run(size_t stopDepth) {
                     return InterpretResult::RUNTIME_ERROR;
                 }
 
-                auto* instance = heap.getAs<ObjInstance>(*target.asObject());
+                auto* instance = gcObj->as<ObjInstance>();
                 if (!instance) {
-                    runtimeError("Only instances and modules have properties.");
+                    runtimeError("Only instances, modules, and collections have properties.");
                     return InterpretResult::RUNTIME_ERROR;
                 }
 
@@ -827,12 +1320,44 @@ InterpretResult VM::run(size_t stopDepth) {
 
                 Value receiver = peek(argCount);
                 if (!receiver.isObject()) {
-                    runtimeError("Only instances and modules have methods.");
+                    runtimeError("Only instances, modules, and collections have methods.");
                     return InterpretResult::RUNTIME_ERROR;
                 }
 
+                GcObject* gcObj = heap.get(*receiver.asObject());
+                if (!gcObj) {
+                    runtimeError("Calling method on invalid object.");
+                    return InterpretResult::RUNTIME_ERROR;
+                }
+
+                // 檢查是否為容器內建方法
+                if (auto* arr = gcObj->as<ObjArray>()) {
+                    if (!invokeArrayMethod(arr, strObj->text, argCount, receiver)) {
+                        return InterpretResult::RUNTIME_ERROR;
+                    }
+                    break;
+                }
+                if (auto* str = gcObj->as<ObjString>()) {
+                    if (!invokeStringMethod(str, strObj->text, argCount, receiver)) {
+                        return InterpretResult::RUNTIME_ERROR;
+                    }
+                    break;
+                }
+                if (auto* map = gcObj->as<ObjMap>()) {
+                    if (!invokeMapMethod(map, strObj->text, argCount, receiver)) {
+                        return InterpretResult::RUNTIME_ERROR;
+                    }
+                    break;
+                }
+                if (auto* rng = gcObj->as<ObjRange>()) {
+                    if (!invokeRangeMethod(rng, strObj->text, argCount, receiver)) {
+                        return InterpretResult::RUNTIME_ERROR;
+                    }
+                    break;
+                }
+
                 // 支援模組函式調用 (e.g. Math.sqrt(16))
-                if (auto* mod = heap.getAs<ObjModule>(*receiver.asObject())) {
+                if (auto* mod = gcObj->as<ObjModule>()) {
                     auto it = mod->exports.find(strObj->text);
                     if (it != mod->exports.end()) {
                         stack[stack.size() - argCount - 1] = it->second;
@@ -846,9 +1371,9 @@ InterpretResult VM::run(size_t stopDepth) {
                     return InterpretResult::RUNTIME_ERROR;
                 }
 
-                auto* instance = heap.getAs<ObjInstance>(*receiver.asObject());
+                auto* instance = gcObj->as<ObjInstance>();
                 if (!instance) {
-                    runtimeError("Only instances and modules have methods.");
+                    runtimeError("Only instances, modules, and collections have methods.");
                     return InterpretResult::RUNTIME_ERROR;
                 }
 
