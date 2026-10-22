@@ -2,6 +2,7 @@
 #include "compiler.hpp"
 #include "serializer.hpp"
 #include "jit.hpp"
+#include "dynamic_lib.hpp"
 #include <cstdarg>
 #include <chrono>
 #include <sstream>
@@ -211,6 +212,29 @@ Value VM::peek(int distance) const {
 void VM::defineNative(const std::string& name, NativeFn function, int arity) {
     GcHandle handle = heap.allocate<ObjNativeFn>(function, name, arity);
     globals[name] = Value(handle);
+}
+
+VM::~VM() {
+    resetStack();
+    modules.clear();
+    globals.clear();
+    heap.freeAll();
+
+    for (void* lib : loadedLibraries) {
+        if (lib) easyscript::freeDynamicLibrary(lib);
+    }
+    loadedLibraries.clear();
+}
+
+void VM::defineModuleNative(ObjModule* mod, const std::string& name, NativeFn function, int arity) {
+    if (!mod) return;
+    GcHandle handle = heap.allocate<ObjNativeFn>(function, name, arity);
+    mod->exports[name] = Value(handle);
+}
+
+void VM::defineModuleValue(ObjModule* mod, const std::string& name, Value value) {
+    if (!mod) return;
+    mod->exports[name] = value;
 }
 
 std::optional<Value> VM::getGlobal(const std::string& name) const {
@@ -1073,10 +1097,91 @@ bool VM::invokeRangeMethod(ObjRange* rng, const std::string& name, uint8_t argCo
     return false;
 }
 
+ObjModule* VM::loadNativeModule(const std::string& fullPath, const std::string& modName) {
+    void* lib = easyscript::loadDynamicLibrary(fullPath);
+    if (!lib) {
+        runtimeError("Could not load dynamic library '%s': %s", fullPath.c_str(), easyscript::getDynamicLibraryError().c_str());
+        return nullptr;
+    }
+
+    using PluginInitFn = bool (*)(VM*, ObjModule*);
+    auto initFn = reinterpret_cast<PluginInitFn>(easyscript::getDynamicSymbol(lib, "easyscript_module_init"));
+
+    if (!initFn) {
+        // 嘗試尋找具名進入點 easyscript_module_init_<cleanName>
+        std::string cleanName = modName;
+        size_t lastSlash = cleanName.find_last_of("/\\");
+        if (lastSlash != std::string::npos) {
+            cleanName = cleanName.substr(lastSlash + 1);
+        }
+        if (cleanName.ends_with(".dll") || cleanName.ends_with(".so")) {
+            cleanName = cleanName.substr(0, cleanName.size() - 4);
+        } else if (cleanName.ends_with(".dylib")) {
+            cleanName = cleanName.substr(0, cleanName.size() - 6);
+        }
+        if (cleanName.starts_with("lib")) {
+            cleanName = cleanName.substr(3);
+        }
+        std::string namedSym = "easyscript_module_init_" + cleanName;
+        initFn = reinterpret_cast<PluginInitFn>(easyscript::getDynamicSymbol(lib, namedSym));
+    }
+
+    if (!initFn) {
+        runtimeError("Dynamic library '%s' does not export 'easyscript_module_init' entry point.", fullPath.c_str());
+        easyscript::freeDynamicLibrary(lib);
+        return nullptr;
+    }
+
+    GcHandle modHandle = heap.allocate<ObjModule>(modName);
+    auto* mod = heap.getAs<ObjModule>(modHandle);
+    modules[modName] = modHandle;
+    modules[fullPath] = modHandle;
+    loadedLibraries.push_back(lib);
+
+    bool ok = initFn(this, mod);
+    if (!ok) {
+        runtimeError("Initialization failed for native module '%s'.", modName.c_str());
+        return nullptr;
+    }
+
+    return mod;
+}
+
 ObjModule* VM::loadModule(const std::string& path) {
     auto it = modules.find(path);
     if (it != modules.end()) {
         return heap.getAs<ObjModule>(it->second);
+    }
+
+    std::vector<std::string> searchBases;
+    searchBases.push_back(path);
+
+    bool isRelativeOrAbsolute = path.starts_with("./") || path.starts_with("../") || 
+                                (path.size() >= 2 && path[1] == ':') || path.starts_with("/");
+    if (!isRelativeOrAbsolute) {
+        searchBases.push_back("./" + path);
+        searchBases.push_back("./lib/" + path);
+        searchBases.push_back("./plugins/" + path);
+
+        const char* envPath = std::getenv("EASYSCRIPT_PATH");
+        if (envPath && *envPath) {
+            std::string envStr(envPath);
+            size_t start = 0;
+            char delimiter = ';';
+#if !defined(_WIN32)
+            delimiter = ':';
+#endif
+            while (start < envStr.size()) {
+                size_t end = envStr.find(delimiter, start);
+                if (end == std::string::npos) end = envStr.size();
+                std::string dir = envStr.substr(start, end - start);
+                if (!dir.empty()) {
+                    if (dir.back() != '/' && dir.back() != '\\') dir += "/";
+                    searchBases.push_back(dir + path);
+                }
+                start = end + 1;
+            }
+        }
     }
 
     std::vector<std::string> candidates;
@@ -1093,22 +1198,32 @@ ObjModule* VM::loadModule(const std::string& path) {
         }
     };
 
-    addCandidate(path);
-
-    if (path.ends_with(".esc") || path.ends_with(".ecs")) {
-        std::string base = path.substr(0, path.size() - 4);
-        addCandidate(base + ".esc");
-        addCandidate(base + ".ecs");
-        addCandidate(base + ".easy");
-    } else if (path.ends_with(".easy")) {
-        std::string base = path.substr(0, path.size() - 5);
-        addCandidate(base + ".esc");
-        addCandidate(base + ".ecs");
-    } else {
-        // 沒有副檔名時，優先載入預編譯的 .esc / .ecs 字節碼，其次載入 .easy 原始碼
-        addCandidate(path + ".esc");
-        addCandidate(path + ".ecs");
-        addCandidate(path + ".easy");
+    for (const auto& base : searchBases) {
+        if (base.ends_with(".esc") || base.ends_with(".ecs") || base.ends_with(".easy") || easyscript::isDynamicLibraryPath(base)) {
+            addCandidate(base);
+        } else {
+            addCandidate(base + ".esc");
+            addCandidate(base + ".ecs");
+            addCandidate(base + ".easy");
+#if defined(_WIN32) || defined(__CYGWIN__)
+            addCandidate(base + ".dll");
+            size_t slash = base.find_last_of("/\\");
+            if (slash != std::string::npos) {
+                addCandidate(base.substr(0, slash + 1) + "lib" + base.substr(slash + 1) + ".dll");
+            } else {
+                addCandidate("lib" + base + ".dll");
+            }
+#else
+            addCandidate(base + ".so");
+            addCandidate(base + ".dylib");
+            size_t slash = base.find_last_of("/\\");
+            if (slash != std::string::npos) {
+                addCandidate(base.substr(0, slash + 1) + "lib" + base.substr(slash + 1) + ".so");
+            } else {
+                addCandidate("lib" + base + ".so");
+            }
+#endif
+        }
     }
 
     std::string foundPath;
@@ -1129,6 +1244,11 @@ ObjModule* VM::loadModule(const std::string& path) {
     if (foundIt != modules.end()) {
         modules[path] = foundIt->second;
         return heap.getAs<ObjModule>(foundIt->second);
+    }
+
+    // 若找到的是原生動態鏈結庫 (.dll / .so / .dylib)
+    if (easyscript::isDynamicLibraryPath(foundPath)) {
+        return loadNativeModule(foundPath, path);
     }
 
     ObjFunction* fn = nullptr;
@@ -2132,11 +2252,10 @@ InterpretResult VM::run(size_t stopDepth) {
                 auto nameStr = heap.getAs<ObjString>(*nameVal.asObject());
 
                 ObjModule* mod = loadModule(pathStr->text);
-                frame = &frames.back();
                 if (!mod) {
-                    runtimeError("Could not load module '%s'.", pathStr->text.c_str());
                     return InterpretResult::RUNTIME_ERROR;
                 }
+                frame = &frames.back();
                 globals[nameStr->text] = Value(modules[pathStr->text]);
                 break;
             }
@@ -2148,11 +2267,10 @@ InterpretResult VM::run(size_t stopDepth) {
                 auto symStr = heap.getAs<ObjString>(*symVal.asObject());
 
                 ObjModule* mod = loadModule(pathStr->text);
-                frame = &frames.back();
                 if (!mod) {
-                    runtimeError("Could not load module '%s'.", pathStr->text.c_str());
                     return InterpretResult::RUNTIME_ERROR;
                 }
+                frame = &frames.back();
                 auto it = mod->exports.find(symStr->text);
                 if (it == mod->exports.end()) {
                     runtimeError("Module '%s' does not export '%s'.", pathStr->text.c_str(), symStr->text.c_str());

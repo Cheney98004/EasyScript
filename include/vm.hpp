@@ -37,7 +37,7 @@ struct TryHandler {
 class VM {
 public:
     VM();
-    ~VM() = default;
+    ~VM();
 
     // 解譯並執行原始碼
     InterpretResult interpret(std::string_view source, const std::string& modulePath = "<main>");
@@ -47,9 +47,12 @@ public:
 
     // 模組載入與註冊
     ObjModule* loadModule(const std::string& path);
+    ObjModule* loadNativeModule(const std::string& fullPath, const std::string& modName);
 
-    // 註冊 C++ 原生函式至全域環境
+    // 註冊 C++ 原生函式至全域環境或模組
     void defineNative(const std::string& name, NativeFn function, int arity = -1);
+    void defineModuleNative(ObjModule* mod, const std::string& name, NativeFn function, int arity = -1);
+    void defineModuleValue(ObjModule* mod, const std::string& name, Value value);
 
     // 存取 Heap
     Heap& getHeap() noexcept { return heap; }
@@ -99,6 +102,7 @@ private:
 
     std::vector<GcHandle> openUpvalues;
     std::vector<TryHandler> tryHandlers;
+    std::vector<void*> loadedLibraries;
 
     GcHandle captureUpvalue(Value* local);
     void closeUpvalues(Value* last);

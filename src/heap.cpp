@@ -7,7 +7,7 @@ Heap::Heap(size_t initialThreshold)
     slots.push_back(HeapSlot{nullptr, false});
 }
 
-Heap::~Heap() {
+void Heap::freeAll() {
     stringPool.clear();
     for (size_t i = 1; i < slots.size(); ++i) {
         if (slots[i].inUse && slots[i].object != nullptr) {
@@ -16,6 +16,10 @@ Heap::~Heap() {
             slots[i].inUse = false;
         }
     }
+}
+
+Heap::~Heap() {
+    freeAll();
 }
 
 GcHandle Heap::insertObject(GcObject* obj) {

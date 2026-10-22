@@ -25,6 +25,7 @@ class Heap {
 public:
     explicit Heap(size_t initialThreshold = 1024 * 1024); // 預設 1MB 門檻
     ~Heap();
+    void freeAll();
 
     // 禁止複製
     Heap(const Heap&) = delete;
