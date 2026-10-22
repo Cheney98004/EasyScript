@@ -38,34 +38,6 @@ Value nativeClock(int, Value*) {
     return Value(seconds);
 }
 
-// 內建 Math 函式
-Value mathSqrt(int argCount, Value* args) {
-    if (argCount < 1 || !args[0].isNumber()) return Value(0.0);
-    return Value(std::sqrt(*args[0].asNumber()));
-}
-
-Value mathPow(int argCount, Value* args) {
-    if (argCount < 2 || !args[0].isNumber() || !args[1].isNumber()) return Value(0.0);
-    return Value(std::pow(*args[0].asNumber(), *args[1].asNumber()));
-}
-
-Value mathAbs(int argCount, Value* args) {
-    if (argCount < 1) return Value(0.0);
-    if (args[0].isInt()) return Value(std::abs(*args[0].asInt()));
-    if (args[0].isDouble()) return Value(std::abs(*args[0].asDouble()));
-    return Value(0.0);
-}
-
-Value mathFloor(int argCount, Value* args) {
-    if (argCount < 1 || !args[0].isNumber()) return Value(0.0);
-    return Value(std::floor(*args[0].asNumber()));
-}
-
-Value mathCeil(int argCount, Value* args) {
-    if (argCount < 1 || !args[0].isNumber()) return Value(0.0);
-    return Value(std::ceil(*args[0].asNumber()));
-}
-
 } // namespace
 
 VM::VM() {
@@ -81,29 +53,6 @@ VM::VM() {
     });
     defineNative("print", nativePrint, -1);
     defineNative("clock", nativeClock, 0);
-    initBuiltinModules();
-}
-
-void VM::initBuiltinModules() {
-    // 註冊 std/math 內建模組
-    GcHandle mathHandle = heap.allocate<ObjModule>("std/math");
-    auto* mathMod = heap.getAs<ObjModule>(mathHandle);
-
-    auto addMathFn = [this, mathMod](const std::string& name, NativeFn fn, int arity) {
-        GcHandle h = heap.allocate<ObjNativeFn>(fn, name, arity);
-        mathMod->exports[name] = Value(h);
-    };
-
-    addMathFn("sqrt", mathSqrt, 1);
-    addMathFn("pow", mathPow, 2);
-    addMathFn("abs", mathAbs, 1);
-    addMathFn("floor", mathFloor, 1);
-    addMathFn("ceil", mathCeil, 1);
-
-    mathMod->exports["PI"] = Value(3.141592653589793);
-    mathMod->exports["E"] = Value(2.718281828459045);
-
-    modules["std/math"] = mathHandle;
 }
 
 void VM::resetStack() {
@@ -439,6 +388,35 @@ bool VM::invokeFromJit(Value* receiverSlot, const std::string& name, uint8_t arg
             }
         } else {
             runtimeError("Module '%s' does not export '%s'.", mod->path.c_str(), name.c_str());
+        }
+    } else if (auto* klass = gcObj->as<ObjClass>()) {
+        Value fnVal;
+        auto sIt = klass->staticFields.find(name);
+        if (sIt != klass->staticFields.end()) {
+            fnVal = sIt->second;
+        } else {
+            auto mIt = klass->methodSlots.find(name);
+            if (mIt != klass->methodSlots.end()) {
+                fnVal = klass->vtable[mIt->second];
+            } else {
+                auto directIt = klass->methods.find(name);
+                if (directIt != klass->methods.end()) {
+                    fnVal = directIt->second;
+                }
+            }
+        }
+        if (!fnVal.isNull()) {
+            stack[stack.size() - argCount - 1] = fnVal;
+            size_t frameCountBefore = frames.size();
+            success = call(fnVal, argCount);
+            if (success) {
+                if (frames.size() > frameCountBefore) {
+                    InterpretResult r = run(frameCountBefore);
+                    success = (r == InterpretResult::OK);
+                }
+            }
+        } else {
+            runtimeError("Class '%s' has no static method '%s'.", klass->name.c_str(), name.c_str());
         }
     }
 
@@ -1163,6 +1141,15 @@ ObjModule* VM::loadModule(const std::string& path) {
         searchBases.push_back("./lib/" + path);
         searchBases.push_back("./plugins/" + path);
 
+        std::string altPath = path;
+        std::replace(altPath.begin(), altPath.end(), '/', '_');
+        if (altPath != path) {
+            searchBases.push_back(altPath);
+            searchBases.push_back("./" + altPath);
+            searchBases.push_back("./lib/" + altPath);
+            searchBases.push_back("./plugins/" + altPath);
+        }
+
         const char* envPath = std::getenv("EASYSCRIPT_PATH");
         if (envPath && *envPath) {
             std::string envStr(envPath);
@@ -1178,6 +1165,9 @@ ObjModule* VM::loadModule(const std::string& path) {
                 if (!dir.empty()) {
                     if (dir.back() != '/' && dir.back() != '\\') dir += "/";
                     searchBases.push_back(dir + path);
+                    if (altPath != path) {
+                        searchBases.push_back(dir + altPath);
+                    }
                 }
                 start = end + 1;
             }
@@ -2014,6 +2004,27 @@ InterpretResult VM::run(size_t stopDepth) {
                     return InterpretResult::RUNTIME_ERROR;
                 }
 
+                // 支援 ObjClass 靜態欄位與方法存取 (e.g. Color.RED, Terminal.clear)
+                if (auto* klass = gcObj->as<ObjClass>()) {
+                    auto sIt = klass->staticFields.find(strObj->text);
+                    if (sIt != klass->staticFields.end()) {
+                        push(sIt->second);
+                        break;
+                    }
+                    auto mIt = klass->methodSlots.find(strObj->text);
+                    if (mIt != klass->methodSlots.end()) {
+                        push(klass->vtable[mIt->second]);
+                        break;
+                    }
+                    auto directMethodIt = klass->methods.find(strObj->text);
+                    if (directMethodIt != klass->methods.end()) {
+                        push(directMethodIt->second);
+                        break;
+                    }
+                    runtimeError("Class '%s' has no static property '%s'.", klass->name.c_str(), strObj->text.c_str());
+                    return InterpretResult::RUNTIME_ERROR;
+                }
+
                 runtimeError("Only instances, modules, and collections have properties.");
                 return InterpretResult::RUNTIME_ERROR;
             }
@@ -2026,13 +2037,19 @@ InterpretResult VM::run(size_t stopDepth) {
                 Value target = pop();
 
                 if (!target.isObject()) {
-                    runtimeError("Only instances have fields.");
+                    runtimeError("Only instances and classes have fields.");
                     return InterpretResult::RUNTIME_ERROR;
+                }
+
+                if (auto* klass = heap.getAs<ObjClass>(*target.asObject())) {
+                    klass->staticFields[strObj->text] = val;
+                    push(val);
+                    break;
                 }
 
                 auto* instance = heap.getAs<ObjInstance>(*target.asObject());
                 if (!instance) {
-                    runtimeError("Only instances have fields.");
+                    runtimeError("Only instances and classes have fields.");
                     return InterpretResult::RUNTIME_ERROR;
                 }
 
@@ -2174,6 +2191,35 @@ InterpretResult VM::run(size_t stopDepth) {
                         break;
                     }
                     runtimeError("Module '%s' does not export '%s'.", mod->path.c_str(), strObj->text.c_str());
+                    return InterpretResult::RUNTIME_ERROR;
+                }
+
+                // 支援類別靜態方法調用 (e.g. Terminal.clear())
+                if (auto* klass = gcObj->as<ObjClass>()) {
+                    Value method;
+                    auto sIt = klass->staticFields.find(strObj->text);
+                    if (sIt != klass->staticFields.end()) {
+                        method = sIt->second;
+                    } else {
+                        auto mIt = klass->methodSlots.find(strObj->text);
+                        if (mIt != klass->methodSlots.end()) {
+                            method = klass->vtable[mIt->second];
+                        } else {
+                            auto dIt = klass->methods.find(strObj->text);
+                            if (dIt != klass->methods.end()) {
+                                method = dIt->second;
+                            }
+                        }
+                    }
+                    if (!method.isNull()) {
+                        stack[stack.size() - argCount - 1] = method;
+                        if (!call(method, argCount)) {
+                            return InterpretResult::RUNTIME_ERROR;
+                        }
+                        frame = &frames.back();
+                        break;
+                    }
+                    runtimeError("Class '%s' has no static method '%s'.", klass->name.c_str(), strObj->text.c_str());
                     return InterpretResult::RUNTIME_ERROR;
                 }
 

@@ -3,3 +3,5 @@
 /*.esc
 /*.ecs
 *.dll
+/plugins
+/tests

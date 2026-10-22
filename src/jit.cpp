@@ -309,6 +309,22 @@ void easyscript_jit_get_property_cached(VM* vm, Value* target, const Value* name
             *target = it->second;
             return;
         }
+    } else if (auto* klass = gcObj->as<ObjClass>()) {
+        auto sIt = klass->staticFields.find(strObj->text);
+        if (sIt != klass->staticFields.end()) {
+            *target = sIt->second;
+            return;
+        }
+        auto mIt = klass->methodSlots.find(strObj->text);
+        if (mIt != klass->methodSlots.end()) {
+            *target = klass->vtable[mIt->second];
+            return;
+        }
+        auto directIt = klass->methods.find(strObj->text);
+        if (directIt != klass->methods.end()) {
+            *target = directIt->second;
+            return;
+        }
     }
     vm->jitRuntimeError("Undefined property '" + strObj->text + "'.");
     *target = Value();
@@ -317,12 +333,19 @@ void easyscript_jit_get_property_cached(VM* vm, Value* target, const Value* name
 void easyscript_jit_set_property_cached(VM* vm, Value* target, const Value* nameVal, const Value* val, JitPropertySite* ps) {
     if (!vm || !target || !val || !nameVal) return;
     if (!target->isObject()) {
-        vm->jitRuntimeError("Only instances have fields.");
+        vm->jitRuntimeError("Only instances and classes have fields.");
+        return;
+    }
+    if (auto* klass = vm->getHeap().getAs<ObjClass>(*target->asObject())) {
+        auto* strObj = vm->getHeap().getAs<ObjString>(*nameVal->asObject());
+        if (strObj) {
+            klass->staticFields[strObj->text] = *val;
+        }
         return;
     }
     auto* instance = vm->getHeap().getAs<ObjInstance>(*target->asObject());
     if (!instance) {
-        vm->jitRuntimeError("Only instances have fields.");
+        vm->jitRuntimeError("Only instances and classes have fields.");
         return;
     }
     uint32_t slot = UINT32_MAX;

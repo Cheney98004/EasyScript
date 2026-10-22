@@ -89,7 +89,6 @@ private:
     std::unordered_map<std::string, GcHandle> modules;
     ObjModule* currentModule{nullptr};
 
-    void initBuiltinModules();
     InterpretResult run(size_t stopDepth = 0);
     void runtimeError(const char* format, ...);
     bool call(Value callee, uint8_t argCount);

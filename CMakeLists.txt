@@ -59,20 +59,28 @@ target_link_libraries(easyscript PRIVATE easyscript_core)
 set_target_properties(easyscript PROPERTIES ENABLE_EXPORTS ON)
 
 # -----------------------------------------------------------------------------
-# 範例動態鏈結庫外掛 (Sample Dynamic Extension Plugin)
+# 標準庫與外掛動態鏈結庫 (Standard Library & Extension Plugins)
 # -----------------------------------------------------------------------------
-add_library(sample_plugin SHARED tests/plugins/sample_plugin.cpp)
-target_link_libraries(sample_plugin PRIVATE easyscript_core)
-target_include_directories(sample_plugin PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-set_target_properties(sample_plugin PROPERTIES
-    PREFIX ""
-    OUTPUT_NAME "sample_plugin"
-)
+function(add_easyscript_plugin target_name source_file output_name)
+    add_library(${target_name} SHARED ${source_file})
+    target_link_libraries(${target_name} PRIVATE easyscript_core)
+    target_include_directories(${target_name} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    set_target_properties(${target_name} PROPERTIES
+        PREFIX ""
+        OUTPUT_NAME ${output_name}
+    )
+    add_custom_command(TARGET ${target_name} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_SOURCE_DIR}/plugins"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:${target_name}>" "${CMAKE_CURRENT_SOURCE_DIR}/plugins/"
+    )
+endfunction()
 
-add_custom_command(TARGET sample_plugin POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_SOURCE_DIR}/plugins"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:sample_plugin>" "${CMAKE_CURRENT_SOURCE_DIR}/plugins/"
-)
+add_easyscript_plugin(sample_plugin tests/plugins/sample_plugin.cpp sample_plugin)
+add_easyscript_plugin(std_fs src/stdlib/std_fs.cpp std_fs)
+add_easyscript_plugin(std_path src/stdlib/std_path.cpp std_path)
+add_easyscript_plugin(std_os src/stdlib/std_os.cpp std_os)
+add_easyscript_plugin(std_math src/stdlib/std_math.cpp std_math)
+add_easyscript_plugin(std_io src/stdlib/std_io.cpp std_io)
 
 # 測試可執行檔 alias
-add_custom_target(easyscript_test DEPENDS easyscript sample_plugin)
+add_custom_target(easyscript_test DEPENDS easyscript sample_plugin std_fs std_path std_os std_math std_io)

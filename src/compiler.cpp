@@ -1,6 +1,86 @@
 #include "compiler.hpp"
 #include <iostream>
 #include <charconv>
+#include <cctype>
+
+namespace {
+
+std::string unescapeString(std::string_view raw) {
+    std::string result;
+    result.reserve(raw.size());
+    for (size_t i = 0; i < raw.size(); ++i) {
+        if (raw[i] == '\\' && i + 1 < raw.size()) {
+            char next = raw[++i];
+            switch (next) {
+                case 'n': result.push_back('\n'); break;
+                case 'r': result.push_back('\r'); break;
+                case 't': result.push_back('\t'); break;
+                case '\\': result.push_back('\\'); break;
+                case '"': result.push_back('"'); break;
+                case '\'': result.push_back('\''); break;
+                case '0': result.push_back('\0'); break;
+                case 'a': result.push_back('\a'); break;
+                case 'b': result.push_back('\b'); break;
+                case 'f': result.push_back('\f'); break;
+                case 'v': result.push_back('\v'); break;
+                case 'e': result.push_back('\033'); break;
+                case 'x': { // 16進制位元組 \xHH
+                    if (i + 2 < raw.size() && 
+                        std::isxdigit(static_cast<unsigned char>(raw[i + 1])) && 
+                        std::isxdigit(static_cast<unsigned char>(raw[i + 2]))) {
+                        char hex[3] = {raw[i + 1], raw[i + 2], '\0'};
+                        char val = static_cast<char>(std::strtol(hex, nullptr, 16));
+                        result.push_back(val);
+                        i += 2;
+                    } else {
+                        result.push_back('\\');
+                        result.push_back('x');
+                    }
+                    break;
+                }
+                case 'u': { // 16進制 Unicode \uHHHH
+                    if (i + 4 < raw.size() &&
+                        std::isxdigit(static_cast<unsigned char>(raw[i + 1])) &&
+                        std::isxdigit(static_cast<unsigned char>(raw[i + 2])) &&
+                        std::isxdigit(static_cast<unsigned char>(raw[i + 3])) &&
+                        std::isxdigit(static_cast<unsigned char>(raw[i + 4]))) {
+                        char hex[5] = {raw[i + 1], raw[i + 2], raw[i + 3], raw[i + 4], '\0'};
+                        uint32_t codepoint = static_cast<uint32_t>(std::strtoul(hex, nullptr, 16));
+                        i += 4;
+                        // 轉為 UTF-8 編碼
+                        if (codepoint <= 0x7F) {
+                            result.push_back(static_cast<char>(codepoint));
+                        } else if (codepoint <= 0x7FF) {
+                            result.push_back(static_cast<char>(0xC0 | ((codepoint >> 6) & 0x1F)));
+                            result.push_back(static_cast<char>(0x80 | (codepoint & 0x3F)));
+                        } else if (codepoint <= 0xFFFF) {
+                            result.push_back(static_cast<char>(0xE0 | ((codepoint >> 12) & 0x0F)));
+                            result.push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F)));
+                            result.push_back(static_cast<char>(0x80 | (codepoint & 0x3F)));
+                        } else if (codepoint <= 0x10FFFF) {
+                            result.push_back(static_cast<char>(0xF0 | ((codepoint >> 18) & 0x07)));
+                            result.push_back(static_cast<char>(0x80 | ((codepoint >> 12) & 0x3F)));
+                            result.push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F)));
+                            result.push_back(static_cast<char>(0x80 | (codepoint & 0x3F)));
+                        }
+                    } else {
+                        result.push_back('\\');
+                        result.push_back('u');
+                    }
+                    break;
+                }
+                default:
+                    result.push_back(next);
+                    break;
+            }
+        } else {
+            result.push_back(raw[i]);
+        }
+    }
+    return result;
+}
+
+} // namespace
 
 Compiler::Compiler(Heap& heap, std::string_view source)
     : heap(heap), lexer(source) {
@@ -727,7 +807,7 @@ void Compiler::importDeclaration() {
         consume(TokenType::STRING, "Expect module path string.");
 
         std::string_view pathLexeme = previous.lexeme;
-        std::string pathText(pathLexeme.substr(1, pathLexeme.size() - 2));
+        std::string pathText = unescapeString(pathLexeme.substr(1, pathLexeme.size() - 2));
         GcHandle pathHandle = heap.allocateString(pathText);
         uint8_t pathConstant = makeConstant(Value(pathHandle));
 
@@ -736,6 +816,28 @@ void Compiler::importDeclaration() {
             emitBytes(static_cast<uint8_t>(OpCode::OP_IMPORT_NAME), pathConstant);
             emitByte(symConstant);
         }
+
+        consume(TokenType::SEMICOLON, "Expect ';' after import.");
+    } else if (match(TokenType::STRING)) {
+        // 支援簡寫形式: import "std/fs"; -> 自動以模組路徑基底名稱 "fs" 註冊
+        std::string_view pathLexeme = previous.lexeme;
+        std::string pathText = unescapeString(pathLexeme.substr(1, pathLexeme.size() - 2));
+        GcHandle pathHandle = heap.allocateString(pathText);
+        uint8_t pathConstant = makeConstant(Value(pathHandle));
+
+        std::string modName = pathText;
+        size_t slash = modName.find_last_of("/\\");
+        if (slash != std::string::npos) modName = modName.substr(slash + 1);
+        if (modName.ends_with(".easy") || modName.ends_with(".esc") || modName.ends_with(".ecs") || modName.ends_with(".dll")) {
+            modName = modName.substr(0, modName.find_last_of('.'));
+        }
+        if (modName.starts_with("lib")) modName = modName.substr(3);
+
+        Token nameToken{TokenType::IDENTIFIER, modName, previous.line, previous.column};
+        uint8_t nameConstant = identifierConstant(nameToken);
+
+        emitBytes(static_cast<uint8_t>(OpCode::OP_IMPORT_MODULE), pathConstant);
+        emitByte(nameConstant);
 
         consume(TokenType::SEMICOLON, "Expect ';' after import.");
     } else if (match(TokenType::IDENTIFIER)) {
@@ -747,7 +849,7 @@ void Compiler::importDeclaration() {
         consume(TokenType::STRING, "Expect module path string.");
 
         std::string_view pathLexeme = previous.lexeme;
-        std::string pathText(pathLexeme.substr(1, pathLexeme.size() - 2));
+        std::string pathText = unescapeString(pathLexeme.substr(1, pathLexeme.size() - 2));
         GcHandle pathHandle = heap.allocateString(pathText);
         uint8_t pathConstant = makeConstant(Value(pathHandle));
 
@@ -756,7 +858,7 @@ void Compiler::importDeclaration() {
 
         consume(TokenType::SEMICOLON, "Expect ';' after import.");
     } else {
-        error("Expect '{' or module name after 'import'.");
+        error("Expect '{', string, or module name after 'import'.");
     }
 }
 
@@ -1224,7 +1326,7 @@ void Compiler::number(bool) {
 
 void Compiler::string(bool) {
     std::string_view content = previous.lexeme.substr(1, previous.lexeme.size() - 2);
-    GcHandle strHandle = heap.allocateString(std::string(content));
+    GcHandle strHandle = heap.allocateString(unescapeString(content));
     emitConstant(Value(strHandle));
     lastExpressionType = Type::String();
 }
@@ -1492,7 +1594,7 @@ void Compiler::mapLiteral(bool) {
 void Compiler::interpolation(bool) {
     std::string_view head = previous.lexeme;
     std::string_view prefix = head.substr(1, head.size() - 3);
-    GcHandle headStr = heap.allocateString(std::string(prefix));
+    GcHandle headStr = heap.allocateString(unescapeString(prefix));
     emitConstant(Value(headStr));
 
     expression();
@@ -1501,7 +1603,7 @@ void Compiler::interpolation(bool) {
     while (match(TokenType::INTERPOLATION_MID)) {
         std::string_view mid = previous.lexeme;
         std::string_view midText = mid.substr(1, mid.size() - 3);
-        GcHandle midStr = heap.allocateString(std::string(midText));
+        GcHandle midStr = heap.allocateString(unescapeString(midText));
         emitConstant(Value(midStr));
         emitOp(OpCode::OP_STRING_CONCAT);
 
@@ -1512,7 +1614,7 @@ void Compiler::interpolation(bool) {
     if (match(TokenType::INTERPOLATION_TAIL)) {
         std::string_view tail = previous.lexeme;
         std::string_view suffix = tail.substr(1, tail.size() - 2);
-        GcHandle tailStr = heap.allocateString(std::string(suffix));
+        GcHandle tailStr = heap.allocateString(unescapeString(suffix));
         emitConstant(Value(tailStr));
         emitOp(OpCode::OP_STRING_CONCAT);
     }
