@@ -15,6 +15,12 @@ public:
     std::vector<Value> constants;
     int upvalueCount{0};
 
+    // JIT 編譯快取與熱點計數
+    void* nativeCode{nullptr};
+    uint32_t invocationCount{0};
+    uint32_t backedgeCount{0};
+    bool jitFailed{false};
+
     explicit ObjFunction(std::string name = "");
 
     void trace(const std::function<void(Value)>& visitor) const override;

@@ -65,6 +65,15 @@ public:
     // 將任意 Value（含堆積物件）轉為字串表示
     std::string valueToString(Value value);
 
+    // JIT 呼叫與全域輔助介面
+    bool callFromJit(Value* calleeSlot, uint8_t argCount);
+    Value jitGetGlobal(const std::string& name);
+    Value jitGetGlobal(const Value& nameVal);
+    void jitSetGlobal(const std::string& name, Value val);
+    void jitSetGlobal(const Value& nameVal, Value val);
+    void jitDefineGlobal(const std::string& name, Value val);
+    void jitDefineGlobal(const Value& nameVal, Value val);
+
 private:
     Heap heap;
     std::vector<CallFrame> frames;

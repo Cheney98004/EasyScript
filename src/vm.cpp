@@ -1,6 +1,7 @@
 #include "vm.hpp"
 #include "compiler.hpp"
 #include "serializer.hpp"
+#include "jit.hpp"
 #include <cstdarg>
 #include <chrono>
 #include <sstream>
@@ -218,6 +219,126 @@ std::optional<Value> VM::getGlobal(const std::string& name) const {
     return std::nullopt;
 }
 
+Value VM::jitGetGlobal(const std::string& name) {
+    auto it = globals.find(name);
+    if (it != globals.end()) return it->second;
+    runtimeError("Undefined variable '%s'.", name.c_str());
+    return Value();
+}
+
+Value VM::jitGetGlobal(const Value& nameVal) {
+    if (nameVal.isObject()) {
+        auto* str = heap.getAs<ObjString>(*nameVal.asObject());
+        if (str) return jitGetGlobal(str->text);
+    }
+    return Value();
+}
+
+void VM::jitSetGlobal(const std::string& name, Value val) {
+    auto it = globals.find(name);
+    if (it == globals.end()) {
+        runtimeError("Undefined variable '%s'.", name.c_str());
+        return;
+    }
+    it->second = val;
+}
+
+void VM::jitSetGlobal(const Value& nameVal, Value val) {
+    if (nameVal.isObject()) {
+        auto* str = heap.getAs<ObjString>(*nameVal.asObject());
+        if (str) jitSetGlobal(str->text, val);
+    }
+}
+
+void VM::jitDefineGlobal(const std::string& name, Value val) {
+    globals[name] = val;
+}
+
+void VM::jitDefineGlobal(const Value& nameVal, Value val) {
+    if (nameVal.isObject()) {
+        auto* str = heap.getAs<ObjString>(*nameVal.asObject());
+        if (str) jitDefineGlobal(str->text, val);
+    }
+}
+
+bool VM::callFromJit(Value* calleeSlot, uint8_t argCount) {
+    Value callee = calleeSlot[0];
+    if (callee.isObject()) {
+        GcObject* obj = heap.get(*callee.asObject());
+        if (obj) {
+            // 原生 C++ 函式
+            if (auto* native = obj->as<ObjNativeFn>()) {
+                if (native->arity != -1 && native->arity != argCount) {
+                    runtimeError("Expected %d arguments but got %d.", native->arity, argCount);
+                    return false;
+                }
+                Value res = native->function(argCount, calleeSlot + 1);
+                calleeSlot[0] = res;
+                return true;
+            }
+
+            // 腳本函式或閉包
+            ObjFunction* fn = nullptr;
+            if (auto* f = obj->as<ObjFunction>()) fn = f;
+            else if (auto* c = obj->as<ObjClosure>()) fn = heap.getAs<ObjFunction>(c->function);
+
+            if (fn) {
+                if (argCount != fn->arity) {
+                    runtimeError("Expected %d arguments but got %d.", fn->arity, argCount);
+                    return false;
+                }
+                if (!fn->jitFailed && fn->nativeCode == nullptr && fn->upvalueCount == 0) {
+                    if (++fn->invocationCount >= 20) {
+                        JitCompiler::compile(fn);
+                    }
+                }
+                if (fn->nativeCode != nullptr && !fn->jitFailed) {
+                    JitNativeFn nativeFn = reinterpret_cast<JitNativeFn>(fn->nativeCode);
+                    Value res;
+                    JitStatus status = nativeFn(this, calleeSlot, &res);
+                    if (status == JitStatus::OK) {
+                        calleeSlot[0] = res;
+                        return true;
+                    }
+                    fn->jitFailed = true;
+                }
+            }
+        }
+    }
+
+    // 落回直譯器
+    size_t savedStackSize = stack.size();
+    size_t savedFrameSize = frames.size();
+
+    for (uint8_t i = 0; i <= argCount; ++i) {
+        push(calleeSlot[i]);
+    }
+
+    if (!call(callee, argCount)) {
+        stack.resize(savedStackSize);
+        return false;
+    }
+
+    // 若 JIT 函式直接執行完成且未入棧幀
+    if (frames.size() == savedFrameSize) {
+        Value res = pop();
+        calleeSlot[0] = res;
+        stack.resize(savedStackSize);
+        return true;
+    }
+
+    InterpretResult result = run(savedFrameSize);
+    if (result != InterpretResult::OK) {
+        stack.resize(savedStackSize);
+        return false;
+    }
+
+    Value retVal = pop();
+    calleeSlot[0] = retVal;
+    stack.resize(savedStackSize);
+    return true;
+}
+
 void VM::runtimeError(const char* format, ...) {
     va_list args;
     va_start(args, format);
@@ -312,12 +433,38 @@ bool VM::call(Value callee, uint8_t argCount) {
         return call(bound->method, argCount);
     }
 
+    auto tryInvokeJit = [this, argCount](ObjFunction* fn) -> std::optional<bool> {
+        if (!fn->jitFailed && fn->nativeCode == nullptr && fn->upvalueCount == 0) {
+            if (++fn->invocationCount >= 20) {
+                JitCompiler::compile(fn);
+            }
+        }
+        if (fn->nativeCode != nullptr && !fn->jitFailed) {
+            Value* slots = &stack[stack.size() - argCount - 1];
+            Value result;
+            JitNativeFn nativeFn = reinterpret_cast<JitNativeFn>(fn->nativeCode);
+            JitStatus status = nativeFn(this, slots, &result);
+            if (status == JitStatus::OK) {
+                stack.resize(stack.size() - argCount - 1);
+                push(result);
+                return true;
+            }
+            // 若發生 Bailout 或執行期錯誤，標記失敗並落回直譯器
+            fn->jitFailed = true;
+        }
+        return std::nullopt;
+    };
+
     // 4. 閉包 (Closure)
     if (auto* closure = obj->as<ObjClosure>()) {
         auto* fn = heap.getAs<ObjFunction>(closure->function);
         if (argCount != fn->arity) {
             runtimeError("Expected %d arguments but got %d.", fn->arity, argCount);
             return false;
+        }
+        if (fn->upvalueCount == 0) {
+            auto jitRes = tryInvokeJit(fn);
+            if (jitRes.has_value()) return *jitRes;
         }
         if (frames.size() >= 256) {
             runtimeError("Stack overflow.");
@@ -333,6 +480,9 @@ bool VM::call(Value callee, uint8_t argCount) {
             runtimeError("Expected %d arguments but got %d.", fn->arity, argCount);
             return false;
         }
+        auto jitRes = tryInvokeJit(fn);
+        if (jitRes.has_value()) return *jitRes;
+
         if (frames.size() >= 256) {
             runtimeError("Stack overflow.");
             return false;
@@ -881,6 +1031,9 @@ ObjModule* VM::loadModule(const std::string& path) {
         push(Value(modHandle));
         frames.push_back(CallFrame{nullptr, fn, fn->bytecode.data(), stack.size() - 1});
         run(currentDepth);
+        if (stack.size() > currentDepth) {
+            pop();
+        }
     }
 
     currentModule = previousModule;
@@ -912,9 +1065,14 @@ InterpretResult VM::execute(ObjFunction* fn, const std::string& modulePath) {
         GcObject* obj = heap.get(*mainIt->second.asObject());
         if (obj && (obj->is<ObjFunction>() || obj->is<ObjClosure>())) {
             push(mainIt->second);
+            size_t frameCountBefore = frames.size();
             if (call(mainIt->second, 0)) {
-                return run();
+                if (frames.size() > frameCountBefore) {
+                    return run();
+                }
+                return InterpretResult::OK;
             }
+            return InterpretResult::RUNTIME_ERROR;
         }
     }
 
@@ -1133,6 +1291,9 @@ InterpretResult VM::run(size_t stopDepth) {
             case OpCode::OP_LOOP: {
                 uint16_t offset = readShort();
                 frame->ip -= offset;
+                if (++frame->function->backedgeCount >= 50 && !frame->function->jitFailed && frame->function->nativeCode == nullptr && frame->function->upvalueCount == 0) {
+                    JitCompiler::compile(frame->function);
+                }
                 break;
             }
 
@@ -1315,6 +1476,7 @@ InterpretResult VM::run(size_t stopDepth) {
 
                 if (frames.size() == stopDepth) {
                     stack.resize(slotOffset);
+                    push(result);
                     return InterpretResult::OK;
                 }
 
