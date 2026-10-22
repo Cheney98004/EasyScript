@@ -51,6 +51,15 @@ struct CompilerUpvalue {
     bool isLocal{false};
 };
 
+// 迴圈編譯狀態 (支援 break 與 continue)
+struct Loop {
+    Loop* enclosing{nullptr};
+    int startOffset{0};
+    int bodyLocalsCount{0};
+    int tryDepth{0};
+    std::vector<int> breakJumps;
+};
+
 // 單一函式的編譯狀態
 struct FunctionState {
     ObjFunction* function{nullptr};
@@ -60,6 +69,7 @@ struct FunctionState {
     std::vector<CompilerUpvalue> upvalues;
     int scopeDepth{0};
     Type returnType{Type::Any()};
+    Loop* currentLoop{nullptr};
 };
 
 // 類別編譯期上下文
@@ -104,6 +114,7 @@ private:
     int lastResolvedGlobalConstant{-1};
 
     Type lastExpressionType{Type::Any()};
+    int currentTryDepth{0};
     std::unordered_map<std::string, Type> globalTypes;
     std::unordered_map<std::string, std::string> classHierarchy;
 
@@ -169,6 +180,8 @@ private:
     void forStatement();
     void forInStatement(Token varToken);
     void returnStatement();
+    void breakStatement();
+    void continueStatement();
     void tryStatement();
     void throwStatement();
     void block();

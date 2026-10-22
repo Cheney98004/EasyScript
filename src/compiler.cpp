@@ -769,6 +769,10 @@ void Compiler::statement() {
         forStatement();
     } else if (match(TokenType::RETURN)) {
         returnStatement();
+    } else if (match(TokenType::BREAK)) {
+        breakStatement();
+    } else if (match(TokenType::CONTINUE)) {
+        continueStatement();
     } else if (match(TokenType::TRY)) {
         tryStatement();
     } else if (match(TokenType::THROW)) {
@@ -849,11 +853,24 @@ void Compiler::whileStatement() {
     int exitJump = emitJump(OpCode::OP_JUMP_IF_FALSE);
     emitOp(OpCode::OP_POP);
 
+    Loop loop;
+    loop.enclosing = currentFunction().currentLoop;
+    loop.startOffset = loopStart;
+    loop.bodyLocalsCount = static_cast<int>(currentFunction().locals.size());
+    loop.tryDepth = currentTryDepth;
+    currentFunction().currentLoop = &loop;
+
     statement();
     emitLoop(loopStart);
 
     patchJump(exitJump);
     emitOp(OpCode::OP_POP);
+
+    for (int breakJump : loop.breakJumps) {
+        patchJump(breakJump);
+    }
+
+    currentFunction().currentLoop = loop.enclosing;
 }
 
 void Compiler::forStatement() {
@@ -905,6 +922,13 @@ void Compiler::forStatement() {
         patchJump(bodyJump);
     }
 
+    Loop loop;
+    loop.enclosing = currentFunction().currentLoop;
+    loop.startOffset = loopStart;
+    loop.bodyLocalsCount = static_cast<int>(currentFunction().locals.size());
+    loop.tryDepth = currentTryDepth;
+    currentFunction().currentLoop = &loop;
+
     statement();
     emitLoop(loopStart);
 
@@ -912,6 +936,12 @@ void Compiler::forStatement() {
         patchJump(exitJump);
         emitOp(OpCode::OP_POP);
     }
+
+    for (int breakJump : loop.breakJumps) {
+        patchJump(breakJump);
+    }
+
+    currentFunction().currentLoop = loop.enclosing;
 
     endScope();
 }
@@ -934,6 +964,13 @@ void Compiler::forInStatement(Token varToken) {
     // 4. 發射 OP_ITER_NEXT
     int exitJump = emitJump(OpCode::OP_ITER_NEXT);
 
+    Loop loop;
+    loop.enclosing = currentFunction().currentLoop;
+    loop.startOffset = loopStart;
+    loop.bodyLocalsCount = static_cast<int>(currentFunction().locals.size());
+    loop.tryDepth = currentTryDepth;
+    currentFunction().currentLoop = &loop;
+
     // 5. 宣告本輪迭代變數 (棧頂正是當前元素)
     beginScope();
     addLocal(varToken);
@@ -950,6 +987,12 @@ void Compiler::forInStatement(Token varToken) {
 
     // 9. 回填結束跳轉
     patchJump(exitJump);
+
+    for (int breakJump : loop.breakJumps) {
+        patchJump(breakJump);
+    }
+
+    currentFunction().currentLoop = loop.enclosing;
 }
 
 void Compiler::returnStatement() {
@@ -979,6 +1022,56 @@ void Compiler::returnStatement() {
     }
 }
 
+void Compiler::breakStatement() {
+    if (currentFunction().currentLoop == nullptr) {
+        error("Can't use 'break' outside of a loop.");
+        return;
+    }
+
+    consume(TokenType::SEMICOLON, "Expect ';' after 'break'.");
+
+    Loop* loop = currentFunction().currentLoop;
+
+    for (int t = currentTryDepth; t > loop->tryDepth; --t) {
+        emitOp(OpCode::OP_POP_TRY);
+    }
+
+    for (int i = static_cast<int>(currentFunction().locals.size()) - 1; i >= loop->bodyLocalsCount; --i) {
+        if (currentFunction().locals[i].isCaptured) {
+            emitOp(OpCode::OP_CLOSE_UPVALUE);
+        } else {
+            emitOp(OpCode::OP_POP);
+        }
+    }
+
+    loop->breakJumps.push_back(emitJump(OpCode::OP_JUMP));
+}
+
+void Compiler::continueStatement() {
+    if (currentFunction().currentLoop == nullptr) {
+        error("Can't use 'continue' outside of a loop.");
+        return;
+    }
+
+    consume(TokenType::SEMICOLON, "Expect ';' after 'continue'.");
+
+    Loop* loop = currentFunction().currentLoop;
+
+    for (int t = currentTryDepth; t > loop->tryDepth; --t) {
+        emitOp(OpCode::OP_POP_TRY);
+    }
+
+    for (int i = static_cast<int>(currentFunction().locals.size()) - 1; i >= loop->bodyLocalsCount; --i) {
+        if (currentFunction().locals[i].isCaptured) {
+            emitOp(OpCode::OP_CLOSE_UPVALUE);
+        } else {
+            emitOp(OpCode::OP_POP);
+        }
+    }
+
+    emitLoop(loop->startOffset);
+}
+
 void Compiler::throwStatement() {
     expression();
     consume(TokenType::SEMICOLON, "Expect ';' after throw statement.");
@@ -996,9 +1089,11 @@ void Compiler::tryStatement() {
     int finallyJumpOffset = static_cast<int>(currentFunction().function->bytecode.size() - 2);
 
     // 2. 編譯 try 區塊
+    currentTryDepth++;
     beginScope();
     block();
     endScope();
+    currentTryDepth--;
 
     // try 正常執行完畢：彈出 TryHandler
     emitOp(OpCode::OP_POP_TRY);
