@@ -261,6 +261,10 @@ void VM::jitDefineGlobal(const Value& nameVal, Value val) {
     }
 }
 
+void VM::jitRuntimeError(const std::string& msg) {
+    runtimeError("%s", msg.c_str());
+}
+
 bool VM::callFromJit(Value* calleeSlot, uint8_t argCount) {
     Value callee = calleeSlot[0];
     if (callee.isObject()) {
@@ -404,7 +408,7 @@ bool VM::call(Value callee, uint8_t argCount) {
             runtimeError("Expected %d arguments but got %d.", native->arity, argCount);
             return false;
         }
-        Value* args = &stack[stack.size() - argCount];
+        Value* args = argCount > 0 ? &stack[stack.size() - argCount] : nullptr;
         Value result = native->function(argCount, args);
         stack.resize(stack.size() - argCount - 1);
         push(result);

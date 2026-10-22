@@ -91,6 +91,7 @@ void easyscript_jit_mul(VM* vm, Value* a, const Value* b) {
 
 void easyscript_jit_div(VM* vm, Value* a, const Value* b) {
     if (b->isNumber() && *b->asNumber() == 0.0) {
+        if (vm) vm->jitRuntimeError("Division by zero.");
         *a = Value();
         return;
     }
@@ -98,13 +99,15 @@ void easyscript_jit_div(VM* vm, Value* a, const Value* b) {
         *a = Value(*a->asInt() / *b->asInt());
     } else if (a->isNumber() && b->isNumber()) {
         *a = Value(*a->asNumber() / *b->asNumber());
-    } else {
+    } else if (vm) {
+        vm->jitRuntimeError("Operands must be numbers.");
         *a = Value();
     }
 }
 
 void easyscript_jit_mod(VM* vm, Value* a, const Value* b) {
     if (b->isNumber() && *b->asNumber() == 0.0) {
+        if (vm) vm->jitRuntimeError("Division by zero.");
         *a = Value();
         return;
     }
@@ -112,7 +115,8 @@ void easyscript_jit_mod(VM* vm, Value* a, const Value* b) {
         *a = Value(*a->asInt() % *b->asInt());
     } else if (a->isDouble() && b->isDouble()) {
         *a = Value(std::fmod(*a->asDouble(), *b->asDouble()));
-    } else {
+    } else if (vm) {
+        vm->jitRuntimeError("Operands must be numbers.");
         *a = Value();
     }
 }
@@ -374,12 +378,6 @@ bool JitCompiler::compile(ObjFunction* fn) {
     auto emitJumpToEpilogue = [&]() {
         a.emitByte(0xE9);
         jumpsToEpilogue.push_back(a.offset());
-        a.emitDword(0);
-    };
-
-    auto emitJumpToBailout = [&]() {
-        a.emitByte(0xE9);
-        jumpsToBailout.push_back(a.offset());
         a.emitDword(0);
     };
 

@@ -73,6 +73,7 @@ public:
     void jitSetGlobal(const Value& nameVal, Value val);
     void jitDefineGlobal(const std::string& name, Value val);
     void jitDefineGlobal(const Value& nameVal, Value val);
+    void jitRuntimeError(const std::string& msg);
 
 private:
     Heap heap;
