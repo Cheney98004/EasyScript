@@ -55,6 +55,10 @@ enum class OpCode : uint8_t {
     // 函式與呼叫
     OP_CALL,            // [arg: uint8_t argCount] 呼叫函式
     OP_RETURN,          // 函式返回
+    OP_CLOSURE,         // [arg: uint8_t fnConstant, uint8_t upvalueCount, (1 byte isLocal, 1 byte index)*] 建立閉包
+    OP_GET_UPVALUE,     // [arg: uint8_t upvalueIndex] 讀取 Upvalue
+    OP_SET_UPVALUE,     // [arg: uint8_t upvalueIndex] 寫入 Upvalue
+    OP_CLOSE_UPVALUE,   // 關閉棧頂 Upvalue 並彈棧
 
     // 輸出與字串內插
     OP_STRING_CONCAT,   // 彈出兩個值，轉字串後相加

@@ -110,6 +110,16 @@ void Compiler::emitReturn() {
     emitOp(OpCode::OP_RETURN);
 }
 
+void Compiler::emitClosure(const FunctionState& finished) {
+    uint8_t fnConstant = makeConstant(Value(finished.functionHandle));
+    emitBytes(static_cast<uint8_t>(OpCode::OP_CLOSURE), fnConstant);
+    emitByte(static_cast<uint8_t>(finished.upvalues.size()));
+    for (const auto& u : finished.upvalues) {
+        emitByte(u.isLocal ? 1 : 0);
+        emitByte(u.index);
+    }
+}
+
 uint8_t Compiler::makeConstant(Value value) {
     auto* fn = currentFunction().function;
     for (size_t i = 0; i < fn->constants.size(); ++i) {
@@ -169,7 +179,11 @@ void Compiler::endScope() {
     auto& state = currentFunction();
     state.scopeDepth--;
     while (!state.locals.empty() && state.locals.back().depth > state.scopeDepth) {
-        emitOp(OpCode::OP_POP);
+        if (state.locals.back().isCaptured) {
+            emitOp(OpCode::OP_CLOSE_UPVALUE);
+        } else {
+            emitOp(OpCode::OP_POP);
+        }
         state.locals.pop_back();
     }
 }
@@ -185,9 +199,12 @@ int Compiler::addLocal(Token name) {
 }
 
 int Compiler::resolveLocal(const Token& name) {
-    const auto& locals = currentFunction().locals;
-    for (int i = static_cast<int>(locals.size()) - 1; i >= 0; --i) {
-        const auto& local = locals[i];
+    return resolveLocal(currentFunction(), name);
+}
+
+int Compiler::resolveLocal(const FunctionState& state, const Token& name) {
+    for (int i = static_cast<int>(state.locals.size()) - 1; i >= 0; --i) {
+        const auto& local = state.locals[i];
         if (local.name.lexeme == name.lexeme) {
             if (local.depth == -1) {
                 error("Can't read local variable in its own initializer.");
@@ -195,7 +212,41 @@ int Compiler::resolveLocal(const Token& name) {
             return i;
         }
     }
-    return -1; // 找不到則視為全域變數
+    return -1;
+}
+
+int Compiler::resolveUpvalue(size_t stateIndex, const Token& name) {
+    if (stateIndex == 0) return -1;
+
+    // 1. 先查外層第一層函式的區域變數
+    int local = resolveLocal(functionStack[stateIndex - 1], name);
+    if (local != -1) {
+        functionStack[stateIndex - 1].locals[local].isCaptured = true;
+        return addUpvalue(functionStack[stateIndex], static_cast<uint8_t>(local), true);
+    }
+
+    // 2. 若無則往更外層遞迴尋找 Upvalue
+    int upvalue = resolveUpvalue(stateIndex - 1, name);
+    if (upvalue != -1) {
+        return addUpvalue(functionStack[stateIndex], static_cast<uint8_t>(upvalue), false);
+    }
+
+    return -1;
+}
+
+int Compiler::addUpvalue(FunctionState& state, uint8_t index, bool isLocal) {
+    for (size_t i = 0; i < state.upvalues.size(); ++i) {
+        const auto& u = state.upvalues[i];
+        if (u.index == index && u.isLocal == isLocal) {
+            return static_cast<int>(i);
+        }
+    }
+    if (state.upvalues.size() >= UINT8_MAX) {
+        error("Too many closure variables in function.");
+        return 0;
+    }
+    state.upvalues.push_back(CompilerUpvalue{index, isLocal});
+    return static_cast<int>(state.upvalues.size() - 1);
 }
 
 void Compiler::declareVariable() {
@@ -450,7 +501,7 @@ void Compiler::method(FunctionType type) {
     FunctionState finished = std::move(functionStack.back());
     functionStack.pop_back();
 
-    emitConstant(Value(finished.functionHandle));
+    emitClosure(finished);
     emitBytes(static_cast<uint8_t>(OpCode::OP_METHOD), constant);
 }
 
@@ -519,7 +570,7 @@ void Compiler::fnDeclaration() {
     FunctionState finished = std::move(functionStack.back());
     functionStack.pop_back();
 
-    emitConstant(Value(finished.functionHandle));
+    emitClosure(finished);
     defineVariable(global);
 }
 
@@ -565,7 +616,7 @@ void Compiler::exportDeclaration() {
         FunctionState finished = std::move(functionStack.back());
         functionStack.pop_back();
 
-        emitConstant(Value(finished.functionHandle));
+        emitClosure(finished);
         defineVariable(global);
         emitBytes(static_cast<uint8_t>(OpCode::OP_EXPORT), global);
     } else if (match(TokenType::LET)) {
@@ -975,7 +1026,7 @@ void Compiler::lambda(bool) {
     FunctionState finished = std::move(functionStack.back());
     functionStack.pop_back();
 
-    emitConstant(Value(finished.functionHandle));
+    emitClosure(finished);
 }
 
 void Compiler::this_(bool) {
@@ -1029,12 +1080,20 @@ void Compiler::namedVariable(Token name, bool canAssign) {
 
     if (arg != -1) {
         lastResolvedLocalSlot = arg;
+        lastResolvedUpvalueSlot = -1;
         lastResolvedGlobalConstant = -1;
         getOp = static_cast<uint8_t>(OpCode::OP_GET_LOCAL);
         setOp = static_cast<uint8_t>(OpCode::OP_SET_LOCAL);
+    } else if ((arg = resolveUpvalue(functionStack.size() - 1, name)) != -1) {
+        lastResolvedLocalSlot = -1;
+        lastResolvedUpvalueSlot = arg;
+        lastResolvedGlobalConstant = -1;
+        getOp = static_cast<uint8_t>(OpCode::OP_GET_UPVALUE);
+        setOp = static_cast<uint8_t>(OpCode::OP_SET_UPVALUE);
     } else {
         arg = identifierConstant(name);
         lastResolvedLocalSlot = -1;
+        lastResolvedUpvalueSlot = -1;
         lastResolvedGlobalConstant = arg;
         getOp = static_cast<uint8_t>(OpCode::OP_GET_GLOBAL);
         setOp = static_cast<uint8_t>(OpCode::OP_SET_GLOBAL);
@@ -1063,6 +1122,8 @@ void Compiler::postfixInc(bool) {
     emitOp(OpCode::OP_ADD);
     if (lastResolvedLocalSlot != -1) {
         emitBytes(static_cast<uint8_t>(OpCode::OP_SET_LOCAL), static_cast<uint8_t>(lastResolvedLocalSlot));
+    } else if (lastResolvedUpvalueSlot != -1) {
+        emitBytes(static_cast<uint8_t>(OpCode::OP_SET_UPVALUE), static_cast<uint8_t>(lastResolvedUpvalueSlot));
     } else if (lastResolvedGlobalConstant != -1) {
         emitBytes(static_cast<uint8_t>(OpCode::OP_SET_GLOBAL), static_cast<uint8_t>(lastResolvedGlobalConstant));
     }
@@ -1073,6 +1134,8 @@ void Compiler::postfixDec(bool) {
     emitOp(OpCode::OP_SUB);
     if (lastResolvedLocalSlot != -1) {
         emitBytes(static_cast<uint8_t>(OpCode::OP_SET_LOCAL), static_cast<uint8_t>(lastResolvedLocalSlot));
+    } else if (lastResolvedUpvalueSlot != -1) {
+        emitBytes(static_cast<uint8_t>(OpCode::OP_SET_UPVALUE), static_cast<uint8_t>(lastResolvedUpvalueSlot));
     } else if (lastResolvedGlobalConstant != -1) {
         emitBytes(static_cast<uint8_t>(OpCode::OP_SET_GLOBAL), static_cast<uint8_t>(lastResolvedGlobalConstant));
     }

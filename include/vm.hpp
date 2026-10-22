@@ -17,6 +17,7 @@ enum class InterpretResult {
 
 // 呼叫訊框 (CallFrame)
 struct CallFrame {
+    ObjClosure* closure{nullptr};
     ObjFunction* function{nullptr};
     const uint8_t* ip{nullptr};
     size_t slotOffset{0}; // 該訊框在運算元棧上的起始位置
@@ -68,6 +69,11 @@ private:
     bool invokeStringMethod(ObjString* str, const std::string& name, uint8_t argCount, Value receiver);
     bool invokeMapMethod(ObjMap* map, const std::string& name, uint8_t argCount, Value receiver);
     bool invokeRangeMethod(ObjRange* rng, const std::string& name, uint8_t argCount, Value receiver);
+
+    std::vector<GcHandle> openUpvalues;
+
+    GcHandle captureUpvalue(Value* local);
+    void closeUpvalues(Value* last);
 
     void resetStack();
 };

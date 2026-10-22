@@ -189,7 +189,11 @@ size_t Heap::sweep() {
 
 size_t Heap::collectGarbage(const std::vector<Value>& roots) {
     // 1. 標記階段 (Mark Roots)
-    for (const auto& root : roots) {
+    std::vector<Value> allRoots = roots;
+    if (rootsCallback) {
+        rootsCallback(allRoots);
+    }
+    for (const auto& root : allRoots) {
         markValue(root);
     }
     for (const auto& temp : tempRoots) {

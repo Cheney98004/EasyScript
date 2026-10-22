@@ -79,6 +79,8 @@ public:
     // 垃圾回收核心 (Mark-Sweep)
     // -------------------------------------------------------------------------
     // 外部可傳入當前 VM 運算元棧或全域環境作為根集合
+    using RootsCallback = std::function<void(std::vector<Value>&)>;
+    void setRootsCallback(RootsCallback cb) { rootsCallback = std::move(cb); }
     size_t collectGarbage(const std::vector<Value>& roots = {});
 
     // -------------------------------------------------------------------------
@@ -94,6 +96,7 @@ private:
     std::vector<HeapSlot> slots;
     std::vector<uint32_t> freeList;
     std::vector<Value> tempRoots;
+    RootsCallback rootsCallback;
 
     // 字串池 (用於 String Interning，弱引用)
     std::unordered_map<std::string_view, GcHandle> stringPool;

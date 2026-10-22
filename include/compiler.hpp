@@ -42,12 +42,19 @@ struct Local {
     bool isCaptured{false};
 };
 
+// 閉包 Upvalue 描述子
+struct CompilerUpvalue {
+    uint8_t index{0};
+    bool isLocal{false};
+};
+
 // 單一函式的編譯狀態
 struct FunctionState {
     ObjFunction* function{nullptr};
     GcHandle functionHandle;
     FunctionType type{FunctionType::SCRIPT};
     std::vector<Local> locals;
+    std::vector<CompilerUpvalue> upvalues;
     int scopeDepth{0};
 };
 
@@ -89,6 +96,7 @@ private:
     ClassCompiler* currentClass{nullptr};
 
     int lastResolvedLocalSlot{-1};
+    int lastResolvedUpvalueSlot{-1};
     int lastResolvedGlobalConstant{-1};
 
     FunctionState& currentFunction() noexcept { return functionStack.back(); }
@@ -112,6 +120,7 @@ private:
     void emitOp(OpCode op);
     void emitBytes(uint8_t byte1, uint8_t byte2);
     void emitReturn();
+    void emitClosure(const FunctionState& finished);
     uint8_t makeConstant(Value value);
     void emitConstant(Value value);
 
@@ -127,6 +136,9 @@ private:
     void endScope();
     int addLocal(Token name);
     int resolveLocal(const Token& name);
+    int resolveLocal(const FunctionState& state, const Token& name);
+    int resolveUpvalue(size_t stateIndex, const Token& name);
+    int addUpvalue(FunctionState& state, uint8_t index, bool isLocal);
     void declareVariable();
     uint8_t parseVariable(std::string_view errorMessage);
     void markInitialized();

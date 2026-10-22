@@ -35,6 +35,10 @@ std::string_view opCodeName(OpCode op) noexcept {
         case OpCode::OP_SET_INDEX:     return "OP_SET_INDEX";
         case OpCode::OP_CALL:          return "OP_CALL";
         case OpCode::OP_RETURN:        return "OP_RETURN";
+        case OpCode::OP_CLOSURE:       return "OP_CLOSURE";
+        case OpCode::OP_GET_UPVALUE:   return "OP_GET_UPVALUE";
+        case OpCode::OP_SET_UPVALUE:   return "OP_SET_UPVALUE";
+        case OpCode::OP_CLOSE_UPVALUE: return "OP_CLOSE_UPVALUE";
         case OpCode::OP_STRING_CONCAT: return "OP_STRING_CONCAT";
         case OpCode::OP_PRINT:         return "OP_PRINT";
         case OpCode::OP_CLASS:         return "OP_CLASS";

@@ -67,6 +67,12 @@ Value mathCeil(int argCount, Value* args) {
 
 VM::VM() {
     resetStack();
+    heap.setRootsCallback([this](std::vector<Value>& roots) {
+        for (const auto& v : stack) roots.push_back(v);
+        for (const auto& [k, v] : globals) roots.push_back(v);
+        for (const auto& [k, h] : modules) roots.push_back(Value(h));
+        for (GcHandle h : openUpvalues) roots.push_back(Value(h));
+    });
     defineNative("print", nativePrint, -1);
     defineNative("clock", nativeClock, 0);
     initBuiltinModules();
@@ -96,7 +102,35 @@ void VM::initBuiltinModules() {
 
 void VM::resetStack() {
     stack.clear();
+    stack.reserve(65536);
     frames.clear();
+    openUpvalues.clear();
+}
+
+GcHandle VM::captureUpvalue(Value* local) {
+    for (GcHandle handle : openUpvalues) {
+        auto* upvalue = heap.getAs<ObjUpvalue>(handle);
+        if (upvalue && upvalue->location == local) {
+            return handle;
+        }
+    }
+
+    GcHandle handle = heap.allocate<ObjUpvalue>(local);
+    openUpvalues.push_back(handle);
+    return handle;
+}
+
+void VM::closeUpvalues(Value* last) {
+    auto it = openUpvalues.begin();
+    while (it != openUpvalues.end()) {
+        auto* upvalue = heap.getAs<ObjUpvalue>(*it);
+        if (upvalue && upvalue->location >= last) {
+            upvalue->close();
+            it = openUpvalues.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 void VM::push(Value value) {
@@ -218,7 +252,22 @@ bool VM::call(Value callee, uint8_t argCount) {
         return call(bound->method, argCount);
     }
 
-    // 4. 腳本編譯函式 (Function)
+    // 4. 閉包 (Closure)
+    if (auto* closure = obj->as<ObjClosure>()) {
+        auto* fn = heap.getAs<ObjFunction>(closure->function);
+        if (argCount != fn->arity) {
+            runtimeError("Expected %d arguments but got %d.", fn->arity, argCount);
+            return false;
+        }
+        if (frames.size() >= 256) {
+            runtimeError("Stack overflow.");
+            return false;
+        }
+        frames.push_back(CallFrame{closure, fn, fn->bytecode.data(), stack.size() - argCount - 1});
+        return true;
+    }
+
+    // 5. 腳本編譯函式 (Function)
     if (auto* fn = obj->as<ObjFunction>()) {
         if (argCount != fn->arity) {
             runtimeError("Expected %d arguments but got %d.", fn->arity, argCount);
@@ -228,7 +277,7 @@ bool VM::call(Value callee, uint8_t argCount) {
             runtimeError("Stack overflow.");
             return false;
         }
-        frames.push_back(CallFrame{fn, fn->bytecode.data(), stack.size() - argCount - 1});
+        frames.push_back(CallFrame{nullptr, fn, fn->bytecode.data(), stack.size() - argCount - 1});
         return true;
     }
 
@@ -716,7 +765,7 @@ ObjModule* VM::loadModule(const std::string& path) {
     if (fn != nullptr) {
         size_t currentDepth = frames.size();
         push(Value(modHandle));
-        frames.push_back(CallFrame{fn, fn->bytecode.data(), stack.size() - 1});
+        frames.push_back(CallFrame{nullptr, fn, fn->bytecode.data(), stack.size() - 1});
         run(currentDepth);
     }
 
@@ -738,7 +787,7 @@ InterpretResult VM::interpret(std::string_view source, const std::string& module
     }
 
     push(Value(heap.allocateString("<script>"))); // 槽位 0
-    frames.push_back(CallFrame{fn, fn->bytecode.data(), 0});
+    frames.push_back(CallFrame{nullptr, fn, fn->bytecode.data(), 0});
 
     InterpretResult res = run();
     if (res != InterpretResult::OK) {
@@ -749,7 +798,7 @@ InterpretResult VM::interpret(std::string_view source, const std::string& module
     auto mainIt = globals.find("main");
     if (mainIt != globals.end() && mainIt->second.isObject()) {
         GcObject* obj = heap.get(*mainIt->second.asObject());
-        if (obj && obj->is<ObjFunction>()) {
+        if (obj && (obj->is<ObjFunction>() || obj->is<ObjClosure>())) {
             push(mainIt->second);
             if (call(mainIt->second, 0)) {
                 return run();
@@ -1131,6 +1180,10 @@ InterpretResult VM::run(size_t stopDepth) {
             case OpCode::OP_RETURN: {
                 Value result = pop();
                 size_t slotOffset = frame->slotOffset;
+
+                // 關閉該函式所有尚未關閉的局部變數 Upvalues
+                closeUpvalues(&stack[slotOffset]);
+
                 frames.pop_back();
 
                 if (frames.size() == stopDepth) {
@@ -1141,6 +1194,50 @@ InterpretResult VM::run(size_t stopDepth) {
                 stack.resize(slotOffset);
                 push(result);
                 frame = &frames.back();
+                break;
+            }
+
+            case OpCode::OP_CLOSURE: {
+                Value fnVal = readConstant();
+                GcHandle fnHandle = *fnVal.asObject();
+                uint8_t upvalueCount = readByte();
+
+                GcHandle closureHandle = heap.allocate<ObjClosure>(fnHandle);
+                push(Value(closureHandle)); // 先推上棧以受 GC 保護
+                auto* closure = heap.getAs<ObjClosure>(closureHandle);
+
+                for (uint8_t i = 0; i < upvalueCount; ++i) {
+                    uint8_t isLocal = readByte();
+                    uint8_t index = readByte();
+                    if (isLocal) {
+                        GcHandle upvalue = captureUpvalue(&stack[frame->slotOffset + index]);
+                        closure->upvalues.push_back(upvalue);
+                    } else {
+                        closure->upvalues.push_back(frame->closure->upvalues[index]);
+                    }
+                }
+                break;
+            }
+
+            case OpCode::OP_GET_UPVALUE: {
+                uint8_t slot = readByte();
+                GcHandle upvalueHandle = frame->closure->upvalues[slot];
+                auto* upvalue = heap.getAs<ObjUpvalue>(upvalueHandle);
+                push(*upvalue->location);
+                break;
+            }
+
+            case OpCode::OP_SET_UPVALUE: {
+                uint8_t slot = readByte();
+                GcHandle upvalueHandle = frame->closure->upvalues[slot];
+                auto* upvalue = heap.getAs<ObjUpvalue>(upvalueHandle);
+                *upvalue->location = peek(0);
+                break;
+            }
+
+            case OpCode::OP_CLOSE_UPVALUE: {
+                closeUpvalues(&stack.back());
+                pop();
                 break;
             }
 
