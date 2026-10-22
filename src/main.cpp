@@ -1,6 +1,7 @@
 #include "vm.hpp"
 #include "compiler.hpp"
 #include "serializer.hpp"
+#include "lsp/lsp_server.hpp"
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -98,6 +99,12 @@ int main(int argc, char* argv[]) {
     if (argc == 1) {
         repl(vm);
     } else if (argc == 2) {
+        std::string arg = argv[1];
+        if (arg == "--lsp") {
+            lsp::LspServer server;
+            server.run();
+            return 0;
+        }
         return runFile(vm, argv[1]);
     } else if (argc >= 3) {
         std::string command = argv[1];

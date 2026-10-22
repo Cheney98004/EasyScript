@@ -5,3 +5,4 @@
 *.dll
 /plugins
 /tests
+/*.py

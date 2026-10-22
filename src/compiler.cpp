@@ -144,13 +144,23 @@ void Compiler::errorAt(const Token& token, std::string_view message) {
     if (panicMode) return;
     panicMode = true;
 
-    std::cerr << "[line " << token.line << "] Error";
-    if (token.type == TokenType::TOKEN_EOF) {
-        std::cerr << " at end";
-    } else if (token.type != TokenType::ERROR) {
-        std::cerr << " at '" << token.lexeme << "'";
+    if (diagnosticSink) {
+        CompilerDiagnostic diag;
+        diag.line = token.line;
+        diag.column = token.column;
+        diag.length = static_cast<int>(token.lexeme.empty() ? 1 : token.lexeme.size());
+        diag.severity = 1;
+        diag.message = std::string(message);
+        diagnosticSink->push_back(std::move(diag));
+    } else {
+        std::cerr << "[line " << token.line << "] Error";
+        if (token.type == TokenType::TOKEN_EOF) {
+            std::cerr << " at end";
+        } else if (token.type != TokenType::ERROR) {
+            std::cerr << " at '" << token.lexeme << "'";
+        }
+        std::cerr << ": " << message << std::endl;
     }
-    std::cerr << ": " << message << std::endl;
 
     hadError = true;
 }

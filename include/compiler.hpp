@@ -87,6 +87,14 @@ struct ParseRule {
     Precedence precedence;
 };
 
+struct CompilerDiagnostic {
+    int line{1};
+    int column{1};
+    int length{1};
+    int severity{1}; // 1 = Error, 2 = Warning
+    std::string message;
+};
+
 // -----------------------------------------------------------------------------
 // Pratt Parser & Bytecode Compiler
 // -----------------------------------------------------------------------------
@@ -97,6 +105,11 @@ public:
     // 核心編譯入口：將原始碼編譯為 ObjFunction
     ObjFunction* compile();
 
+    // LSP 診斷收集槽
+    void setDiagnosticSink(std::vector<CompilerDiagnostic>* sink) noexcept {
+        diagnosticSink = sink;
+    }
+
 private:
     Heap& heap;
     Lexer lexer;
@@ -104,6 +117,7 @@ private:
     Token current;
     bool hadError{false};
     bool panicMode{false};
+    std::vector<CompilerDiagnostic>* diagnosticSink{nullptr};
 
     // 函式編譯棧 (支援巢狀函式/方法編譯)
     std::vector<FunctionState> functionStack;

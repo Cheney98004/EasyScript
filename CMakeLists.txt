@@ -43,6 +43,7 @@ set(EASYSCRIPT_SOURCES
     src/objects/obj_instance.cpp
     src/objects/obj_bound_method.cpp
     src/objects/obj_module.cpp
+    src/lsp/lsp_server.cpp
 )
 
 # 建立核心靜態庫
