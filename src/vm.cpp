@@ -1,5 +1,6 @@
 #include "vm.hpp"
 #include "compiler.hpp"
+#include "serializer.hpp"
 #include <cstdarg>
 #include <chrono>
 #include <sstream>
@@ -792,35 +793,89 @@ ObjModule* VM::loadModule(const std::string& path) {
         return heap.getAs<ObjModule>(it->second);
     }
 
-    std::string filePath = path;
-    if (!filePath.ends_with(".easy")) {
-        filePath += ".easy";
+    std::vector<std::string> candidates;
+    auto addCandidate = [&](const std::string& p) {
+        if (p.empty()) return;
+        if (std::find(candidates.begin(), candidates.end(), p) == candidates.end()) {
+            candidates.push_back(p);
+        }
+        if (p.starts_with("./")) {
+            std::string stripped = p.substr(2);
+            if (std::find(candidates.begin(), candidates.end(), stripped) == candidates.end()) {
+                candidates.push_back(stripped);
+            }
+        }
+    };
+
+    addCandidate(path);
+
+    if (path.ends_with(".esc") || path.ends_with(".ecs")) {
+        std::string base = path.substr(0, path.size() - 4);
+        addCandidate(base + ".esc");
+        addCandidate(base + ".ecs");
+        addCandidate(base + ".easy");
+    } else if (path.ends_with(".easy")) {
+        std::string base = path.substr(0, path.size() - 5);
+        addCandidate(base + ".esc");
+        addCandidate(base + ".ecs");
+    } else {
+        // 沒有副檔名時，優先載入預編譯的 .esc / .ecs 字節碼，其次載入 .easy 原始碼
+        addCandidate(path + ".esc");
+        addCandidate(path + ".ecs");
+        addCandidate(path + ".easy");
     }
 
-    std::ifstream file(filePath);
-    if (!file.is_open()) {
-        if (filePath.starts_with("./")) {
-            file.open(filePath.substr(2));
+    std::string foundPath;
+    for (const auto& candidate : candidates) {
+        std::ifstream test(candidate, std::ios::binary);
+        if (test.is_open()) {
+            foundPath = candidate;
+            break;
         }
     }
 
-    if (!file.is_open()) {
+    if (foundPath.empty()) {
         return nullptr;
     }
 
-    std::stringstream buffer;
-    buffer << file.rdbuf();
-    std::string source = buffer.str();
+    // 檢查快取中是否已有相同實體路徑的模組
+    auto foundIt = modules.find(foundPath);
+    if (foundIt != modules.end()) {
+        modules[path] = foundIt->second;
+        return heap.getAs<ObjModule>(foundIt->second);
+    }
+
+    ObjFunction* fn = nullptr;
+    if (BytecodeDeserializer::isBytecodeFile(foundPath)) {
+        fn = BytecodeDeserializer::deserializeFromFile(heap, foundPath);
+        if (fn == nullptr) {
+            runtimeError("Could not deserialize bytecode module '%s'.", foundPath.c_str());
+            return nullptr;
+        }
+    } else {
+        std::ifstream file(foundPath);
+        if (!file.is_open()) {
+            return nullptr;
+        }
+        std::stringstream buffer;
+        buffer << file.rdbuf();
+        std::string source = buffer.str();
+
+        Compiler compiler(heap, source);
+        fn = compiler.compile();
+        if (fn == nullptr) {
+            return nullptr;
+        }
+    }
 
     GcHandle modHandle = heap.allocate<ObjModule>(path);
     modules[path] = modHandle;
+    modules[foundPath] = modHandle;
     auto* mod = heap.getAs<ObjModule>(modHandle);
 
     ObjModule* previousModule = currentModule;
     currentModule = mod;
 
-    Compiler compiler(heap, source);
-    ObjFunction* fn = compiler.compile();
     if (fn != nullptr) {
         size_t currentDepth = frames.size();
         push(Value(modHandle));

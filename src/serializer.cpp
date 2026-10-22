@@ -133,15 +133,23 @@ void BytecodeSerializer::writeValue(Value val, const Heap& heap, std::ostream& o
     }
 }
 
+bool BytecodeDeserializer::isBytecodeFile(const std::string& filepath) {
+    std::ifstream in(filepath, std::ios::binary);
+    if (!in.is_open()) return false;
+
+    char magic[4];
+    in.read(magic, 4);
+    return in.gcount() == 4 && std::memcmp(magic, MAGIC, 4) == 0;
+}
+
 ObjFunction* BytecodeDeserializer::deserializeFromFile(Heap& heap, const std::string& filepath) {
+    if (!isBytecodeFile(filepath)) return nullptr;
+
     std::ifstream in(filepath, std::ios::binary);
     if (!in.is_open()) return nullptr;
 
     char magic[4];
     in.read(magic, 4);
-    if (!in.good() || std::memcmp(magic, MAGIC, 4) != 0) {
-        return nullptr;
-    }
 
     uint32_t version = 0;
     if (!readRaw(in, version) || version != ESC_VERSION) {

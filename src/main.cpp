@@ -27,16 +27,8 @@ void repl(VM& vm) {
     }
 }
 
-static bool isBytecodeFile(const std::string& path) {
-    std::ifstream file(path, std::ios::binary);
-    if (!file.is_open()) return false;
-    char magic[4];
-    file.read(magic, 4);
-    return file.gcount() == 4 && magic[0] == 'E' && magic[1] == 'S' && magic[2] == 'C' && magic[3] == '\x01';
-}
-
 int runFile(VM& vm, const std::string& path) {
-    if (isBytecodeFile(path)) {
+    if (BytecodeDeserializer::isBytecodeFile(path)) {
         ObjFunction* fn = BytecodeDeserializer::deserializeFromFile(vm.getHeap(), path);
         if (fn == nullptr) {
             std::cerr << "Failed to load bytecode file: " << path << std::endl;

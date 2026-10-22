@@ -18,6 +18,7 @@ private:
 
 class BytecodeDeserializer {
 public:
+    static bool isBytecodeFile(const std::string& filepath);
     static ObjFunction* deserializeFromFile(Heap& heap, const std::string& filepath);
     static ObjFunction* deserialize(Heap& heap, std::istream& in);
 

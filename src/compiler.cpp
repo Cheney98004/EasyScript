@@ -708,15 +708,6 @@ void Compiler::exportDeclaration() {
         defineVariable(global);
         emitBytes(static_cast<uint8_t>(OpCode::OP_EXPORT), global);
         globalTypes[std::string(varToken.lexeme)] = (expectedType.kind != TypeKind::ANY) ? expectedType : initType;
-        skipTypeAnnotation();
-        if (match(TokenType::EQUAL)) {
-            expression();
-        } else {
-            emitOp(OpCode::OP_NIL);
-        }
-        consume(TokenType::SEMICOLON, "Expect ';' after variable declaration.");
-        defineVariable(global);
-        emitBytes(static_cast<uint8_t>(OpCode::OP_EXPORT), global);
     } else {
         error("Only functions or variables can be exported.");
     }
