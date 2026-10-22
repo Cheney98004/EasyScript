@@ -8,7 +8,7 @@ class ObjInstance final : public GcObject {
 public:
     static constexpr ObjType TYPE = ObjType::Instance;
     GcHandle klass;
-    std::unordered_map<std::string, Value> fields;
+    std::vector<Value> fields;
 
     explicit ObjInstance(GcHandle klass);
 

@@ -15,6 +15,13 @@ public:
     std::unordered_map<std::string, Value> methods;
     std::unordered_map<std::string, Value> staticFields;
 
+    // P1: 欄位槽位映射 (Field Name -> Flat Slot Index)
+    std::unordered_map<std::string, uint32_t> fieldSlots;
+
+    // P2: 虛擬方法表 (VTable) 與方法槽位映射 (Method Name -> VTable Index)
+    std::vector<Value> vtable;
+    std::unordered_map<std::string, uint32_t> methodSlots;
+
     explicit ObjClass(std::string name, std::optional<GcHandle> superclass = std::nullopt);
 
     void trace(const std::function<void(Value)>& visitor) const override;

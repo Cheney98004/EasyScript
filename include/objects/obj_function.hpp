@@ -21,6 +21,14 @@ public:
     uint32_t backedgeCount{0};
     bool jitFailed{false};
 
+    // P1 + P2: Bytecode Inline Cache (IC)
+    struct InlineCache {
+        uint32_t classId{0};
+        uint32_t slot{0};
+        Value value{};
+    };
+    mutable std::vector<InlineCache> icTable;
+
     explicit ObjFunction(std::string name = "");
 
     void trace(const std::function<void(Value)>& visitor) const override;

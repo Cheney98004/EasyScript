@@ -13,6 +13,9 @@ void ObjClass::trace(const std::function<void(Value)>& visitor) const {
     for (const auto& [_, method] : methods) {
         visitor(method);
     }
+    for (const auto& method : vtable) {
+        visitor(method);
+    }
     for (const auto& [_, field] : staticFields) {
         visitor(field);
     }

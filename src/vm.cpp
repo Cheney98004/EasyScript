@@ -1604,6 +1604,13 @@ InterpretResult VM::run(size_t stopDepth) {
 
                 subclass->superclass = *superclassVal.asObject();
 
+                // 複製父類的欄位槽位佈局 (P1)
+                subclass->fieldSlots = superclass->fieldSlots;
+
+                // 複製父類的虛擬方法表與方法槽位 (P2)
+                subclass->vtable = superclass->vtable;
+                subclass->methodSlots = superclass->methodSlots;
+
                 // 複製父類方法表至子類 (方法覆寫 override 則直接覆蓋同名鍵)
                 for (const auto& [methodName, methodVal] : superclass->methods) {
                     subclass->methods[methodName] = methodVal;
@@ -1623,6 +1630,16 @@ InterpretResult VM::run(size_t stopDepth) {
                 auto* klass = heap.getAs<ObjClass>(*classVal.asObject());
                 klass->methods[strObj->text] = methodVal;
 
+                // 更新 VTable 與 methodSlots (P2)
+                auto it = klass->methodSlots.find(strObj->text);
+                if (it == klass->methodSlots.end()) {
+                    uint32_t slot = static_cast<uint32_t>(klass->vtable.size());
+                    klass->methodSlots[strObj->text] = slot;
+                    klass->vtable.push_back(methodVal);
+                } else {
+                    klass->vtable[it->second] = methodVal;
+                }
+
                 pop(); // 彈出 method 函式
                 break;
             }
@@ -1640,6 +1657,54 @@ InterpretResult VM::run(size_t stopDepth) {
                 GcObject* gcObj = heap.get(*target.asObject());
                 if (!gcObj) {
                     runtimeError("Invalid object handle.");
+                    return InterpretResult::RUNTIME_ERROR;
+                }
+
+                // 實例快速路徑 (P1 欄位槽位化 + Inline Cache)
+                if (auto* instance = gcObj->as<ObjInstance>()) {
+                    auto* klass = heap.getAs<ObjClass>(instance->klass);
+                    size_t ipOffset = frame->ip - frame->function->bytecode.data() - 1;
+                    if (frame->function->icTable.size() <= ipOffset) {
+                        frame->function->icTable.resize(frame->function->bytecode.size());
+                    }
+                    auto& ic = frame->function->icTable[ipOffset];
+
+                    // 1. Fast Path: IC 命中
+                    if (ic.classId == instance->klass.id && ic.classId != 0 && ic.slot != UINT32_MAX) {
+                        if (ic.slot < instance->fields.size()) {
+                            push(instance->fields[ic.slot]);
+                        } else {
+                            push(Value());
+                        }
+                        break;
+                    }
+
+                    // 2. Slow Path: 查類別欄位槽位
+                    if (klass) {
+                        auto fIt = klass->fieldSlots.find(strObj->text);
+                        if (fIt != klass->fieldSlots.end()) {
+                            uint32_t slot = fIt->second;
+                            ic.classId = instance->klass.id;
+                            ic.slot = slot;
+                            if (slot < instance->fields.size()) {
+                                push(instance->fields[slot]);
+                            } else {
+                                push(Value());
+                            }
+                            break;
+                        }
+
+                        // 3. 查類別方法 -> 生成 ObjBoundMethod
+                        auto mIt = klass->methodSlots.find(strObj->text);
+                        if (mIt != klass->methodSlots.end()) {
+                            Value method = klass->vtable[mIt->second];
+                            GcHandle bound = heap.allocate<ObjBoundMethod>(target, method);
+                            push(Value(bound));
+                            break;
+                        }
+                    }
+
+                    runtimeError("Undefined property '%s'.", strObj->text.c_str());
                     return InterpretResult::RUNTIME_ERROR;
                 }
 
@@ -1697,31 +1762,7 @@ InterpretResult VM::run(size_t stopDepth) {
                     return InterpretResult::RUNTIME_ERROR;
                 }
 
-                auto* instance = gcObj->as<ObjInstance>();
-                if (!instance) {
-                    runtimeError("Only instances, modules, and collections have properties.");
-                    return InterpretResult::RUNTIME_ERROR;
-                }
-
-                // 1. 先查實例欄位 (Fields)
-                auto it = instance->fields.find(strObj->text);
-                if (it != instance->fields.end()) {
-                    push(it->second);
-                    break;
-                }
-
-                // 2. 再查類別方法 (Methods) -> 生成 ObjBoundMethod
-                auto* klass = heap.getAs<ObjClass>(instance->klass);
-                if (klass) {
-                    auto mIt = klass->methods.find(strObj->text);
-                    if (mIt != klass->methods.end()) {
-                        GcHandle bound = heap.allocate<ObjBoundMethod>(target, mIt->second);
-                        push(Value(bound));
-                        break;
-                    }
-                }
-
-                runtimeError("Undefined property '%s'.", strObj->text.c_str());
+                runtimeError("Only instances, modules, and collections have properties.");
                 return InterpretResult::RUNTIME_ERROR;
             }
 
@@ -1743,7 +1784,32 @@ InterpretResult VM::run(size_t stopDepth) {
                     return InterpretResult::RUNTIME_ERROR;
                 }
 
-                instance->fields[strObj->text] = val;
+                auto* klass = heap.getAs<ObjClass>(instance->klass);
+                size_t ipOffset = frame->ip - frame->function->bytecode.data() - 1;
+                if (frame->function->icTable.size() <= ipOffset) {
+                    frame->function->icTable.resize(frame->function->bytecode.size());
+                }
+                auto& ic = frame->function->icTable[ipOffset];
+
+                uint32_t slot = 0;
+                if (ic.classId == instance->klass.id && ic.classId != 0) {
+                    slot = ic.slot;
+                } else if (klass) {
+                    auto it = klass->fieldSlots.find(strObj->text);
+                    if (it == klass->fieldSlots.end()) {
+                        slot = static_cast<uint32_t>(klass->fieldSlots.size());
+                        klass->fieldSlots[strObj->text] = slot;
+                    } else {
+                        slot = it->second;
+                    }
+                    ic.classId = instance->klass.id;
+                    ic.slot = slot;
+                }
+
+                if (slot >= instance->fields.size()) {
+                    instance->fields.resize(slot + 1);
+                }
+                instance->fields[slot] = val;
                 push(val);
                 break;
             }
@@ -1762,6 +1828,59 @@ InterpretResult VM::run(size_t stopDepth) {
                 GcObject* gcObj = heap.get(*receiver.asObject());
                 if (!gcObj) {
                     runtimeError("Calling method on invalid object.");
+                    return InterpretResult::RUNTIME_ERROR;
+                }
+
+                // 實例快速調用 (P2 VTable + Monomorphic Inline Cache)
+                if (auto* instance = gcObj->as<ObjInstance>()) {
+                    auto* klass = heap.getAs<ObjClass>(instance->klass);
+                    size_t ipOffset = frame->ip - frame->function->bytecode.data() - 2;
+                    if (frame->function->icTable.size() <= ipOffset) {
+                        frame->function->icTable.resize(frame->function->bytecode.size());
+                    }
+                    auto& ic = frame->function->icTable[ipOffset];
+
+                    // 1. Fast Path: 單態內聯快取命中 (Monomorphic IC Hit)
+                    if (ic.classId == instance->klass.id && ic.classId != 0 && !ic.value.isNull()) {
+                        if (!call(ic.value, argCount)) {
+                            return InterpretResult::RUNTIME_ERROR;
+                        }
+                        frame = &frames.back();
+                        break;
+                    }
+
+                    // 2. Slow Path: 先查是否有同名欄位覆蓋函式
+                    if (klass) {
+                        auto fIt = klass->fieldSlots.find(strObj->text);
+                        if (fIt != klass->fieldSlots.end() && fIt->second < instance->fields.size()) {
+                            Value fieldVal = instance->fields[fIt->second];
+                            if (!fieldVal.isNull()) {
+                                stack[stack.size() - argCount - 1] = fieldVal;
+                                if (!call(fieldVal, argCount)) {
+                                    return InterpretResult::RUNTIME_ERROR;
+                                }
+                                frame = &frames.back();
+                                break;
+                            }
+                        }
+
+                        // 3. VTable 虛擬方法表查詢
+                        auto mIt = klass->methodSlots.find(strObj->text);
+                        if (mIt != klass->methodSlots.end()) {
+                            Value method = klass->vtable[mIt->second];
+                            ic.classId = instance->klass.id;
+                            ic.slot = mIt->second;
+                            ic.value = method;
+
+                            if (!call(method, argCount)) {
+                                return InterpretResult::RUNTIME_ERROR;
+                            }
+                            frame = &frames.back();
+                            break;
+                        }
+                    }
+
+                    runtimeError("Undefined method '%s'.", strObj->text.c_str());
                     return InterpretResult::RUNTIME_ERROR;
                 }
 
@@ -1806,37 +1925,7 @@ InterpretResult VM::run(size_t stopDepth) {
                     return InterpretResult::RUNTIME_ERROR;
                 }
 
-                auto* instance = gcObj->as<ObjInstance>();
-                if (!instance) {
-                    runtimeError("Only instances, modules, and collections have methods.");
-                    return InterpretResult::RUNTIME_ERROR;
-                }
-
-                // 先查是否有欄位覆蓋函式
-                auto it = instance->fields.find(strObj->text);
-                if (it != instance->fields.end()) {
-                    stack[stack.size() - argCount - 1] = it->second;
-                    if (!call(it->second, argCount)) {
-                        return InterpretResult::RUNTIME_ERROR;
-                    }
-                    frame = &frames.back();
-                    break;
-                }
-
-                // 查詢類別方法並直接呼叫
-                auto* klass = heap.getAs<ObjClass>(instance->klass);
-                if (klass) {
-                    auto mIt = klass->methods.find(strObj->text);
-                    if (mIt != klass->methods.end()) {
-                        if (!call(mIt->second, argCount)) {
-                            return InterpretResult::RUNTIME_ERROR;
-                        }
-                        frame = &frames.back();
-                        break;
-                    }
-                }
-
-                runtimeError("Undefined method '%s'.", strObj->text.c_str());
+                runtimeError("Only instances, modules, and collections have methods.");
                 return InterpretResult::RUNTIME_ERROR;
             }
 
@@ -1850,9 +1939,10 @@ InterpretResult VM::run(size_t stopDepth) {
 
                 if (klass->superclass) {
                     auto* superclass = heap.getAs<ObjClass>(*klass->superclass);
-                    auto it = superclass->methods.find(strObj->text);
-                    if (it != superclass->methods.end()) {
-                        GcHandle bound = heap.allocate<ObjBoundMethod>(receiver, it->second);
+                    auto it = superclass->methodSlots.find(strObj->text);
+                    if (it != superclass->methodSlots.end()) {
+                        Value method = superclass->vtable[it->second];
+                        GcHandle bound = heap.allocate<ObjBoundMethod>(receiver, method);
                         push(Value(bound));
                         break;
                     }
@@ -1873,9 +1963,10 @@ InterpretResult VM::run(size_t stopDepth) {
 
                 if (klass->superclass) {
                     auto* superclass = heap.getAs<ObjClass>(*klass->superclass);
-                    auto it = superclass->methods.find(strObj->text);
-                    if (it != superclass->methods.end()) {
-                        if (!call(it->second, argCount)) {
+                    auto it = superclass->methodSlots.find(strObj->text);
+                    if (it != superclass->methodSlots.end()) {
+                        Value method = superclass->vtable[it->second];
+                        if (!call(method, argCount)) {
                             return InterpretResult::RUNTIME_ERROR;
                         }
                         frame = &frames.back();

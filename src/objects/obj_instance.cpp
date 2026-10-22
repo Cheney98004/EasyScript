@@ -5,7 +5,7 @@ ObjInstance::ObjInstance(GcHandle klass)
 
 void ObjInstance::trace(const std::function<void(Value)>& visitor) const {
     visitor(Value(klass));
-    for (const auto& [_, fieldVal] : fields) {
+    for (const auto& fieldVal : fields) {
         visitor(fieldVal);
     }
 }
