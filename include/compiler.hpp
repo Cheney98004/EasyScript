@@ -127,6 +127,7 @@ private:
     // 跳轉指令與回填 (Backpatching)
     int emitJump(OpCode instruction);
     void patchJump(int offset);
+    void patchJumpTo(int offset, int target);
     void emitLoop(int loopStart);
 
     // -------------------------------------------------------------------------
@@ -160,6 +161,8 @@ private:
     void forStatement();
     void forInStatement(Token varToken);
     void returnStatement();
+    void tryStatement();
+    void throwStatement();
     void block();
     void expressionStatement();
     void skipTypeAnnotation();

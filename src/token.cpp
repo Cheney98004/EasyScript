@@ -66,6 +66,10 @@ std::string_view tokenTypeName(TokenType type) noexcept {
         case TokenType::IMPORT:             return "import";
         case TokenType::EXPORT:             return "export";
         case TokenType::FROM:               return "from";
+        case TokenType::TRY:                return "try";
+        case TokenType::CATCH:              return "catch";
+        case TokenType::FINALLY:            return "finally";
+        case TokenType::THROW:              return "throw";
         case TokenType::TRUE:               return "true";
         case TokenType::FALSE:              return "false";
         case TokenType::NIL:                return "null";

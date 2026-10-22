@@ -90,6 +90,10 @@ enum class TokenType : uint16_t {
     IMPORT,             // import
     EXPORT,             // export
     FROM,               // from
+    TRY,                // try
+    CATCH,              // catch
+    FINALLY,            // finally
+    THROW,              // throw
     TRUE,               // true
     FALSE,              // false
     NIL,                // null / nil

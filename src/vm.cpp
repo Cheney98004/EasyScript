@@ -72,6 +72,9 @@ VM::VM() {
         for (const auto& [k, v] : globals) roots.push_back(v);
         for (const auto& [k, h] : modules) roots.push_back(Value(h));
         for (GcHandle h : openUpvalues) roots.push_back(Value(h));
+        for (const auto& h : tryHandlers) {
+            if (!h.pendingException.isNull()) roots.push_back(h.pendingException);
+        }
     });
     defineNative("print", nativePrint, -1);
     defineNative("clock", nativeClock, 0);
@@ -105,6 +108,7 @@ void VM::resetStack() {
     stack.reserve(65536);
     frames.clear();
     openUpvalues.clear();
+    tryHandlers.clear();
 }
 
 GcHandle VM::captureUpvalue(Value* local) {
@@ -131,6 +135,61 @@ void VM::closeUpvalues(Value* last) {
             ++it;
         }
     }
+}
+
+InterpretResult VM::handleThrow(Value exception) {
+    while (!tryHandlers.empty()) {
+        TryHandler& handler = tryHandlers.back();
+
+        // 1. 若有 catch 區塊且尚未進入過 catch 或 finally
+        if (handler.catchIp != nullptr && !handler.inCatch && !handler.inFinally) {
+            handler.inCatch = true;
+
+            // 展開調用棧訊框至 handler.frameIndex
+            while (frames.size() - 1 > handler.frameIndex) {
+                closeUpvalues(stack.data() + frames.back().slotOffset);
+                frames.pop_back();
+            }
+
+            // 展開運算元棧至 handler.stackSize
+            closeUpvalues(stack.data() + handler.stackSize);
+            stack.resize(handler.stackSize);
+
+            // 推入例外值作為 catch 局部變數
+            push(exception);
+
+            // 設定 IP 至 catch 區塊起始位置
+            frames.back().ip = handler.catchIp;
+            return InterpretResult::OK;
+        }
+
+        // 2. 若無 catch 區塊（或已在 catch 中），但有 finally 且尚未進入 finally
+        if (handler.finallyIp != nullptr && !handler.inFinally) {
+            handler.inFinally = true;
+            handler.pendingException = exception;
+
+            // 展開調用棧訊框至 handler.frameIndex
+            while (frames.size() - 1 > handler.frameIndex) {
+                closeUpvalues(stack.data() + frames.back().slotOffset);
+                frames.pop_back();
+            }
+
+            // 展開運算元棧至 handler.stackSize
+            closeUpvalues(stack.data() + handler.stackSize);
+            stack.resize(handler.stackSize);
+
+            // 設定 IP 至 finally 區塊起始位置
+            frames.back().ip = handler.finallyIp;
+            return InterpretResult::OK;
+        }
+
+        // 該 handler 無法處理，彈出並繼續搜尋外層
+        tryHandlers.pop_back();
+    }
+
+    // 無任何捕捉處理器：未捕獲的例外
+    runtimeError("Uncaught exception: %s", valueToString(exception).c_str());
+    return InterpretResult::RUNTIME_ERROR;
 }
 
 void VM::push(Value value) {
@@ -1182,7 +1241,12 @@ InterpretResult VM::run(size_t stopDepth) {
                 size_t slotOffset = frame->slotOffset;
 
                 // 關閉該函式所有尚未關閉的局部變數 Upvalues
-                closeUpvalues(&stack[slotOffset]);
+                closeUpvalues(stack.data() + slotOffset);
+
+                // 清理當前幀的所有 tryHandlers
+                while (!tryHandlers.empty() && tryHandlers.back().frameIndex >= frames.size() - 1) {
+                    tryHandlers.pop_back();
+                }
 
                 frames.pop_back();
 
@@ -1236,8 +1300,53 @@ InterpretResult VM::run(size_t stopDepth) {
             }
 
             case OpCode::OP_CLOSE_UPVALUE: {
-                closeUpvalues(&stack.back());
+                closeUpvalues(stack.data() + (stack.size() - 1));
                 pop();
+                break;
+            }
+
+            case OpCode::OP_THROW: {
+                Value exception = pop();
+                InterpretResult res = handleThrow(exception);
+                if (res != InterpretResult::OK) return res;
+                frame = &frames.back();
+                break;
+            }
+
+            case OpCode::OP_PUSH_TRY: {
+                uint16_t catchOffset = readShort();
+                const uint8_t* catchIp = (catchOffset != 0) ? (frame->ip + catchOffset) : nullptr;
+                uint16_t finallyOffset = readShort();
+                const uint8_t* finallyIp = (finallyOffset != 0) ? (frame->ip + finallyOffset) : nullptr;
+
+                TryHandler handler;
+                handler.frameIndex = frames.size() - 1;
+                handler.stackSize = stack.size();
+                handler.catchIp = catchIp;
+                handler.finallyIp = finallyIp;
+                handler.inCatch = false;
+                handler.inFinally = false;
+                tryHandlers.push_back(handler);
+                break;
+            }
+
+            case OpCode::OP_POP_TRY: {
+                if (!tryHandlers.empty()) {
+                    tryHandlers.pop_back();
+                }
+                break;
+            }
+
+            case OpCode::OP_FINALLY_END: {
+                if (!tryHandlers.empty() && tryHandlers.back().inFinally) {
+                    TryHandler handler = tryHandlers.back();
+                    tryHandlers.pop_back();
+                    if (!handler.pendingException.isNull()) {
+                        InterpretResult res = handleThrow(handler.pendingException);
+                        if (res != InterpretResult::OK) return res;
+                        frame = &frames.back();
+                    }
+                }
                 break;
             }
 

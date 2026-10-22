@@ -156,6 +156,12 @@ void Compiler::patchJump(int offset) {
     fn->bytecode[offset + 1] = static_cast<uint8_t>(jump & 0xff);
 }
 
+void Compiler::patchJumpTo(int offset, int target) {
+    auto* fn = currentFunction().function;
+    fn->bytecode[offset] = static_cast<uint8_t>((target >> 8) & 0xff);
+    fn->bytecode[offset + 1] = static_cast<uint8_t>(target & 0xff);
+}
+
 void Compiler::emitLoop(int loopStart) {
     emitOp(OpCode::OP_LOOP);
     auto* fn = currentFunction().function;
@@ -691,6 +697,10 @@ void Compiler::statement() {
         forStatement();
     } else if (match(TokenType::RETURN)) {
         returnStatement();
+    } else if (match(TokenType::TRY)) {
+        tryStatement();
+    } else if (match(TokenType::THROW)) {
+        throwStatement();
     } else if (match(TokenType::LEFT_BRACE)) {
         beginScope();
         block();
@@ -884,6 +894,86 @@ void Compiler::returnStatement() {
         expression();
         consume(TokenType::SEMICOLON, "Expect ';' after return value.");
         emitOp(OpCode::OP_RETURN);
+    }
+}
+
+void Compiler::throwStatement() {
+    expression();
+    consume(TokenType::SEMICOLON, "Expect ';' after throw statement.");
+    emitOp(OpCode::OP_THROW);
+}
+
+void Compiler::tryStatement() {
+    consume(TokenType::LEFT_BRACE, "Expect '{' after 'try'.");
+
+    // 1. 發射 OP_PUSH_TRY 並預留 catchOffset 與 finallyOffset
+    emitOp(OpCode::OP_PUSH_TRY);
+    emitByte(0xff); emitByte(0xff); // placeholder for catchOffset
+    int catchJumpOffset = static_cast<int>(currentFunction().function->bytecode.size() - 2);
+    emitByte(0xff); emitByte(0xff); // placeholder for finallyOffset
+    int finallyJumpOffset = static_cast<int>(currentFunction().function->bytecode.size() - 2);
+
+    // 2. 編譯 try 區塊
+    beginScope();
+    block();
+    endScope();
+
+    // try 正常執行完畢：彈出 TryHandler
+    emitOp(OpCode::OP_POP_TRY);
+    int trySuccessJump = emitJump(OpCode::OP_JUMP);
+
+    bool hasCatch = false;
+    int catchSuccessJump = -1;
+
+    // 3. catch 區塊
+    if (match(TokenType::CATCH)) {
+        hasCatch = true;
+        patchJump(catchJumpOffset);
+
+        consume(TokenType::LEFT_PAREN, "Expect '(' after 'catch'.");
+        consume(TokenType::IDENTIFIER, "Expect exception variable name in catch.");
+        Token errToken = previous;
+        skipTypeAnnotation();
+        consume(TokenType::RIGHT_PAREN, "Expect ')' after catch variable.");
+
+        consume(TokenType::LEFT_BRACE, "Expect '{' before catch body.");
+        beginScope();
+        addLocal(errToken);
+        markInitialized();
+
+        block();
+        endScope();
+
+        catchSuccessJump = emitJump(OpCode::OP_JUMP);
+    } else {
+        patchJumpTo(catchJumpOffset, 0);
+    }
+
+    // 4. finally 區塊
+    if (match(TokenType::FINALLY)) {
+        patchJump(finallyJumpOffset);
+
+        patchJump(trySuccessJump);
+        if (catchSuccessJump != -1) {
+            patchJump(catchSuccessJump);
+        }
+
+        consume(TokenType::LEFT_BRACE, "Expect '{' before finally body.");
+        beginScope();
+        block();
+        endScope();
+
+        emitOp(OpCode::OP_FINALLY_END);
+    } else {
+        if (!hasCatch) {
+            error("Expect 'catch' or 'finally' after 'try'.");
+        }
+        patchJumpTo(finallyJumpOffset, 0);
+
+        patchJump(trySuccessJump);
+        if (catchSuccessJump != -1) {
+            patchJump(catchSuccessJump);
+        }
     }
 }
 

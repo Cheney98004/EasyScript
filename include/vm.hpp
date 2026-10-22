@@ -23,6 +23,17 @@ struct CallFrame {
     size_t slotOffset{0}; // 該訊框在運算元棧上的起始位置
 };
 
+// 例外捕捉處理器 (TryHandler)
+struct TryHandler {
+    size_t frameIndex{0};
+    size_t stackSize{0};
+    const uint8_t* catchIp{nullptr};
+    const uint8_t* finallyIp{nullptr};
+    bool inCatch{false};
+    bool inFinally{false};
+    Value pendingException;
+};
+
 class VM {
 public:
     VM();
@@ -71,9 +82,11 @@ private:
     bool invokeRangeMethod(ObjRange* rng, const std::string& name, uint8_t argCount, Value receiver);
 
     std::vector<GcHandle> openUpvalues;
+    std::vector<TryHandler> tryHandlers;
 
     GcHandle captureUpvalue(Value* local);
     void closeUpvalues(Value* last);
+    InterpretResult handleThrow(Value exception);
 
     void resetStack();
 };

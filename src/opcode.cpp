@@ -52,6 +52,10 @@ std::string_view opCodeName(OpCode op) noexcept {
         case OpCode::OP_EXPORT:        return "OP_EXPORT";
         case OpCode::OP_IMPORT_MODULE: return "OP_IMPORT_MODULE";
         case OpCode::OP_IMPORT_NAME:   return "OP_IMPORT_NAME";
+        case OpCode::OP_THROW:         return "OP_THROW";
+        case OpCode::OP_PUSH_TRY:      return "OP_PUSH_TRY";
+        case OpCode::OP_POP_TRY:       return "OP_POP_TRY";
+        case OpCode::OP_FINALLY_END:   return "OP_FINALLY_END";
     }
     return "OP_UNKNOWN";
 }

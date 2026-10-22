@@ -78,6 +78,12 @@ enum class OpCode : uint8_t {
     OP_EXPORT,          // [arg: uint8_t nameIndex] 將棧頂符號匯出
     OP_IMPORT_MODULE,   // [arg: uint8_t pathIndex, uint8_t nameIndex] 匯入整個模組為變數
     OP_IMPORT_NAME,     // [arg: uint8_t pathIndex, uint8_t symbolIndex] 具名匯入模組符號
+
+    // 例外處理 (Exception Handling)
+    OP_THROW,           // 彈出棧頂值並拋出例外
+    OP_PUSH_TRY,        // [arg: uint16_t catchOffset, uint16_t finallyOffset] 註冊 TryHandler
+    OP_POP_TRY,         // 彈出 TryHandler
+    OP_FINALLY_END,     // 結束 Finally 區塊，若有未處理例外則重新拋出
 };
 
 std::string_view opCodeName(OpCode op) noexcept;
