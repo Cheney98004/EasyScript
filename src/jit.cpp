@@ -2,6 +2,14 @@
 #include "vm.hpp"
 #include "opcode.hpp"
 #include "objects/obj_string.hpp"
+#include "objects/obj_class.hpp"
+#include "objects/obj_instance.hpp"
+#include "objects/obj_bound_method.hpp"
+#include "objects/obj_closure.hpp"
+#include "objects/obj_array.hpp"
+#include "objects/obj_map.hpp"
+#include "objects/obj_range.hpp"
+#include "objects/obj_module.hpp"
 #include <windows.h>
 #include <vector>
 #include <unordered_map>
@@ -219,6 +227,226 @@ void easyscript_jit_define_global(VM* vm, const Value* nameVal, const Value* val
     vm->jitDefineGlobal(*nameVal, *val);
 }
 
+void easyscript_jit_get_property_cached(VM* vm, Value* target, const Value* nameVal, JitPropertySite* ps) {
+    if (!vm || !target || !nameVal) return;
+    if (!target->isObject()) {
+        vm->jitRuntimeError("Only instances, modules, and collections have properties.");
+        *target = Value();
+        return;
+    }
+    GcObject* gcObj = vm->getHeap().get(*target->asObject());
+    if (!gcObj) {
+        vm->jitRuntimeError("Invalid object handle.");
+        *target = Value();
+        return;
+    }
+    if (auto* instance = gcObj->as<ObjInstance>()) {
+        if (ps && ps->cachedClassId == instance->klass.id && ps->cachedClassId != 0 && ps->slot != UINT32_MAX) {
+            *target = (ps->slot < instance->fields.size()) ? instance->fields[ps->slot] : Value();
+            return;
+        }
+        auto* strObj = vm->getHeap().getAs<ObjString>(*nameVal->asObject());
+        if (!strObj) return;
+        auto* klass = vm->getHeap().getAs<ObjClass>(instance->klass);
+        if (klass) {
+            auto fIt = klass->fieldSlots.find(strObj->text);
+            if (fIt != klass->fieldSlots.end()) {
+                uint32_t slot = fIt->second;
+                if (ps) {
+                    ps->cachedClassId = instance->klass.id;
+                    ps->slot = slot;
+                }
+                *target = (slot < instance->fields.size()) ? instance->fields[slot] : Value();
+                return;
+            }
+            auto mIt = klass->methodSlots.find(strObj->text);
+            if (mIt != klass->methodSlots.end()) {
+                Value method = klass->vtable[mIt->second];
+                GcHandle bound = vm->getHeap().allocate<ObjBoundMethod>(*target, method);
+                *target = Value(bound);
+                return;
+            }
+        }
+        vm->jitRuntimeError("Undefined property '" + strObj->text + "'.");
+        *target = Value();
+        return;
+    }
+
+    auto* strObj = vm->getHeap().getAs<ObjString>(*nameVal->asObject());
+    if (!strObj) return;
+    if (auto* arr = gcObj->as<ObjArray>()) {
+        if (strObj->text == "length" || strObj->text == "size") {
+            *target = Value(static_cast<int64_t>(arr->elements.size()));
+            return;
+        }
+    } else if (auto* str = gcObj->as<ObjString>()) {
+        if (strObj->text == "length" || strObj->text == "size") {
+            *target = Value(static_cast<int64_t>(str->text.size()));
+            return;
+        }
+    } else if (auto* map = gcObj->as<ObjMap>()) {
+        if (strObj->text == "length" || strObj->text == "size") {
+            *target = Value(static_cast<int64_t>(map->table.size()));
+            return;
+        }
+    } else if (auto* rng = gcObj->as<ObjRange>()) {
+        if (strObj->text == "start") { *target = Value(rng->start); return; }
+        if (strObj->text == "end") { *target = Value(rng->end); return; }
+        if (strObj->text == "step") { *target = Value(rng->step); return; }
+        if (strObj->text == "length" || strObj->text == "size") {
+            int64_t len = 0;
+            if (rng->step > 0 && rng->end > rng->start) {
+                len = (rng->end - rng->start + rng->step - 1) / rng->step;
+            } else if (rng->step < 0 && rng->end < rng->start) {
+                len = (rng->start - rng->end - rng->step - 1) / (-rng->step);
+            }
+            *target = Value(len);
+            return;
+        }
+    } else if (auto* mod = gcObj->as<ObjModule>()) {
+        auto it = mod->exports.find(strObj->text);
+        if (it != mod->exports.end()) {
+            *target = it->second;
+            return;
+        }
+    }
+    vm->jitRuntimeError("Undefined property '" + strObj->text + "'.");
+    *target = Value();
+}
+
+void easyscript_jit_set_property_cached(VM* vm, Value* target, const Value* nameVal, const Value* val, JitPropertySite* ps) {
+    if (!vm || !target || !val || !nameVal) return;
+    if (!target->isObject()) {
+        vm->jitRuntimeError("Only instances have fields.");
+        return;
+    }
+    auto* instance = vm->getHeap().getAs<ObjInstance>(*target->asObject());
+    if (!instance) {
+        vm->jitRuntimeError("Only instances have fields.");
+        return;
+    }
+    uint32_t slot = UINT32_MAX;
+    if (ps && ps->cachedClassId == instance->klass.id && ps->cachedClassId != 0 && ps->slot != UINT32_MAX) {
+        slot = ps->slot;
+    } else {
+        auto* strObj = vm->getHeap().getAs<ObjString>(*nameVal->asObject());
+        if (!strObj) return;
+        auto* klass = vm->getHeap().getAs<ObjClass>(instance->klass);
+        if (klass) {
+            auto it = klass->fieldSlots.find(strObj->text);
+            if (it == klass->fieldSlots.end()) {
+                slot = static_cast<uint32_t>(klass->fieldSlots.size());
+                klass->fieldSlots[strObj->text] = slot;
+            } else {
+                slot = it->second;
+            }
+            if (ps) {
+                ps->cachedClassId = instance->klass.id;
+                ps->slot = slot;
+            }
+        }
+    }
+    if (slot != UINT32_MAX) {
+        if (slot >= instance->fields.size()) {
+            instance->fields.resize(slot + 1);
+        }
+        instance->fields[slot] = *val;
+    }
+}
+
+int64_t easyscript_jit_invoke_cached(VM* vm, Value* receiverSlot, const Value* nameVal, uint8_t argCount, JitInvokeSite* isite) {
+    if (!vm || !receiverSlot || !nameVal) return 0;
+    auto* strObj = vm->getHeap().getAs<ObjString>(*nameVal->asObject());
+    if (!strObj) return 0;
+
+    Value receiver = receiverSlot[0];
+    if (receiver.isObject()) {
+        auto* instance = vm->getHeap().getAs<ObjInstance>(*receiver.asObject());
+        if (instance) {
+            if (isite && isite->cachedClassId == instance->klass.id && isite->nativeCode != nullptr) {
+                JitNativeFn nativeFn = reinterpret_cast<JitNativeFn>(isite->nativeCode);
+                Value result;
+                JitStatus status = nativeFn(vm, receiverSlot, &result);
+                if (status == JitStatus::OK) {
+                    receiverSlot[0] = result;
+                    return 1;
+                }
+            }
+        }
+    }
+
+    bool ok = vm->invokeFromJit(receiverSlot, strObj->text, argCount);
+    if (!ok) return 0;
+
+    if (isite && receiver.isObject()) {
+        auto* instance = vm->getHeap().getAs<ObjInstance>(*receiver.asObject());
+        if (instance) {
+            auto* klass = vm->getHeap().getAs<ObjClass>(instance->klass);
+            if (klass) {
+                auto mIt = klass->methodSlots.find(strObj->text);
+                if (mIt != klass->methodSlots.end()) {
+                    Value method = klass->vtable[mIt->second];
+                    isite->cachedClassId = instance->klass.id;
+                    isite->vtableSlot = mIt->second;
+                    isite->cachedMethod = method;
+                    if (method.isObject()) {
+                        GcObject* mObj = vm->getHeap().get(*method.asObject());
+                        if (mObj) {
+                            ObjFunction* mFn = nullptr;
+                            if (auto* f = mObj->as<ObjFunction>()) mFn = f;
+                            else if (auto* c = mObj->as<ObjClosure>()) mFn = vm->getHeap().getAs<ObjFunction>(c->function);
+                            if (mFn && mFn->nativeCode && !mFn->jitFailed && mFn->arity == argCount) {
+                                isite->nativeCode = mFn->nativeCode;
+                            } else {
+                                isite->nativeCode = nullptr;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return 1;
+}
+
+void easyscript_jit_get_super(VM* vm, Value* receiverSlot, const Value* nameVal) {
+    if (!vm || !receiverSlot || !nameVal) return;
+    if (!receiverSlot->isObject()) {
+        vm->jitRuntimeError("Super receiver must be an object.");
+        return;
+    }
+    auto* instance = vm->getHeap().getAs<ObjInstance>(*receiverSlot->asObject());
+    if (!instance) {
+        vm->jitRuntimeError("Super receiver must be an instance.");
+        return;
+    }
+    auto* klass = vm->getHeap().getAs<ObjClass>(instance->klass);
+    if (!klass || !klass->superclass) {
+        vm->jitRuntimeError("Superclass not found.");
+        return;
+    }
+    auto* superclass = vm->getHeap().getAs<ObjClass>(*klass->superclass);
+    auto* strObj = vm->getHeap().getAs<ObjString>(*nameVal->asObject());
+    if (!strObj || !superclass) return;
+
+    auto it = superclass->methodSlots.find(strObj->text);
+    if (it != superclass->methodSlots.end()) {
+        Value method = superclass->vtable[it->second];
+        GcHandle bound = vm->getHeap().allocate<ObjBoundMethod>(*receiverSlot, method);
+        *receiverSlot = Value(bound);
+        return;
+    }
+    vm->jitRuntimeError("Undefined superclass method '" + strObj->text + "'.");
+}
+
+int64_t easyscript_jit_super_invoke(VM* vm, Value* receiverSlot, const Value* nameVal, uint8_t argCount) {
+    if (!vm || !receiverSlot || !nameVal) return 0;
+    auto* strObj = vm->getHeap().getAs<ObjString>(*nameVal->asObject());
+    if (!strObj) return 0;
+    bool ok = vm->superInvokeFromJit(receiverSlot, strObj->text, argCount);
+    return ok ? 1 : 0;
+}
+
 } // extern "C"
 
 // -----------------------------------------------------------------------------
@@ -300,6 +528,33 @@ public:
         emitByte(0x41); emitByte(0xB8); emitDword(imm);
     }
 
+    void emitMovR8Imm64(uint64_t imm) {
+        // mov r8, imm64
+        emitByte(0x49); emitByte(0xB8); emitQword(imm);
+    }
+
+    void emitMovR9Imm64(uint64_t imm) {
+        // mov r9, imm64
+        emitByte(0x49); emitByte(0xB9); emitQword(imm);
+    }
+
+    void emitMovR9dImm32(uint32_t imm) {
+        // mov r9d, imm32
+        emitByte(0x41); emitByte(0xB9); emitDword(imm);
+    }
+
+    void emitLeaR9RsiDisp8(int8_t disp) {
+        // lea r9, [rsi + disp8]
+        emitByte(0x4C); emitByte(0x8D); emitByte(0x4E); emitByte(static_cast<uint8_t>(disp));
+    }
+
+    void emitStoreShadow5thImm64(uint64_t imm) {
+        // mov rax, imm64
+        emitMovRaxImm64(imm);
+        // mov [rsp + 32], rax
+        emitByte(0x48); emitByte(0x89); emitByte(0x44); emitByte(0x24); emitByte(0x20);
+    }
+
     void emitMovRaxImm64(uint64_t imm) {
         // mov rax, imm64
         emitByte(0x48); emitByte(0xB8); emitQword(imm);
@@ -350,6 +605,11 @@ bool JitCompiler::canCompile(const ObjFunction* fn) {
             case OpCode::OP_LOOP: i += 2; break;
             case OpCode::OP_CALL: i += 1; break;
             case OpCode::OP_RETURN: break;
+            case OpCode::OP_GET_PROPERTY:
+            case OpCode::OP_SET_PROPERTY: i += 1; break;
+            case OpCode::OP_INVOKE: i += 2; break;
+            case OpCode::OP_GET_SUPER: i += 1; break;
+            case OpCode::OP_SUPER_INVOKE: i += 2; break;
             default:
                 return false;
         }
@@ -379,9 +639,9 @@ bool JitCompiler::compile(ObjFunction* fn) {
     a.emitByte(0x41); a.emitByte(0x56);
     a.emitByte(0x41); a.emitByte(0x57);
 
-    // sub rsp, 4128 (4096 bytes for 256 local/eval slots + 32 shadow space)
+    // sub rsp, 4168 (4096 bytes for local/eval slots + 64 shadow & arg space)
     a.emitByte(0x48); a.emitByte(0x81); a.emitByte(0xEC);
-    a.emitDword(4128);
+    a.emitDword(4168);
 
     // mov r12, rcx (VM* vm)
     a.emitByte(0x49); a.emitByte(0x89); a.emitByte(0xCC);
@@ -389,8 +649,8 @@ bool JitCompiler::compile(ObjFunction* fn) {
     // mov r14, r8  (Value* outResult)
     a.emitByte(0x4D); a.emitByte(0x89); a.emitByte(0xC6);
 
-    // lea r13, [rsp + 32] (frameSlots base)
-    a.emitByte(0x4C); a.emitByte(0x8D); a.emitByte(0x6C); a.emitByte(0x24); a.emitByte(0x20);
+    // lea r13, [rsp + 64] (frameSlots base)
+    a.emitByte(0x4C); a.emitByte(0x8D); a.emitByte(0x6C); a.emitByte(0x24); a.emitByte(0x40);
 
     // 複製傳入參數到 frameSlots (slot 0 是 callee，slot 1..arity 是引數)
     // callerSlots 在 RDX
@@ -429,17 +689,26 @@ bool JitCompiler::compile(ObjFunction* fn) {
     const auto& code = fn->bytecode;
     size_t ip = 0;
 
-    // 計算 OP_CALL 呼叫點並初始化 Direct Native Call sites
+    // 計算呼叫點並初始化各 Direct Native Call / IC sites
     size_t callCount = 0;
     size_t getGlobalCount = 0;
+    size_t propCount = 0;
+    size_t invokeCount = 0;
     for (size_t i = 0; i < code.size(); ++i) {
-        if (static_cast<OpCode>(code[i]) == OpCode::OP_CALL) callCount++;
-        else if (static_cast<OpCode>(code[i]) == OpCode::OP_GET_GLOBAL) getGlobalCount++;
+        OpCode op = static_cast<OpCode>(code[i]);
+        if (op == OpCode::OP_CALL) callCount++;
+        else if (op == OpCode::OP_GET_GLOBAL) getGlobalCount++;
+        else if (op == OpCode::OP_GET_PROPERTY || op == OpCode::OP_SET_PROPERTY) propCount++;
+        else if (op == OpCode::OP_INVOKE) invokeCount++;
     }
     fn->jitCallSites.assign(callCount, JitCallSite{});
     fn->jitGlobalSites.assign(getGlobalCount, JitGlobalSite{});
+    fn->jitPropertySites.assign(propCount, JitPropertySite{});
+    fn->jitInvokeSites.assign(invokeCount, JitInvokeSite{});
     size_t callSiteIdx = 0;
     size_t getGlobalSiteIdx = 0;
+    size_t propSiteIdx = 0;
+    size_t invokeSiteIdx = 0;
 
     while (ip < code.size()) {
         size_t currentBcOffset = ip;
@@ -963,6 +1232,134 @@ bool JitCompiler::compile(ObjFunction* fn) {
                 a.emitByte(0x48); a.emitByte(0x81); a.emitByte(0xEE); a.emitDword(shrink);
                 break;
             }
+            case OpCode::OP_GET_PROPERTY: {
+                uint8_t constIdx = code[ip++];
+                uint64_t constAddr = reinterpret_cast<uint64_t>(&fn->constants[constIdx]);
+                JitPropertySite* ps = &fn->jitPropertySites[propSiteIdx++];
+                uint64_t psAddr = reinterpret_cast<uint64_t>(ps);
+
+                // RCX = vm (r12)
+                a.emitMovRcxR12();
+                // RDX = target (&[rsi - 16])
+                a.emitLeaRdxRsiDisp8(-16);
+                // R8 = constAddr (&fn->constants[constIdx])
+                a.emitMovR8Imm64(constAddr);
+                // R9 = psAddr
+                a.emitMovR9Imm64(psAddr);
+                // call easyscript_jit_get_property_cached
+                a.emitMovRaxImm64(reinterpret_cast<uint64_t>(&easyscript_jit_get_property_cached));
+                a.emitCallRax();
+                break;
+            }
+            case OpCode::OP_SET_PROPERTY: {
+                uint8_t constIdx = code[ip++];
+                uint64_t constAddr = reinterpret_cast<uint64_t>(&fn->constants[constIdx]);
+                JitPropertySite* ps = &fn->jitPropertySites[propSiteIdx++];
+                uint64_t psAddr = reinterpret_cast<uint64_t>(ps);
+
+                // RCX = vm (r12)
+                a.emitMovRcxR12();
+                // RDX = target (&[rsi - 32])
+                a.emitLeaRdxRsiDisp8(-32);
+                // R8 = constAddr (&fn->constants[constIdx])
+                a.emitMovR8Imm64(constAddr);
+                // R9 = val (&[rsi - 16])
+                a.emitLeaR9RsiDisp8(-16);
+                // 5th param: psAddr -> [rsp + 32]
+                a.emitStoreShadow5thImm64(psAddr);
+                // call easyscript_jit_set_property_cached
+                a.emitMovRaxImm64(reinterpret_cast<uint64_t>(&easyscript_jit_set_property_cached));
+                a.emitCallRax();
+
+                // pop target, keep val at top:
+                // mov rax, [rsi - 16]
+                a.emitByte(0x48); a.emitByte(0x8B); a.emitByte(0x46); a.emitByte(0xF0);
+                // mov rdx, [rsi - 8]
+                a.emitByte(0x48); a.emitByte(0x8B); a.emitByte(0x56); a.emitByte(0xF8);
+                // mov [rsi - 32], rax
+                a.emitByte(0x48); a.emitByte(0x89); a.emitByte(0x46); a.emitByte(0xE0);
+                // mov [rsi - 24], rdx
+                a.emitByte(0x48); a.emitByte(0x89); a.emitByte(0x56); a.emitByte(0xE8);
+                // sub rsi, 16
+                a.emitByte(0x48); a.emitByte(0x83); a.emitByte(0xEE); a.emitByte(0x10);
+                break;
+            }
+            case OpCode::OP_INVOKE: {
+                uint8_t constIdx = code[ip++];
+                uint8_t argCount = code[ip++];
+                int32_t calleeDisp = -static_cast<int32_t>((argCount + 1) * 16);
+                uint64_t constAddr = reinterpret_cast<uint64_t>(&fn->constants[constIdx]);
+                JitInvokeSite* isite = &fn->jitInvokeSites[invokeSiteIdx++];
+                uint64_t isiteAddr = reinterpret_cast<uint64_t>(isite);
+
+                // RCX = vm (r12)
+                a.emitMovRcxR12();
+                // RDX = receiverSlot (rsi + calleeDisp)
+                a.emitLeaRdxRsiDisp32(calleeDisp);
+                // R8 = constAddr (&fn->constants[constIdx])
+                a.emitMovR8Imm64(constAddr);
+                // R9d = argCount
+                a.emitMovR9dImm32(argCount);
+                // 5th param: isiteAddr -> [rsp + 32]
+                a.emitStoreShadow5thImm64(isiteAddr);
+                // call easyscript_jit_invoke_cached
+                a.emitMovRaxImm64(reinterpret_cast<uint64_t>(&easyscript_jit_invoke_cached));
+                a.emitCallRax();
+                // test eax, eax
+                a.emitByte(0x85); a.emitByte(0xC0);
+                // jz bailout
+                a.emitByte(0x0F); a.emitByte(0x84);
+                jumpsToBailout.push_back(a.offset());
+                a.emitDword(0);
+
+                // sub rsi, argCount * 16
+                uint32_t shrink = argCount * 16;
+                a.emitByte(0x48); a.emitByte(0x81); a.emitByte(0xEE); a.emitDword(shrink);
+                break;
+            }
+            case OpCode::OP_GET_SUPER: {
+                uint8_t constIdx = code[ip++];
+                uint64_t constAddr = reinterpret_cast<uint64_t>(&fn->constants[constIdx]);
+                // RCX = vm (r12)
+                a.emitMovRcxR12();
+                // RDX = target (&[rsi - 16])
+                a.emitLeaRdxRsiDisp8(-16);
+                // R8 = constAddr
+                a.emitMovR8Imm64(constAddr);
+                // call easyscript_jit_get_super
+                a.emitMovRaxImm64(reinterpret_cast<uint64_t>(&easyscript_jit_get_super));
+                a.emitCallRax();
+                break;
+            }
+            case OpCode::OP_SUPER_INVOKE: {
+                uint8_t constIdx = code[ip++];
+                uint8_t argCount = code[ip++];
+                int32_t calleeDisp = -static_cast<int32_t>((argCount + 1) * 16);
+                uint64_t constAddr = reinterpret_cast<uint64_t>(&fn->constants[constIdx]);
+
+                // RCX = vm (r12)
+                a.emitMovRcxR12();
+                // RDX = receiverSlot (rsi + calleeDisp)
+                a.emitLeaRdxRsiDisp32(calleeDisp);
+                // R8 = constAddr
+                a.emitMovR8Imm64(constAddr);
+                // R9d = argCount
+                a.emitMovR9dImm32(argCount);
+                // call easyscript_jit_super_invoke
+                a.emitMovRaxImm64(reinterpret_cast<uint64_t>(&easyscript_jit_super_invoke));
+                a.emitCallRax();
+                // test eax, eax
+                a.emitByte(0x85); a.emitByte(0xC0);
+                // jz bailout
+                a.emitByte(0x0F); a.emitByte(0x84);
+                jumpsToBailout.push_back(a.offset());
+                a.emitDword(0);
+
+                // sub rsi, argCount * 16
+                uint32_t shrink = argCount * 16;
+                a.emitByte(0x48); a.emitByte(0x81); a.emitByte(0xEE); a.emitDword(shrink);
+                break;
+            }
             case OpCode::OP_RETURN: {
                 // sub rsi, 16
                 a.emitByte(0x48); a.emitByte(0x83); a.emitByte(0xEE); a.emitByte(0x10);
@@ -999,8 +1396,8 @@ bool JitCompiler::compile(ObjFunction* fn) {
         a.patchDword(patchPos, static_cast<uint32_t>(rel));
     }
 
-    // add rsp, 4128
-    a.emitByte(0x48); a.emitByte(0x81); a.emitByte(0xC4); a.emitDword(4128);
+    // add rsp, 4168
+    a.emitByte(0x48); a.emitByte(0x81); a.emitByte(0xC4); a.emitDword(4168);
     // pop r15, r14, r13, r12, rdi, rsi, rbx, rbp
     a.emitByte(0x41); a.emitByte(0x5F);
     a.emitByte(0x41); a.emitByte(0x5E);

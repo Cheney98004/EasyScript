@@ -15,6 +15,11 @@ void ObjFunction::trace(const std::function<void(Value)>& visitor) const {
             visitor(ic.value);
         }
     }
+    for (const auto& isite : jitInvokeSites) {
+        if (!isite.cachedMethod.isNull()) {
+            visitor(isite.cachedMethod);
+        }
+    }
 }
 
 void ObjFunction::print(std::ostream& os) const {

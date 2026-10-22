@@ -343,6 +343,138 @@ bool VM::callFromJit(Value* calleeSlot, uint8_t argCount) {
     return true;
 }
 
+bool VM::invokeFromJit(Value* receiverSlot, const std::string& name, uint8_t argCount) {
+    Value receiver = receiverSlot[0];
+    if (!receiver.isObject()) {
+        runtimeError("Only instances, modules, and collections have methods.");
+        return false;
+    }
+    GcObject* gcObj = heap.get(*receiver.asObject());
+    if (!gcObj) {
+        runtimeError("Calling method on invalid object.");
+        return false;
+    }
+
+    size_t savedStack = stack.size();
+    for (uint8_t i = 0; i <= argCount; ++i) {
+        push(receiverSlot[i]);
+    }
+
+    bool success = false;
+    if (auto* instance = gcObj->as<ObjInstance>()) {
+        auto* klass = heap.getAs<ObjClass>(instance->klass);
+        if (klass) {
+            auto fIt = klass->fieldSlots.find(name);
+            if (fIt != klass->fieldSlots.end() && fIt->second < instance->fields.size()) {
+                Value fieldVal = instance->fields[fIt->second];
+                if (!fieldVal.isNull()) {
+                    stack[stack.size() - argCount - 1] = fieldVal;
+                    size_t frameCountBefore = frames.size();
+                    success = call(fieldVal, argCount);
+                    if (success && frames.size() > frameCountBefore) {
+                        InterpretResult r = run(frameCountBefore);
+                        success = (r == InterpretResult::OK);
+                    }
+                    goto done_invoke;
+                }
+            }
+
+            auto mIt = klass->methodSlots.find(name);
+            if (mIt != klass->methodSlots.end()) {
+                Value method = klass->vtable[mIt->second];
+                size_t frameCountBefore = frames.size();
+                success = call(method, argCount);
+                if (success && frames.size() > frameCountBefore) {
+                    InterpretResult r = run(frameCountBefore);
+                    success = (r == InterpretResult::OK);
+                }
+                goto done_invoke;
+            }
+        }
+        runtimeError("Undefined method '%s'.", name.c_str());
+        return false;
+    } else if (auto* arr = gcObj->as<ObjArray>()) {
+        success = invokeArrayMethod(arr, name, argCount, receiver);
+    } else if (auto* str = gcObj->as<ObjString>()) {
+        success = invokeStringMethod(str, name, argCount, receiver);
+    } else if (auto* map = gcObj->as<ObjMap>()) {
+        success = invokeMapMethod(map, name, argCount, receiver);
+    } else if (auto* rng = gcObj->as<ObjRange>()) {
+        success = invokeRangeMethod(rng, name, argCount, receiver);
+    } else if (auto* mod = gcObj->as<ObjModule>()) {
+        auto it = mod->exports.find(name);
+        if (it != mod->exports.end()) {
+            stack[stack.size() - argCount - 1] = it->second;
+            size_t frameCountBefore = frames.size();
+            success = call(it->second, argCount);
+            if (success) {
+                if (frames.size() > frameCountBefore) {
+                    InterpretResult r = run(frameCountBefore);
+                    success = (r == InterpretResult::OK);
+                }
+            }
+        } else {
+            runtimeError("Module '%s' does not export '%s'.", mod->path.c_str(), name.c_str());
+        }
+    }
+
+done_invoke:
+
+    if (success) {
+        Value res = pop();
+        receiverSlot[0] = res;
+    }
+    stack.resize(savedStack);
+    return success;
+}
+
+bool VM::superInvokeFromJit(Value* receiverSlot, const std::string& name, uint8_t argCount) {
+    Value receiver = receiverSlot[0];
+    if (!receiver.isObject()) {
+        runtimeError("Super receiver must be an object.");
+        return false;
+    }
+    auto* instance = heap.getAs<ObjInstance>(*receiver.asObject());
+    if (!instance) {
+        runtimeError("Super receiver must be an instance.");
+        return false;
+    }
+    auto* klass = heap.getAs<ObjClass>(instance->klass);
+    if (!klass || !klass->superclass) {
+        runtimeError("Superclass not found.");
+        return false;
+    }
+    auto* superclass = heap.getAs<ObjClass>(*klass->superclass);
+    if (!superclass) return false;
+
+    auto it = superclass->methodSlots.find(name);
+    if (it == superclass->methodSlots.end()) {
+        runtimeError("Undefined superclass method '%s'.", name.c_str());
+        return false;
+    }
+
+    Value method = superclass->vtable[it->second];
+
+    size_t savedStack = stack.size();
+    for (uint8_t i = 0; i <= argCount; ++i) {
+        push(receiverSlot[i]);
+    }
+
+    size_t frameCountBefore = frames.size();
+    bool success = call(method, argCount);
+    if (success && frames.size() > frameCountBefore) {
+        InterpretResult r = run(frameCountBefore);
+        success = (r == InterpretResult::OK);
+    }
+
+    if (success) {
+        Value res = pop();
+        receiverSlot[0] = res;
+    }
+    stack.resize(savedStack);
+    return success;
+}
+
 void VM::runtimeError(const char* format, ...) {
     va_list args;
     va_start(args, format);

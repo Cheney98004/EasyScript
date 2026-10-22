@@ -15,6 +15,18 @@ struct JitGlobalSite {
     Value* cachedSlot{nullptr};
 };
 
+struct JitPropertySite {
+    uint32_t cachedClassId{0};
+    uint32_t slot{0};
+};
+
+struct JitInvokeSite {
+    uint32_t cachedClassId{0};
+    uint32_t vtableSlot{0};
+    void* nativeCode{nullptr};
+    Value cachedMethod{};
+};
+
 class ObjFunction final : public GcObject {
 public:
     static constexpr ObjType TYPE = ObjType::Function;
@@ -32,6 +44,8 @@ public:
     bool jitFailed{false};
     mutable std::vector<JitCallSite> jitCallSites;
     mutable std::vector<JitGlobalSite> jitGlobalSites;
+    mutable std::vector<JitPropertySite> jitPropertySites;
+    mutable std::vector<JitInvokeSite> jitInvokeSites;
 
     // P1 + P2: Bytecode Inline Cache (IC)
     struct InlineCache {

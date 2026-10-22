@@ -68,6 +68,8 @@ public:
 
     // JIT 呼叫與全域輔助介面
     bool callFromJit(Value* calleeSlot, uint8_t argCount);
+    bool invokeFromJit(Value* receiverSlot, const std::string& name, uint8_t argCount);
+    bool superInvokeFromJit(Value* receiverSlot, const std::string& name, uint8_t argCount);
     Value jitGetGlobal(const std::string& name);
     Value jitGetGlobal(const Value& nameVal);
     void jitSetGlobal(const std::string& name, Value val);
