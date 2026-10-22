@@ -53,6 +53,7 @@ public:
 
     // 存取 Heap
     Heap& getHeap() noexcept { return heap; }
+    std::unordered_map<std::string, Value>& getGlobals() noexcept { return globals; }
 
     // 運算元棧輔助
     void push(Value value);

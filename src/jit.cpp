@@ -159,8 +159,53 @@ int64_t easyscript_jit_call(VM* vm, Value* calleeSlot, uint8_t argCount) {
     return vm->callFromJit(calleeSlot, argCount) ? 1 : 0;
 }
 
+int64_t easyscript_jit_call_cached(VM* vm, Value* calleeSlot, uint8_t argCount, JitCallSite* cs) {
+    if (!vm || !calleeSlot) return 0;
+
+    Value callee = calleeSlot[0];
+    ObjFunction* targetFn = nullptr;
+    GcHandle targetHandle;
+    if (callee.isObject()) {
+        targetHandle = *callee.asObject();
+        GcObject* obj = vm->getHeap().get(targetHandle);
+        if (obj) {
+            if (auto* f = obj->as<ObjFunction>()) targetFn = f;
+            else if (auto* c = obj->as<ObjClosure>()) targetFn = vm->getHeap().getAs<ObjFunction>(c->function);
+        }
+    }
+
+    bool ok = vm->callFromJit(calleeSlot, argCount);
+    if (!ok) return 0;
+
+    // 若 targetFn 在本次調用後已擁有 JIT 原生進入點，快取之以供 Direct Native Call
+    if (targetFn && targetFn->nativeCode && !targetFn->jitFailed && targetFn->arity == argCount && cs) {
+        cs->expectedHandleId = targetHandle.id;
+        cs->nativeCode = targetFn->nativeCode;
+    }
+
+    return 1;
+}
+
 void easyscript_jit_get_global(VM* vm, const Value* nameVal, Value* dest) {
     if (!vm || !nameVal || !dest) return;
+    *dest = vm->jitGetGlobal(*nameVal);
+}
+
+void easyscript_jit_get_global_cached(VM* vm, const Value* nameVal, Value* dest, JitGlobalSite* gs) {
+    if (!vm || !nameVal || !dest) return;
+    if (nameVal->isObject()) {
+        auto* str = vm->getHeap().getAs<ObjString>(*nameVal->asObject());
+        if (str) {
+            auto it = vm->getGlobals().find(str->text);
+            if (it != vm->getGlobals().end()) {
+                *dest = it->second;
+                if (gs) gs->cachedSlot = &it->second;
+                return;
+            }
+            vm->jitRuntimeError("Undefined variable '" + str->text + "'.");
+            return;
+        }
+    }
     *dest = vm->jitGetGlobal(*nameVal);
 }
 
@@ -384,6 +429,18 @@ bool JitCompiler::compile(ObjFunction* fn) {
     const auto& code = fn->bytecode;
     size_t ip = 0;
 
+    // 計算 OP_CALL 呼叫點並初始化 Direct Native Call sites
+    size_t callCount = 0;
+    size_t getGlobalCount = 0;
+    for (size_t i = 0; i < code.size(); ++i) {
+        if (static_cast<OpCode>(code[i]) == OpCode::OP_CALL) callCount++;
+        else if (static_cast<OpCode>(code[i]) == OpCode::OP_GET_GLOBAL) getGlobalCount++;
+    }
+    fn->jitCallSites.assign(callCount, JitCallSite{});
+    fn->jitGlobalSites.assign(getGlobalCount, JitGlobalSite{});
+    size_t callSiteIdx = 0;
+    size_t getGlobalSiteIdx = 0;
+
     while (ip < code.size()) {
         size_t currentBcOffset = ip;
         bytecodeToNative[currentBcOffset] = a.offset();
@@ -460,17 +517,59 @@ bool JitCompiler::compile(ObjFunction* fn) {
             case OpCode::OP_GET_GLOBAL: {
                 uint8_t constIdx = code[ip++];
                 uint64_t constAddr = reinterpret_cast<uint64_t>(&fn->constants[constIdx]);
+
+                JitGlobalSite* gs = &fn->jitGlobalSites[getGlobalSiteIdx++];
+                uint64_t gsAddr = reinterpret_cast<uint64_t>(gs);
+
+                // 1. 檢查 gs->cachedSlot 是否已快取
+                // mov rbx, imm64 (gsAddr)
+                a.emitByte(0x48); a.emitByte(0xBB); a.emitQword(gsAddr);
+                // mov rax, [rbx]
+                a.emitByte(0x48); a.emitByte(0x8B); a.emitByte(0x03);
+                // test rax, rax
+                a.emitByte(0x48); a.emitByte(0x85); a.emitByte(0xC0);
+                // je slowPath
+                a.emitByte(0x0F); a.emitByte(0x84);
+                size_t jmpSlow = a.offset();
+                a.emitDword(0);
+
+                // === FAST PATH: 直接從快取的 Value* 指針以暫存器載入 ===
+                // mov rdx, [rax]
+                a.emitByte(0x48); a.emitByte(0x8B); a.emitByte(0x10);
+                // mov rcx, [rax + 8]
+                a.emitByte(0x48); a.emitByte(0x8B); a.emitByte(0x48); a.emitByte(0x08);
+                // mov [rsi], rdx
+                a.emitByte(0x48); a.emitByte(0x89); a.emitByte(0x16);
+                // mov [rsi + 8], rcx
+                a.emitByte(0x48); a.emitByte(0x89); a.emitByte(0x4E); a.emitByte(0x08);
+                // add rsi, 16
+                a.emitByte(0x48); a.emitByte(0x83); a.emitByte(0xC6); a.emitByte(0x10);
+                // jmp done
+                a.emitByte(0xE9);
+                size_t jmpDone = a.offset();
+                a.emitDword(0);
+
+                // === SLOW PATH: 呼叫 easyscript_jit_get_global_cached ===
+                size_t slowOffset = a.offset();
+                a.patchDword(jmpSlow, static_cast<uint32_t>(slowOffset - (jmpSlow + 4)));
+
                 // mov rcx, r12 (vm)
                 a.emitMovRcxR12();
                 // mov rdx, imm64 (constAddr)
                 a.emitMovRdxImm64(constAddr);
                 // mov r8, rsi (dest)
                 a.emitMovR8Rsi();
-                // call easyscript_jit_get_global
-                a.emitMovRaxImm64(reinterpret_cast<uint64_t>(&easyscript_jit_get_global));
+                // mov r9, rbx (gs)
+                a.emitByte(0x4C); a.emitByte(0x8B); a.emitByte(0xCB);
+                // call easyscript_jit_get_global_cached
+                a.emitMovRaxImm64(reinterpret_cast<uint64_t>(&easyscript_jit_get_global_cached));
                 a.emitCallRax();
                 // add rsi, 16
                 a.emitByte(0x48); a.emitByte(0x83); a.emitByte(0xC6); a.emitByte(0x10);
+
+                // === DONE ===
+                size_t doneOffset = a.offset();
+                a.patchDword(jmpDone, static_cast<uint32_t>(doneOffset - (jmpDone + 4)));
                 break;
             }
             case OpCode::OP_SET_GLOBAL: {
@@ -776,14 +875,77 @@ bool JitCompiler::compile(ObjFunction* fn) {
                 uint8_t argCount = code[ip++];
                 int32_t calleeDisp = -static_cast<int32_t>((argCount + 1) * 16);
 
+                JitCallSite* cs = &fn->jitCallSites[callSiteIdx++];
+                cs->expectedArity = argCount;
+                uint64_t csAddr = reinterpret_cast<uint64_t>(cs);
+
+                // 1. 檢查 cs->nativeCode 是否已就緒
+                // mov rbx, imm64 (csAddr)
+                a.emitByte(0x48); a.emitByte(0xBB); a.emitQword(csAddr);
+                // cmp qword ptr [rbx + 8], 0
+                a.emitByte(0x48); a.emitByte(0x83); a.emitByte(0x7B); a.emitByte(0x08); a.emitByte(0x00);
+                // je slowPath
+                a.emitByte(0x0F); a.emitByte(0x84);
+                size_t jmpSlow1 = a.offset();
+                a.emitDword(0);
+
+                // 2. 檢查被調用者是否為物件 (tag == 4)
+                int32_t tagDisp = calleeDisp + 8;
+                // cmp byte ptr [rsi + tagDisp], 4
+                a.emitByte(0x80); a.emitByte(0xBE); a.emitDword(static_cast<uint32_t>(tagDisp)); a.emitByte(0x04);
+                // jne slowPath
+                a.emitByte(0x0F); a.emitByte(0x85);
+                size_t jmpSlow2 = a.offset();
+                a.emitDword(0);
+
+                // 3. 檢查被調用者 handle.id 是否匹配 cs->expectedHandleId
+                // mov eax, [rbx]
+                a.emitByte(0x8B); a.emitByte(0x03);
+                // cmp [rsi + calleeDisp], eax
+                a.emitByte(0x39); a.emitByte(0x86); a.emitDword(static_cast<uint32_t>(calleeDisp));
+                // jne slowPath
+                a.emitByte(0x0F); a.emitByte(0x85);
+                size_t jmpSlow3 = a.offset();
+                a.emitDword(0);
+
+                // === FAST PATH: JIT Direct Native Call (原生呼叫直連) ===
+                // mov rax, [rbx + 8] (cs->nativeCode)
+                a.emitByte(0x48); a.emitByte(0x8B); a.emitByte(0x43); a.emitByte(0x08);
                 // mov rcx, r12 (vm)
                 a.emitMovRcxR12();
-                // lea rdx, [rsi + calleeDisp]
+                // lea rdx, [rsi + calleeDisp] (slots)
+                a.emitLeaRdxRsiDisp32(calleeDisp);
+                // mov r8, rdx (outResult = slots directly!)
+                a.emitByte(0x4C); a.emitByte(0x8B); a.emitByte(0xC2);
+                // call rax
+                a.emitCallRax();
+                // test eax, eax
+                a.emitByte(0x85); a.emitByte(0xC0);
+                // jnz bailout
+                a.emitByte(0x0F); a.emitByte(0x85);
+                jumpsToBailout.push_back(a.offset());
+                a.emitDword(0);
+                // jmp doneCall
+                a.emitByte(0xE9);
+                size_t jmpDone = a.offset();
+                a.emitDword(0);
+
+                // === SLOW PATH: 呼叫 easyscript_jit_call_cached ===
+                size_t slowPathOffset = a.offset();
+                a.patchDword(jmpSlow1, static_cast<uint32_t>(slowPathOffset - (jmpSlow1 + 4)));
+                a.patchDword(jmpSlow2, static_cast<uint32_t>(slowPathOffset - (jmpSlow2 + 4)));
+                a.patchDword(jmpSlow3, static_cast<uint32_t>(slowPathOffset - (jmpSlow3 + 4)));
+
+                // mov rcx, r12 (vm)
+                a.emitMovRcxR12();
+                // lea rdx, [rsi + calleeDisp] (slots)
                 a.emitLeaRdxRsiDisp32(calleeDisp);
                 // mov r8d, argCount
                 a.emitMovR8dImm32(argCount);
-                // call easyscript_jit_call
-                a.emitMovRaxImm64(reinterpret_cast<uint64_t>(&easyscript_jit_call));
+                // mov r9, rbx (cs)
+                a.emitByte(0x4C); a.emitByte(0x8B); a.emitByte(0xCB);
+                // call easyscript_jit_call_cached
+                a.emitMovRaxImm64(reinterpret_cast<uint64_t>(&easyscript_jit_call_cached));
                 a.emitCallRax();
                 // test eax, eax
                 a.emitByte(0x85); a.emitByte(0xC0);
@@ -791,6 +953,10 @@ bool JitCompiler::compile(ObjFunction* fn) {
                 a.emitByte(0x0F); a.emitByte(0x84);
                 jumpsToBailout.push_back(a.offset());
                 a.emitDword(0);
+
+                // === DONE CALL ===
+                size_t doneCallOffset = a.offset();
+                a.patchDword(jmpDone, static_cast<uint32_t>(doneCallOffset - (jmpDone + 4)));
 
                 // sub rsi, argCount * 16
                 uint32_t shrink = argCount * 16;

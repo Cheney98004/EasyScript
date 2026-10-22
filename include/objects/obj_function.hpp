@@ -5,6 +5,16 @@
 #include <vector>
 #include <cstdint>
 
+struct JitCallSite {
+    uint32_t expectedHandleId{0};
+    uint32_t expectedArity{0};
+    void* nativeCode{nullptr};
+};
+
+struct JitGlobalSite {
+    Value* cachedSlot{nullptr};
+};
+
 class ObjFunction final : public GcObject {
 public:
     static constexpr ObjType TYPE = ObjType::Function;
@@ -20,6 +30,8 @@ public:
     uint32_t invocationCount{0};
     uint32_t backedgeCount{0};
     bool jitFailed{false};
+    mutable std::vector<JitCallSite> jitCallSites;
+    mutable std::vector<JitGlobalSite> jitGlobalSites;
 
     // P1 + P2: Bytecode Inline Cache (IC)
     struct InlineCache {
