@@ -42,6 +42,9 @@ public:
     // 解譯並執行原始碼
     InterpretResult interpret(std::string_view source, const std::string& modulePath = "<main>");
 
+    // 執行已編譯之 ObjFunction
+    InterpretResult execute(ObjFunction* fn, const std::string& modulePath = "<main>");
+
     // 模組載入與註冊
     ObjModule* loadModule(const std::string& path);
 

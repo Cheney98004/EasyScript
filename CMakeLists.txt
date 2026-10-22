@@ -26,6 +26,7 @@ set(EASYSCRIPT_SOURCES
     src/lexer.cpp
     src/opcode.cpp
     src/compiler.cpp
+    src/serializer.cpp
     src/vm.cpp
     src/objects/gc_object.cpp
     src/objects/obj_string.cpp

@@ -5,8 +5,10 @@
 #include "heap.hpp"
 #include "object.hpp"
 #include "opcode.hpp"
+#include "type.hpp"
 #include <string_view>
 #include <vector>
+#include <unordered_map>
 #include <optional>
 
 // -----------------------------------------------------------------------------
@@ -40,6 +42,7 @@ struct Local {
     Token name;
     int depth{-1};  // -1 表示正在宣告中（尚未初始化完成）
     bool isCaptured{false};
+    Type type{Type::Any()};
 };
 
 // 閉包 Upvalue 描述子
@@ -56,6 +59,7 @@ struct FunctionState {
     std::vector<Local> locals;
     std::vector<CompilerUpvalue> upvalues;
     int scopeDepth{0};
+    Type returnType{Type::Any()};
 };
 
 // 類別編譯期上下文
@@ -98,6 +102,10 @@ private:
     int lastResolvedLocalSlot{-1};
     int lastResolvedUpvalueSlot{-1};
     int lastResolvedGlobalConstant{-1};
+
+    Type lastExpressionType{Type::Any()};
+    std::unordered_map<std::string, Type> globalTypes;
+    std::unordered_map<std::string, std::string> classHierarchy;
 
     FunctionState& currentFunction() noexcept { return functionStack.back(); }
     const FunctionState& currentFunction() const noexcept { return functionStack.back(); }
@@ -165,13 +173,15 @@ private:
     void throwStatement();
     void block();
     void expressionStatement();
+    Type parseType();
+    Type parseTypeAnnotation();
     void skipTypeAnnotation();
     void skipModifiers();
 
     // -------------------------------------------------------------------------
     // Pratt Parser 運算式解析核心
     // -------------------------------------------------------------------------
-    void expression();
+    Type expression();
     void parsePrecedence(Precedence precedence);
     const ParseRule& getRule(TokenType type) const;
 

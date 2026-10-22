@@ -303,21 +303,50 @@ void Compiler::skipModifiers() {
     }
 }
 
-void Compiler::skipTypeAnnotation() {
-    if (match(TokenType::COLON) || match(TokenType::ARROW)) {
-        advance();
+Type Compiler::parseType() {
+    Type baseType = Type::Any();
+
+    if (match(TokenType::TYPE_INT)) {
+        baseType = Type::Int();
+    } else if (match(TokenType::TYPE_DOUBLE)) {
+        baseType = Type::Double();
+    } else if (match(TokenType::TYPE_BOOL)) {
+        baseType = Type::Bool();
+    } else if (match(TokenType::TYPE_STRING)) {
+        baseType = Type::String();
+    } else if (match(TokenType::TYPE_VOID)) {
+        baseType = Type::Void();
+    } else if (match(TokenType::TYPE_MAP)) {
+        Type keyT = Type::Any();
+        Type valT = Type::Any();
         if (match(TokenType::LESS)) {
-            int depth = 1;
-            while (depth > 0 && !check(TokenType::TOKEN_EOF)) {
-                if (match(TokenType::LESS)) depth++;
-                else if (match(TokenType::GREATER)) depth--;
-                else advance();
-            }
+            keyT = parseType();
+            consume(TokenType::COMMA, "Expect ',' between Map key and value types.");
+            valT = parseType();
+            consume(TokenType::GREATER, "Expect '>' after Map types.");
         }
-        while (match(TokenType::LEFT_BRACKET)) {
-            consume(TokenType::RIGHT_BRACKET, "Expect ']' after '[' in type.");
-        }
+        baseType = Type::Map(keyT, valT);
+    } else if (match(TokenType::IDENTIFIER)) {
+        baseType = Type::Class(std::string(previous.lexeme));
     }
+
+    while (match(TokenType::LEFT_BRACKET)) {
+        consume(TokenType::RIGHT_BRACKET, "Expect ']' after '[' in array type.");
+        baseType = Type::Array(baseType);
+    }
+
+    return baseType;
+}
+
+Type Compiler::parseTypeAnnotation() {
+    if (match(TokenType::COLON) || match(TokenType::ARROW)) {
+        return parseType();
+    }
+    return Type::Any();
+}
+
+void Compiler::skipTypeAnnotation() {
+    parseTypeAnnotation();
 }
 
 uint8_t Compiler::argumentList() {
@@ -385,6 +414,7 @@ void Compiler::classDeclaration() {
 
     emitBytes(static_cast<uint8_t>(OpCode::OP_CLASS), nameConstant);
     defineVariable(nameConstant);
+    globalTypes[std::string(className.lexeme)] = Type::Class(std::string(className.lexeme));
 
     ClassCompiler classCompiler;
     classCompiler.enclosing = currentClass;
@@ -393,6 +423,7 @@ void Compiler::classDeclaration() {
     // 繼承判定 : SuperClass, Interface...
     if (match(TokenType::COLON)) {
         consume(TokenType::IDENTIFIER, "Expect superclass name.");
+        classHierarchy[std::string(className.lexeme)] = std::string(previous.lexeme);
         variable(false);
 
         if (className.lexeme == previous.lexeme) {
@@ -478,15 +509,20 @@ void Compiler::method(FunctionType type) {
             if (isProperty) {
                 autoProperties.push_back(previous);
             }
-            skipTypeAnnotation();
+            Type pType = parseTypeAnnotation();
+            currentFunction().locals.back().type = pType;
             if (match(TokenType::EQUAL)) {
-                expression(); // 預設參數
+                Type defType = expression(); // 預設參數
+                if (pType.kind != TypeKind::ANY && !isAssignable(pType, defType, classHierarchy)) {
+                    error("Default parameter type does not match parameter type.");
+                }
             }
             defineVariable(paramConstant);
         } while (match(TokenType::COMMA));
     }
     consume(TokenType::RIGHT_PAREN, "Expect ')' after parameters.");
-    skipTypeAnnotation(); // 跳過回傳型別
+    Type retType = parseTypeAnnotation();
+    currentFunction().returnType = retType;
 
     consume(TokenType::LEFT_BRACE, "Expect '{' before method body.");
 
@@ -513,13 +549,26 @@ void Compiler::method(FunctionType type) {
 
 void Compiler::varDeclaration() {
     uint8_t global = parseVariable("Expect variable name.");
+    Token varToken = previous;
 
-    skipTypeAnnotation();
+    Type expectedType = parseTypeAnnotation();
 
+    Type initType = Type::Nil();
     if (match(TokenType::EQUAL)) {
-        expression();
+        initType = expression();
+        if (expectedType.kind != TypeKind::ANY && !isAssignable(expectedType, initType, classHierarchy)) {
+            error("Type mismatch: cannot assign value of type '" + initType.toString() +
+                  "' to variable '" + std::string(varToken.lexeme) + "' of type '" + expectedType.toString() + "'.");
+        }
     } else {
         emitOp(OpCode::OP_NIL);
+    }
+
+    Type assignedType = (expectedType.kind != TypeKind::ANY) ? expectedType : initType;
+    if (currentFunction().scopeDepth > 0) {
+        currentFunction().locals.back().type = assignedType;
+    } else {
+        globalTypes[std::string(varToken.lexeme)] = assignedType;
     }
 
     if (match(TokenType::SEMICOLON)) {
@@ -553,20 +602,28 @@ void Compiler::fnDeclaration() {
     beginScope();
     consume(TokenType::LEFT_PAREN, "Expect '(' after function name.");
 
+    std::vector<Type> paramTypes;
     if (!check(TokenType::RIGHT_PAREN)) {
         do {
             currentFunction().function->arity++;
             uint8_t paramConstant = parseVariable("Expect parameter name.");
-            skipTypeAnnotation();
+            Type pType = parseTypeAnnotation();
+            currentFunction().locals.back().type = pType;
+            paramTypes.push_back(pType);
             if (match(TokenType::EQUAL)) {
-                expression(); // 預設參數
+                Type defType = expression(); // 預設參數
+                if (pType.kind != TypeKind::ANY && !isAssignable(pType, defType, classHierarchy)) {
+                    error("Default parameter type does not match parameter type.");
+                }
             }
             defineVariable(paramConstant);
         } while (match(TokenType::COMMA));
     }
     consume(TokenType::RIGHT_PAREN, "Expect ')' after parameters.");
 
-    skipTypeAnnotation();
+    Type retType = parseTypeAnnotation();
+    currentFunction().returnType = retType;
+    globalTypes[fnName] = Type::Function(paramTypes, retType);
 
     consume(TokenType::LEFT_BRACE, "Expect '{' before function body.");
     block();
@@ -600,19 +657,28 @@ void Compiler::exportDeclaration() {
         beginScope();
         consume(TokenType::LEFT_PAREN, "Expect '(' after function name.");
 
+        std::vector<Type> paramTypes;
         if (!check(TokenType::RIGHT_PAREN)) {
             do {
                 currentFunction().function->arity++;
                 uint8_t paramConstant = parseVariable("Expect parameter name.");
-                skipTypeAnnotation();
+                Type pType = parseTypeAnnotation();
+                currentFunction().locals.back().type = pType;
+                paramTypes.push_back(pType);
                 if (match(TokenType::EQUAL)) {
-                    expression();
+                    Type defType = expression();
+                    if (pType.kind != TypeKind::ANY && !isAssignable(pType, defType, classHierarchy)) {
+                        error("Default parameter type does not match parameter type.");
+                    }
                 }
                 defineVariable(paramConstant);
             } while (match(TokenType::COMMA));
         }
         consume(TokenType::RIGHT_PAREN, "Expect ')' after parameters.");
-        skipTypeAnnotation();
+
+        Type retType = parseTypeAnnotation();
+        currentFunction().returnType = retType;
+        globalTypes[fnName] = Type::Function(paramTypes, retType);
 
         consume(TokenType::LEFT_BRACE, "Expect '{' before function body.");
         block();
@@ -627,6 +693,21 @@ void Compiler::exportDeclaration() {
         emitBytes(static_cast<uint8_t>(OpCode::OP_EXPORT), global);
     } else if (match(TokenType::LET)) {
         uint8_t global = parseVariable("Expect variable name.");
+        Token varToken = previous;
+        Type expectedType = parseTypeAnnotation();
+        Type initType = Type::Nil();
+        if (match(TokenType::EQUAL)) {
+            initType = expression();
+            if (expectedType.kind != TypeKind::ANY && !isAssignable(expectedType, initType, classHierarchy)) {
+                error("Type mismatch in export let: cannot assign '" + initType.toString() + "' to '" + expectedType.toString() + "'.");
+            }
+        } else {
+            emitOp(OpCode::OP_NIL);
+        }
+        consume(TokenType::SEMICOLON, "Expect ';' after variable declaration.");
+        defineVariable(global);
+        emitBytes(static_cast<uint8_t>(OpCode::OP_EXPORT), global);
+        globalTypes[std::string(varToken.lexeme)] = (expectedType.kind != TypeKind::ANY) ? expectedType : initType;
         skipTypeAnnotation();
         if (match(TokenType::EQUAL)) {
             expression();
@@ -886,12 +967,22 @@ void Compiler::returnStatement() {
     }
 
     if (match(TokenType::SEMICOLON)) {
+        if (currentFunction().returnType.kind != TypeKind::ANY &&
+            currentFunction().returnType.kind != TypeKind::VOID &&
+            currentFunction().returnType.kind != TypeKind::NIL) {
+            error("Cannot return void from function with return type '" + currentFunction().returnType.toString() + "'.");
+        }
         emitReturn();
     } else {
         if (currentFunction().type == FunctionType::INITIALIZER) {
             error("Can't return a value from an initializer.");
         }
-        expression();
+        Type valType = expression();
+        if (currentFunction().returnType.kind != TypeKind::ANY &&
+            !isAssignable(currentFunction().returnType, valType, classHierarchy)) {
+            error("Return type mismatch: expected '" + currentFunction().returnType.toString() +
+                  "', got '" + valType.toString() + "'.");
+        }
         consume(TokenType::SEMICOLON, "Expect ';' after return value.");
         emitOp(OpCode::OP_RETURN);
     }
@@ -994,8 +1085,9 @@ void Compiler::expressionStatement() {
 // Pratt Parser 運算式解析核心
 // -----------------------------------------------------------------------------
 
-void Compiler::expression() {
+Type Compiler::expression() {
     parsePrecedence(Precedence::ASSIGNMENT);
+    return lastExpressionType;
 }
 
 void Compiler::parsePrecedence(Precedence precedence) {
@@ -1036,9 +1128,11 @@ void Compiler::number(bool) {
             val = std::strtoll(text.data(), nullptr, 10);
         }
         emitConstant(Value(val));
+        lastExpressionType = Type::Int();
     } else {
         double val = std::strtod(text.data(), nullptr);
         emitConstant(Value(val));
+        lastExpressionType = Type::Double();
     }
 }
 
@@ -1046,19 +1140,20 @@ void Compiler::string(bool) {
     std::string_view content = previous.lexeme.substr(1, previous.lexeme.size() - 2);
     GcHandle strHandle = heap.allocateString(std::string(content));
     emitConstant(Value(strHandle));
+    lastExpressionType = Type::String();
 }
 
 void Compiler::literal(bool) {
     switch (previous.type) {
-        case TokenType::FALSE: emitOp(OpCode::OP_FALSE); break;
-        case TokenType::TRUE:  emitOp(OpCode::OP_TRUE);  break;
-        case TokenType::NIL:   emitOp(OpCode::OP_NIL);   break;
+        case TokenType::FALSE: emitOp(OpCode::OP_FALSE); lastExpressionType = Type::Bool(); break;
+        case TokenType::TRUE:  emitOp(OpCode::OP_TRUE);  lastExpressionType = Type::Bool(); break;
+        case TokenType::NIL:   emitOp(OpCode::OP_NIL);   lastExpressionType = Type::Nil(); break;
         default: return;
     }
 }
 
 void Compiler::grouping(bool) {
-    expression();
+    lastExpressionType = expression();
     consume(TokenType::RIGHT_PAREN, "Expect ')' after expression.");
 }
 
@@ -1066,10 +1161,11 @@ void Compiler::unary(bool) {
     TokenType operatorType = previous.type;
 
     parsePrecedence(Precedence::UNARY);
+    Type operandType = lastExpressionType;
 
     switch (operatorType) {
-        case TokenType::BANG:  emitOp(OpCode::OP_NOT);    break;
-        case TokenType::MINUS: emitOp(OpCode::OP_NEGATE); break;
+        case TokenType::BANG:  emitOp(OpCode::OP_NOT);    lastExpressionType = Type::Bool(); break;
+        case TokenType::MINUS: emitOp(OpCode::OP_NEGATE); lastExpressionType = (operandType.kind == TypeKind::DOUBLE ? Type::Double() : Type::Int()); break;
         default: return;
     }
 }
@@ -1093,20 +1189,27 @@ void Compiler::lambda(bool) {
     beginScope();
     consume(TokenType::LEFT_PAREN, "Expect '(' after 'fn'.");
 
+    std::vector<Type> paramTypes;
     if (!check(TokenType::RIGHT_PAREN)) {
         do {
             currentFunction().function->arity++;
             uint8_t paramConstant = parseVariable("Expect parameter name.");
-            skipTypeAnnotation();
+            Type pType = parseTypeAnnotation();
+            currentFunction().locals.back().type = pType;
+            paramTypes.push_back(pType);
             if (match(TokenType::EQUAL)) {
-                expression(); // 預設參數
+                Type defType = expression(); // 預設參數
+                if (pType.kind != TypeKind::ANY && !isAssignable(pType, defType, classHierarchy)) {
+                    error("Default parameter type does not match parameter type.");
+                }
             }
             defineVariable(paramConstant);
         } while (match(TokenType::COMMA));
     }
     consume(TokenType::RIGHT_PAREN, "Expect ')' after parameters.");
 
-    skipTypeAnnotation(); // 跳過 `-> returnType`
+    Type retType = parseTypeAnnotation();
+    currentFunction().returnType = retType;
 
     consume(TokenType::LEFT_BRACE, "Expect '{' before lambda body.");
     block();
@@ -1117,6 +1220,7 @@ void Compiler::lambda(bool) {
     functionStack.pop_back();
 
     emitClosure(finished);
+    lastExpressionType = Type::Function(paramTypes, retType);
 }
 
 void Compiler::this_(bool) {
@@ -1162,11 +1266,13 @@ void Compiler::super_(bool) {
             emitBytes(static_cast<uint8_t>(OpCode::OP_GET_SUPER), nameConst);
         }
     }
+    lastExpressionType = Type::Any();
 }
 
 void Compiler::namedVariable(Token name, bool canAssign) {
     uint8_t getOp, setOp;
     int arg = resolveLocal(name);
+    Type varType = Type::Any();
 
     if (arg != -1) {
         lastResolvedLocalSlot = arg;
@@ -1174,12 +1280,14 @@ void Compiler::namedVariable(Token name, bool canAssign) {
         lastResolvedGlobalConstant = -1;
         getOp = static_cast<uint8_t>(OpCode::OP_GET_LOCAL);
         setOp = static_cast<uint8_t>(OpCode::OP_SET_LOCAL);
+        varType = currentFunction().locals[arg].type;
     } else if ((arg = resolveUpvalue(functionStack.size() - 1, name)) != -1) {
         lastResolvedLocalSlot = -1;
         lastResolvedUpvalueSlot = arg;
         lastResolvedGlobalConstant = -1;
         getOp = static_cast<uint8_t>(OpCode::OP_GET_UPVALUE);
         setOp = static_cast<uint8_t>(OpCode::OP_SET_UPVALUE);
+        varType = Type::Any();
     } else {
         arg = identifierConstant(name);
         lastResolvedLocalSlot = -1;
@@ -1187,23 +1295,35 @@ void Compiler::namedVariable(Token name, bool canAssign) {
         lastResolvedGlobalConstant = arg;
         getOp = static_cast<uint8_t>(OpCode::OP_GET_GLOBAL);
         setOp = static_cast<uint8_t>(OpCode::OP_SET_GLOBAL);
+        auto it = globalTypes.find(std::string(name.lexeme));
+        if (it != globalTypes.end()) {
+            varType = it->second;
+        }
     }
 
     if (canAssign && match(TokenType::EQUAL)) {
-        expression();
+        Type valType = expression();
+        if (varType.kind != TypeKind::ANY && !isAssignable(varType, valType, classHierarchy)) {
+            error("Type mismatch: cannot assign value of type '" + valType.toString() +
+                  "' to variable '" + std::string(name.lexeme) + "' of type '" + varType.toString() + "'.");
+        }
         emitBytes(setOp, static_cast<uint8_t>(arg));
+        lastExpressionType = valType;
     } else if (canAssign && match(TokenType::PLUS_EQUAL)) {
         emitBytes(getOp, static_cast<uint8_t>(arg));
-        expression();
+        Type valType = expression();
         emitOp(OpCode::OP_ADD);
         emitBytes(setOp, static_cast<uint8_t>(arg));
+        lastExpressionType = varType;
     } else if (canAssign && match(TokenType::MINUS_EQUAL)) {
         emitBytes(getOp, static_cast<uint8_t>(arg));
-        expression();
+        Type valType = expression();
         emitOp(OpCode::OP_SUB);
         emitBytes(setOp, static_cast<uint8_t>(arg));
+        lastExpressionType = varType;
     } else {
         emitBytes(getOp, static_cast<uint8_t>(arg));
+        lastExpressionType = varType;
     }
 }
 
@@ -1217,6 +1337,7 @@ void Compiler::postfixInc(bool) {
     } else if (lastResolvedGlobalConstant != -1) {
         emitBytes(static_cast<uint8_t>(OpCode::OP_SET_GLOBAL), static_cast<uint8_t>(lastResolvedGlobalConstant));
     }
+    lastExpressionType = Type::Int();
 }
 
 void Compiler::postfixDec(bool) {
@@ -1229,13 +1350,22 @@ void Compiler::postfixDec(bool) {
     } else if (lastResolvedGlobalConstant != -1) {
         emitBytes(static_cast<uint8_t>(OpCode::OP_SET_GLOBAL), static_cast<uint8_t>(lastResolvedGlobalConstant));
     }
+    lastExpressionType = Type::Int();
 }
 
 void Compiler::arrayLiteral(bool) {
     uint16_t count = 0;
+    Type elemType = Type::Any();
+    bool first = true;
     if (!check(TokenType::RIGHT_BRACKET)) {
         do {
-            expression();
+            Type t = expression();
+            if (first) {
+                elemType = t;
+                first = false;
+            } else if (elemType.kind != t.kind) {
+                elemType = Type::Any();
+            }
             count++;
         } while (match(TokenType::COMMA));
     }
@@ -1244,15 +1374,24 @@ void Compiler::arrayLiteral(bool) {
     emitOp(OpCode::OP_BUILD_ARRAY);
     emitByte(static_cast<uint8_t>((count >> 8) & 0xff));
     emitByte(static_cast<uint8_t>(count & 0xff));
+    lastExpressionType = Type::Array(elemType);
 }
 
 void Compiler::mapLiteral(bool) {
     uint16_t count = 0;
+    Type keyType = Type::Any();
+    Type valType = Type::Any();
+    bool first = true;
     if (!check(TokenType::RIGHT_BRACE)) {
         do {
-            expression(); // Key
+            Type kt = expression(); // Key
             consume(TokenType::COLON, "Expect ':' between key and value.");
-            expression(); // Value
+            Type vt = expression(); // Value
+            if (first) {
+                keyType = kt;
+                valType = vt;
+                first = false;
+            }
             count++;
         } while (match(TokenType::COMMA));
     }
@@ -1261,6 +1400,7 @@ void Compiler::mapLiteral(bool) {
     emitOp(OpCode::OP_BUILD_MAP);
     emitByte(static_cast<uint8_t>((count >> 8) & 0xff));
     emitByte(static_cast<uint8_t>(count & 0xff));
+    lastExpressionType = Type::Map(keyType, valType);
 }
 
 void Compiler::interpolation(bool) {
@@ -1290,6 +1430,7 @@ void Compiler::interpolation(bool) {
         emitConstant(Value(tailStr));
         emitOp(OpCode::OP_STRING_CONCAT);
     }
+    lastExpressionType = Type::String();
 }
 
 // -----------------------------------------------------------------------------
@@ -1298,21 +1439,82 @@ void Compiler::interpolation(bool) {
 
 void Compiler::binary(bool) {
     TokenType operatorType = previous.type;
+    Type leftType = lastExpressionType;
     const ParseRule& rule = getRule(operatorType);
     parsePrecedence(static_cast<Precedence>(static_cast<int>(rule.precedence) + 1));
+    Type rightType = lastExpressionType;
 
     switch (operatorType) {
-        case TokenType::PLUS:          emitOp(OpCode::OP_ADD); break;
-        case TokenType::MINUS:         emitOp(OpCode::OP_SUB); break;
-        case TokenType::STAR:          emitOp(OpCode::OP_MUL); break;
-        case TokenType::SLASH:         emitOp(OpCode::OP_DIV); break;
-        case TokenType::PERCENT:       emitOp(OpCode::OP_MOD); break;
-        case TokenType::BANG_EQUAL:    emitBytes(static_cast<uint8_t>(OpCode::OP_EQUAL), static_cast<uint8_t>(OpCode::OP_NOT)); break;
-        case TokenType::EQUAL_EQUAL:   emitOp(OpCode::OP_EQUAL); break;
-        case TokenType::GREATER:       emitOp(OpCode::OP_GREATER); break;
-        case TokenType::GREATER_EQUAL: emitBytes(static_cast<uint8_t>(OpCode::OP_LESS), static_cast<uint8_t>(OpCode::OP_NOT)); break;
-        case TokenType::LESS:          emitOp(OpCode::OP_LESS); break;
-        case TokenType::LESS_EQUAL:    emitBytes(static_cast<uint8_t>(OpCode::OP_GREATER), static_cast<uint8_t>(OpCode::OP_NOT)); break;
+        case TokenType::PLUS:
+            emitOp(OpCode::OP_ADD);
+            if (leftType.kind == TypeKind::STRING || rightType.kind == TypeKind::STRING) {
+                lastExpressionType = Type::String();
+            } else if (leftType.kind == TypeKind::DOUBLE || rightType.kind == TypeKind::DOUBLE) {
+                lastExpressionType = Type::Double();
+            } else if (leftType.kind == TypeKind::INT && rightType.kind == TypeKind::INT) {
+                lastExpressionType = Type::Int();
+            } else {
+                lastExpressionType = Type::Any();
+            }
+            break;
+        case TokenType::MINUS:
+            emitOp(OpCode::OP_SUB);
+            if (leftType.kind == TypeKind::DOUBLE || rightType.kind == TypeKind::DOUBLE) {
+                lastExpressionType = Type::Double();
+            } else if (leftType.kind == TypeKind::INT && rightType.kind == TypeKind::INT) {
+                lastExpressionType = Type::Int();
+            } else {
+                lastExpressionType = Type::Any();
+            }
+            break;
+        case TokenType::STAR:
+            emitOp(OpCode::OP_MUL);
+            if (leftType.kind == TypeKind::DOUBLE || rightType.kind == TypeKind::DOUBLE) {
+                lastExpressionType = Type::Double();
+            } else if (leftType.kind == TypeKind::INT && rightType.kind == TypeKind::INT) {
+                lastExpressionType = Type::Int();
+            } else {
+                lastExpressionType = Type::Any();
+            }
+            break;
+        case TokenType::SLASH:
+            emitOp(OpCode::OP_DIV);
+            if (leftType.kind == TypeKind::DOUBLE || rightType.kind == TypeKind::DOUBLE) {
+                lastExpressionType = Type::Double();
+            } else if (leftType.kind == TypeKind::INT && rightType.kind == TypeKind::INT) {
+                lastExpressionType = Type::Int();
+            } else {
+                lastExpressionType = Type::Any();
+            }
+            break;
+        case TokenType::PERCENT:
+            emitOp(OpCode::OP_MOD);
+            lastExpressionType = Type::Int();
+            break;
+        case TokenType::BANG_EQUAL:
+            emitBytes(static_cast<uint8_t>(OpCode::OP_EQUAL), static_cast<uint8_t>(OpCode::OP_NOT));
+            lastExpressionType = Type::Bool();
+            break;
+        case TokenType::EQUAL_EQUAL:
+            emitOp(OpCode::OP_EQUAL);
+            lastExpressionType = Type::Bool();
+            break;
+        case TokenType::GREATER:
+            emitOp(OpCode::OP_GREATER);
+            lastExpressionType = Type::Bool();
+            break;
+        case TokenType::GREATER_EQUAL:
+            emitBytes(static_cast<uint8_t>(OpCode::OP_LESS), static_cast<uint8_t>(OpCode::OP_NOT));
+            lastExpressionType = Type::Bool();
+            break;
+        case TokenType::LESS:
+            emitOp(OpCode::OP_LESS);
+            lastExpressionType = Type::Bool();
+            break;
+        case TokenType::LESS_EQUAL:
+            emitBytes(static_cast<uint8_t>(OpCode::OP_GREATER), static_cast<uint8_t>(OpCode::OP_NOT));
+            lastExpressionType = Type::Bool();
+            break;
         default: return;
     }
 }
@@ -1336,8 +1538,16 @@ void Compiler::or_(bool) {
 }
 
 void Compiler::call(bool) {
+    Type calleeType = lastExpressionType;
     uint8_t argCount = argumentList();
     emitBytes(static_cast<uint8_t>(OpCode::OP_CALL), argCount);
+    if (calleeType.kind == TypeKind::CLASS) {
+        lastExpressionType = calleeType;
+    } else if (calleeType.kind == TypeKind::FUNCTION && calleeType.returnType) {
+        lastExpressionType = *calleeType.returnType;
+    } else {
+        lastExpressionType = Type::Any();
+    }
 }
 
 void Compiler::dot(bool canAssign) {
@@ -1345,32 +1555,47 @@ void Compiler::dot(bool canAssign) {
     uint8_t name = identifierConstant(previous);
 
     if (canAssign && match(TokenType::EQUAL)) {
-        expression();
+        Type valType = expression();
         emitBytes(static_cast<uint8_t>(OpCode::OP_SET_PROPERTY), name);
+        lastExpressionType = valType;
     } else if (match(TokenType::LEFT_PAREN)) {
         uint8_t argCount = argumentList();
         emitBytes(static_cast<uint8_t>(OpCode::OP_INVOKE), name);
         emitByte(argCount);
+        lastExpressionType = Type::Any();
     } else {
         emitBytes(static_cast<uint8_t>(OpCode::OP_GET_PROPERTY), name);
+        lastExpressionType = Type::Any();
     }
 }
 
 void Compiler::subscript(bool canAssign) {
-    expression();
+    Type receiverType = lastExpressionType;
+    Type indexType = expression();
     consume(TokenType::RIGHT_BRACKET, "Expect ']' after index.");
 
     if (canAssign && match(TokenType::EQUAL)) {
-        expression();
+        Type valType = expression();
         emitOp(OpCode::OP_SET_INDEX);
+        lastExpressionType = valType;
     } else {
         emitOp(OpCode::OP_GET_INDEX);
+        if (receiverType.kind == TypeKind::ARRAY && receiverType.elementType) {
+            lastExpressionType = *receiverType.elementType;
+        } else if (receiverType.kind == TypeKind::MAP && receiverType.valueType) {
+            lastExpressionType = *receiverType.valueType;
+        } else if (receiverType.kind == TypeKind::STRING) {
+            lastExpressionType = Type::String();
+        } else {
+            lastExpressionType = Type::Any();
+        }
     }
 }
 
 void Compiler::range(bool) {
     parsePrecedence(Precedence::RANGE);
     emitOp(OpCode::OP_BUILD_RANGE);
+    lastExpressionType = Type::Array(Type::Int());
 }
 
 // -----------------------------------------------------------------------------

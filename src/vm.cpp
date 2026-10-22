@@ -832,18 +832,16 @@ ObjModule* VM::loadModule(const std::string& path) {
     return mod;
 }
 
-InterpretResult VM::interpret(std::string_view source, const std::string& modulePath) {
+InterpretResult VM::execute(ObjFunction* fn, const std::string& modulePath) {
+    if (fn == nullptr) {
+        return InterpretResult::COMPILE_ERROR;
+    }
+
     currentRunningVM = this;
 
     GcHandle modHandle = heap.allocate<ObjModule>(modulePath);
     modules[modulePath] = modHandle;
     currentModule = heap.getAs<ObjModule>(modHandle);
-
-    Compiler compiler(heap, source);
-    ObjFunction* fn = compiler.compile();
-    if (fn == nullptr) {
-        return InterpretResult::COMPILE_ERROR;
-    }
 
     push(Value(heap.allocateString("<script>"))); // 槽位 0
     frames.push_back(CallFrame{nullptr, fn, fn->bytecode.data(), 0});
@@ -866,6 +864,16 @@ InterpretResult VM::interpret(std::string_view source, const std::string& module
     }
 
     return InterpretResult::OK;
+}
+
+InterpretResult VM::interpret(std::string_view source, const std::string& modulePath) {
+    Compiler compiler(heap, source);
+    ObjFunction* fn = compiler.compile();
+    if (fn == nullptr) {
+        return InterpretResult::COMPILE_ERROR;
+    }
+
+    return execute(fn, modulePath);
 }
 
 // -----------------------------------------------------------------------------
