@@ -798,8 +798,27 @@ void Compiler::exportDeclaration() {
         defineVariable(global);
         emitBytes(static_cast<uint8_t>(OpCode::OP_EXPORT), global);
         globalTypes[std::string(varToken.lexeme)] = (expectedType.kind != TypeKind::ANY) ? expectedType : initType;
+    } else if (match(TokenType::CONST)) {
+        uint8_t global = parseVariable("Expect constant name.");
+        Token varToken = previous;
+        Type expectedType = parseTypeAnnotation();
+        consume(TokenType::EQUAL, "Expect '=' after constant name.");
+        Type initType = expression();
+        if (expectedType.kind != TypeKind::ANY && !isAssignable(expectedType, initType, classHierarchy)) {
+            error("Type mismatch in export const: cannot assign '" + initType.toString() + "' to '" + expectedType.toString() + "'.");
+        }
+        consume(TokenType::SEMICOLON, "Expect ';' after constant declaration.");
+        defineVariable(global);
+        emitBytes(static_cast<uint8_t>(OpCode::OP_EXPORT), global);
+        globalTypes[std::string(varToken.lexeme)] = (expectedType.kind != TypeKind::ANY) ? expectedType : initType;
+    } else if (check(TokenType::CLASS)) {
+        advance();
+        Token className = current;
+        classDeclaration();
+        uint8_t global = identifierConstant(className);
+        emitBytes(static_cast<uint8_t>(OpCode::OP_EXPORT), global);
     } else {
-        error("Only functions or variables can be exported.");
+        error("Only functions, variables, constants, or classes can be exported.");
     }
 }
 

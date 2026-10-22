@@ -3,8 +3,12 @@
 #include "lexer.hpp"
 #include <iostream>
 #include <sstream>
+#include <fstream>
+#include <filesystem>
 #include <algorithm>
 #include <cctype>
+
+namespace fs = std::filesystem;
 
 #if defined(_WIN32)
 #include <io.h>
@@ -253,47 +257,519 @@ void LspServer::validateDocument(const std::string& uri, const std::string& text
 }
 
 // -----------------------------------------------------------------------------
-// 輔助函式：提取行列中的前綴字串
+// URI 與路徑轉換輔助
 // -----------------------------------------------------------------------------
 
-static std::string getLinePrefix(const std::string& text, int line, int character) {
+static std::string uriToPath(const std::string& uri) {
+    std::string path = uri;
+    if (path.starts_with("file:///")) {
+        path = path.substr(8);
+    } else if (path.starts_with("file://")) {
+        path = path.substr(7);
+    }
+    size_t colonPos = path.find("%3A");
+    if (colonPos != std::string::npos) path.replace(colonPos, 3, ":");
+    colonPos = path.find("%3a");
+    if (colonPos != std::string::npos) path.replace(colonPos, 3, ":");
+    size_t spacePos = 0;
+    while ((spacePos = path.find("%20", spacePos)) != std::string::npos) {
+        path.replace(spacePos, 3, " ");
+        spacePos += 1;
+    }
+    return path;
+}
+
+static std::string pathToUri(const std::string& path) {
+    std::string normal = path;
+    std::replace(normal.begin(), normal.end(), '\\', '/');
+    if (!normal.empty() && normal[0] != '/') {
+        return "file:///" + normal;
+    }
+    return "file://" + normal;
+}
+
+// -----------------------------------------------------------------------------
+// 輔助函式：文字提取、註解解析與字詞內容分析
+// -----------------------------------------------------------------------------
+
+static std::string extractDocComment(const std::string& text, int targetLine0Based) {
+    std::istringstream stream(text);
+    std::string line;
+    std::vector<std::string> lines;
+    while (std::getline(stream, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        lines.push_back(line);
+    }
+    if (targetLine0Based <= 0 || targetLine0Based >= static_cast<int>(lines.size())) {
+        return "";
+    }
+    int cur = targetLine0Based - 1;
+    std::vector<std::string> commentLines;
+    while (cur >= 0) {
+        std::string l = lines[cur];
+        size_t firstNonBlank = l.find_first_not_of(" \t");
+        if (firstNonBlank == std::string::npos) break;
+        if (l.compare(firstNonBlank, 2, "//") == 0) {
+            std::string content = l.substr(firstNonBlank + 2);
+            if (!content.empty() && content.front() == ' ') content.erase(0, 1);
+            commentLines.push_back(content);
+            cur--;
+        } else if (l.compare(firstNonBlank, 2, "*/") == 0) {
+            commentLines.push_back(l.substr(firstNonBlank));
+            cur--;
+            while (cur >= 0) {
+                std::string ml = lines[cur];
+                size_t fb = ml.find_first_not_of(" \t");
+                if (fb != std::string::npos && ml.compare(fb, 2, "/*") == 0) {
+                    commentLines.push_back(ml.substr(fb));
+                    break;
+                }
+                commentLines.push_back(ml);
+                cur--;
+            }
+            break;
+        } else {
+            break;
+        }
+    }
+    if (commentLines.empty()) return "";
+    std::reverse(commentLines.begin(), commentLines.end());
+    std::string result;
+    for (const auto& cl : commentLines) {
+        if (!result.empty()) result += "\n";
+        result += cl;
+    }
+    return result;
+}
+
+static std::string getLineText(const std::string& text, int line) {
     std::istringstream stream(text);
     std::string curLine;
     int cur = 0;
     while (std::getline(stream, curLine)) {
         if (!curLine.empty() && curLine.back() == '\r') curLine.pop_back();
-        if (cur == line) {
-            if (character >= 0 && character <= static_cast<int>(curLine.size())) {
-                return curLine.substr(0, character);
-            }
-            return curLine;
-        }
+        if (cur == line) return curLine;
         cur++;
     }
     return "";
 }
 
-static std::string getWordAtPosition(const std::string& text, int line, int character) {
-    std::istringstream stream(text);
-    std::string curLine;
-    int cur = 0;
-    while (std::getline(stream, curLine)) {
-        if (!curLine.empty() && curLine.back() == '\r') curLine.pop_back();
-        if (cur == line) {
-            if (character < 0 || character > static_cast<int>(curLine.size())) return "";
-            int start = character;
-            while (start > 0 && (std::isalnum(static_cast<unsigned char>(curLine[start - 1])) || curLine[start - 1] == '_' || curLine[start - 1] == '$')) {
-                start--;
-            }
-            int end = character;
-            while (end < static_cast<int>(curLine.size()) && (std::isalnum(static_cast<unsigned char>(curLine[end])) || curLine[end] == '_' || curLine[end] == '$')) {
-                end++;
-            }
-            return curLine.substr(start, end - start);
-        }
-        cur++;
+static std::string getLinePrefix(const std::string& text, int line, int character) {
+    std::string curLine = getLineText(text, line);
+    if (character >= 0 && character <= static_cast<int>(curLine.size())) {
+        return curLine.substr(0, character);
     }
-    return "";
+    return curLine;
+}
+
+struct WordContext {
+    std::string word;
+    int startCol{0};
+    int endCol{0};
+    std::string parentObject;
+};
+
+static WordContext getWordContext(const std::string& text, int line, int character) {
+    WordContext ctx;
+    std::string lineStr = getLineText(text, line);
+    if (lineStr.empty() || character < 0 || character > static_cast<int>(lineStr.size())) {
+        return ctx;
+    }
+
+    int start = character;
+    if (start > 0 && start == static_cast<int>(lineStr.size())) {
+        start--;
+    }
+    if (start > 0 && !(std::isalnum(static_cast<unsigned char>(lineStr[start])) || lineStr[start] == '_' || lineStr[start] == '$')) {
+        if (std::isalnum(static_cast<unsigned char>(lineStr[start - 1])) || lineStr[start - 1] == '_' || lineStr[start - 1] == '$') {
+            start--;
+        }
+    }
+
+    if (start < static_cast<int>(lineStr.size()) && (std::isalnum(static_cast<unsigned char>(lineStr[start])) || lineStr[start] == '_' || lineStr[start] == '$')) {
+        while (start > 0 && (std::isalnum(static_cast<unsigned char>(lineStr[start - 1])) || lineStr[start - 1] == '_' || lineStr[start - 1] == '$')) {
+            start--;
+        }
+        int end = start;
+        while (end < static_cast<int>(lineStr.size()) && (std::isalnum(static_cast<unsigned char>(lineStr[end])) || lineStr[end] == '_' || lineStr[end] == '$')) {
+            end++;
+        }
+        ctx.word = lineStr.substr(start, end - start);
+        ctx.startCol = start;
+        ctx.endCol = end;
+
+        int p = start - 1;
+        while (p >= 0 && (lineStr[p] == ' ' || lineStr[p] == '\t')) p--;
+        if (p >= 0 && lineStr[p] == '.') {
+            p--;
+            while (p >= 0 && (lineStr[p] == ' ' || lineStr[p] == '\t')) p--;
+            int objEnd = p + 1;
+            while (p >= 0 && (std::isalnum(static_cast<unsigned char>(lineStr[p])) || lineStr[p] == '_' || lineStr[p] == '$')) {
+                p--;
+            }
+            int objStart = p + 1;
+            if (objEnd > objStart) {
+                ctx.parentObject = lineStr.substr(objStart, objEnd - objStart);
+            }
+        }
+    }
+
+    return ctx;
+}
+
+// -----------------------------------------------------------------------------
+// 模組解析與匯出符號提取 (Module Resolution & Symbol Extraction)
+// -----------------------------------------------------------------------------
+
+std::vector<ImportInfo> LspServer::parseDocumentImports(const std::string& text) {
+    std::vector<ImportInfo> imports;
+    Lexer lexer(text);
+    Token tok = lexer.nextToken();
+
+    while (tok.type != TokenType::TOKEN_EOF) {
+        if (tok.type == TokenType::IMPORT) {
+            Token next = lexer.nextToken();
+            if (next.type == TokenType::STRING) {
+                // import "path";
+                std::string pathStr = std::string(next.lexeme);
+                if (pathStr.size() >= 2 && pathStr.front() == '"' && pathStr.back() == '"') {
+                    pathStr = pathStr.substr(1, pathStr.size() - 2);
+                }
+                std::string alias = pathStr;
+                size_t slash = alias.find_last_of("/\\");
+                if (slash != std::string::npos) alias = alias.substr(slash + 1);
+                if (alias.ends_with(".easy") || alias.ends_with(".esc")) {
+                    alias = alias.substr(0, alias.find_last_of('.'));
+                }
+                ImportInfo info;
+                info.modulePath = pathStr;
+                info.alias = alias;
+                info.line = next.line - 1;
+                info.pathColStart = next.column - 1;
+                info.pathColEnd = next.column - 1 + static_cast<int>(next.lexeme.size());
+                imports.push_back(std::move(info));
+            } else if (next.type == TokenType::LEFT_BRACE) {
+                // import { a, b, c } from "path";
+                std::vector<std::string> symbols;
+                Token symTok = lexer.nextToken();
+                while (symTok.type != TokenType::RIGHT_BRACE && symTok.type != TokenType::TOKEN_EOF) {
+                    if (symTok.type == TokenType::IDENTIFIER) {
+                        symbols.push_back(std::string(symTok.lexeme));
+                    }
+                    symTok = lexer.nextToken();
+                }
+                Token fromTok = lexer.nextToken();
+                if (fromTok.type == TokenType::FROM) {
+                    Token pathTok = lexer.nextToken();
+                    if (pathTok.type == TokenType::STRING) {
+                        std::string pathStr = std::string(pathTok.lexeme);
+                        if (pathStr.size() >= 2 && pathStr.front() == '"' && pathStr.back() == '"') {
+                            pathStr = pathStr.substr(1, pathStr.size() - 2);
+                        }
+                        std::string alias = pathStr;
+                        size_t slash = alias.find_last_of("/\\");
+                        if (slash != std::string::npos) alias = alias.substr(slash + 1);
+                        if (alias.ends_with(".easy") || alias.ends_with(".esc")) {
+                            alias = alias.substr(0, alias.find_last_of('.'));
+                        }
+                        ImportInfo info;
+                        info.modulePath = pathStr;
+                        info.alias = alias;
+                        info.namedSymbols = std::move(symbols);
+                        info.line = pathTok.line - 1;
+                        info.pathColStart = pathTok.column - 1;
+                        info.pathColEnd = pathTok.column - 1 + static_cast<int>(pathTok.lexeme.size());
+                        imports.push_back(std::move(info));
+                    }
+                }
+            } else if (next.type == TokenType::IDENTIFIER) {
+                // import alias from "path";
+                std::string alias(next.lexeme);
+                Token fromTok = lexer.nextToken();
+                if (fromTok.type == TokenType::FROM) {
+                    Token pathTok = lexer.nextToken();
+                    if (pathTok.type == TokenType::STRING) {
+                        std::string pathStr = std::string(pathTok.lexeme);
+                        if (pathStr.size() >= 2 && pathStr.front() == '"' && pathStr.back() == '"') {
+                            pathStr = pathStr.substr(1, pathStr.size() - 2);
+                        }
+                        ImportInfo info;
+                        info.modulePath = pathStr;
+                        info.alias = alias;
+                        info.line = pathTok.line - 1;
+                        info.pathColStart = pathTok.column - 1;
+                        info.pathColEnd = pathTok.column - 1 + static_cast<int>(pathTok.lexeme.size());
+                        imports.push_back(std::move(info));
+                    }
+                }
+            }
+        }
+        tok = lexer.nextToken();
+    }
+    return imports;
+}
+
+ResolvedModule LspServer::resolveModule(const std::string& currentDocUri, const std::string& importPath) {
+    ResolvedModule mod;
+    mod.path = importPath;
+
+    // 1. 標準庫模組判定
+    if (importPath == "std/io") {
+        mod.isStandard = true;
+        mod.symbols.push_back({"write", 3, 0, 0, 5, "write(...args): void", "Prints arguments to stdout without automatic newline."});
+        mod.symbols.push_back({"writeln", 3, 0, 0, 7, "writeln(...args): void", "Prints arguments to stdout followed by newline."});
+        mod.symbols.push_back({"writeError", 3, 0, 0, 10, "writeError(...args): void", "Prints arguments to stderr without newline."});
+        mod.symbols.push_back({"writeErrorln", 3, 0, 0, 12, "writeErrorln(...args): void", "Prints arguments to stderr followed by newline."});
+        mod.symbols.push_back({"readLine", 3, 0, 0, 8, "readLine(): string", "Reads a line from stdin (stripping trailing \\r\\n)."});
+        mod.symbols.push_back({"readAll", 3, 0, 0, 7, "readAll(): string", "Reads entire standard input until EOF."});
+        mod.symbols.push_back({"readChar", 3, 0, 0, 8, "readChar(): string", "Reads a single unbuffered keystroke immediately."});
+        mod.symbols.push_back({"flush", 3, 0, 0, 5, "flush(): void", "Flushes stdout buffer."});
+        mod.symbols.push_back({"flushError", 3, 0, 0, 10, "flushError(): void", "Flushes stderr buffer."});
+        mod.symbols.push_back({"setEncoding", 3, 0, 0, 11, "setEncoding(encoding, setInput = true): bool", "Sets console output and input character encoding."});
+        mod.symbols.push_back({"getEncoding", 3, 0, 0, 11, "getEncoding(): string", "Gets current console output character encoding name."});
+        mod.symbols.push_back({"Terminal", 7, 0, 0, 8, "class Terminal", "Terminal screen and cursor manipulation class."});
+        mod.symbols.push_back({"Color", 7, 0, 0, 5, "class Color", "ANSI terminal colors and text styles class."});
+        mod.symbols.push_back({"Prompt", 7, 0, 0, 6, "class Prompt", "Interactive CLI prompt dialog class."});
+        return mod;
+    } else if (importPath == "std/fs") {
+        mod.isStandard = true;
+        mod.symbols.push_back({"readText", 3, 0, 0, 8, "readText(path: string): string", "Reads entire file as UTF-8 text."});
+        mod.symbols.push_back({"writeText", 3, 0, 0, 9, "writeText(path, text): bool", "Overwrites file with text."});
+        mod.symbols.push_back({"appendText", 3, 0, 0, 10, "appendText(path, text): bool", "Appends text to file."});
+        mod.symbols.push_back({"exists", 3, 0, 0, 6, "exists(path: string): bool", "Checks whether file or directory exists."});
+        mod.symbols.push_back({"remove", 3, 0, 0, 6, "remove(path: string): bool", "Deletes single file or empty directory."});
+        mod.symbols.push_back({"removeTree", 3, 0, 0, 10, "removeTree(path: string): bool", "Recursively deletes directory and all contents."});
+        mod.symbols.push_back({"makeDir", 3, 0, 0, 7, "makeDir(path: string): bool", "Creates directories along path."});
+        mod.symbols.push_back({"listDir", 3, 0, 0, 7, "listDir(path: string): Array<string>", "Lists filenames in directory."});
+        mod.symbols.push_back({"stat", 3, 0, 0, 4, "stat(path: string): Map", "Retrieves file metadata map."});
+        return mod;
+    } else if (importPath == "std/path") {
+        mod.isStandard = true;
+        mod.symbols.push_back({"join", 3, 0, 0, 4, "join(...parts): string", "Joins path segments with normalized separators."});
+        mod.symbols.push_back({"dirname", 3, 0, 0, 7, "dirname(path): string", "Gets directory name of path."});
+        mod.symbols.push_back({"basename", 3, 0, 0, 8, "basename(path): string", "Gets filename or last segment of path."});
+        mod.symbols.push_back({"extname", 3, 0, 0, 7, "extname(path): string", "Gets extension of path including leading dot."});
+        mod.symbols.push_back({"isAbsolute", 3, 0, 0, 10, "isAbsolute(path): bool", "Checks if path is absolute."});
+        mod.symbols.push_back({"resolve", 3, 0, 0, 7, "resolve(...paths): string", "Resolves absolute canonical path."});
+        mod.symbols.push_back({"normalize", 3, 0, 0, 9, "normalize(path): string", "Normalizes path separators."});
+        return mod;
+    } else if (importPath == "std/os") {
+        mod.isStandard = true;
+        mod.symbols.push_back({"platform", 3, 0, 0, 8, "platform(): string", "Returns host OS ('windows', 'linux', 'macos')."});
+        mod.symbols.push_back({"arch", 3, 0, 0, 4, "arch(): string", "Returns architecture ('x86_64', 'arm64')."});
+        mod.symbols.push_back({"getEnv", 3, 0, 0, 6, "getEnv(name: string): string | nil", "Gets environment variable value."});
+        mod.symbols.push_back({"setEnv", 3, 0, 0, 6, "setEnv(name, val): bool", "Sets environment variable value."});
+        mod.symbols.push_back({"cwd", 3, 0, 0, 3, "cwd(): string", "Gets current working directory."});
+        mod.symbols.push_back({"chdir", 3, 0, 0, 5, "chdir(path): bool", "Changes current working directory."});
+        mod.symbols.push_back({"exec", 3, 0, 0, 4, "exec(command: string): int", "Executes shell command and returns exit code."});
+        mod.symbols.push_back({"cpuCount", 3, 0, 0, 8, "cpuCount(): int", "Returns hardware concurrency CPU core count."});
+        mod.symbols.push_back({"exit", 3, 0, 0, 4, "exit(code: int): void", "Terminates the process."});
+        return mod;
+    } else if (importPath == "std/math") {
+        mod.isStandard = true;
+        mod.symbols.push_back({"PI", 21, 0, 0, 2, "const PI: double = 3.14159...", "Mathematical constant Pi."});
+        mod.symbols.push_back({"E", 21, 0, 0, 1, "const E: double = 2.71828...", "Mathematical constant E."});
+        mod.symbols.push_back({"sqrt", 3, 0, 0, 4, "sqrt(x: double): double", "Square root."});
+        mod.symbols.push_back({"pow", 3, 0, 0, 3, "pow(base, exp): double", "Power function."});
+        mod.symbols.push_back({"abs", 3, 0, 0, 3, "abs(x): number", "Absolute value."});
+        mod.symbols.push_back({"floor", 3, 0, 0, 5, "floor(x: double): int", "Floor."});
+        mod.symbols.push_back({"ceil", 3, 0, 0, 4, "ceil(x: double): int", "Ceiling."});
+        mod.symbols.push_back({"round", 3, 0, 0, 5, "round(x: double): int", "Round."});
+        mod.symbols.push_back({"min", 3, 0, 0, 3, "min(a, b): number", "Minimum."});
+        mod.symbols.push_back({"max", 3, 0, 0, 3, "max(a, b): number", "Maximum."});
+        mod.symbols.push_back({"clamp", 3, 0, 0, 5, "clamp(val, min, max): number", "Clamp."});
+        mod.symbols.push_back({"random", 3, 0, 0, 6, "random(): double", "Random [0, 1)."});
+        mod.symbols.push_back({"randomInt", 3, 0, 0, 9, "randomInt(min, max): int", "Random integer."});
+        return mod;
+    }
+
+    // 2. 使用者腳本檔案解析 (.easy)
+    std::string currentPath = uriToPath(currentDocUri);
+    fs::path currentDir = fs::path(currentPath).parent_path();
+    fs::path targetPath = currentDir / importPath;
+
+    fs::path normPath = targetPath.lexically_normal();
+    fs::path normPathWithExt = (targetPath.string().ends_with(".easy") ? normPath : (targetPath.parent_path() / (targetPath.filename().string() + ".easy")).lexically_normal());
+
+    std::string candidateUri = pathToUri(normPath.string());
+    std::string candidateUriWithExt = pathToUri(normPathWithExt.string());
+
+    // 先檢查記憶體中開啟的文檔 (未存檔也能即時解析跨模組提示)
+    if (documents.find(candidateUri) != documents.end()) {
+        mod.targetUri = candidateUri;
+    } else if (documents.find(candidateUriWithExt) != documents.end()) {
+        mod.targetUri = candidateUriWithExt;
+    }
+
+    std::string resolvedFile;
+    try {
+        if (fs::exists(targetPath) && !fs::is_directory(targetPath)) {
+            resolvedFile = fs::canonical(targetPath).string();
+        } else if (fs::exists(targetPath.string() + ".easy")) {
+            resolvedFile = fs::canonical(targetPath.string() + ".easy").string();
+        } else {
+            // 嘗試相對工作目錄
+            fs::path cwdTarget = fs::current_path() / importPath;
+            if (fs::exists(cwdTarget) && !fs::is_directory(cwdTarget)) {
+                resolvedFile = fs::canonical(cwdTarget).string();
+            } else if (fs::exists(cwdTarget.string() + ".easy")) {
+                resolvedFile = fs::canonical(cwdTarget.string() + ".easy").string();
+            }
+        }
+    } catch (...) {}
+
+    if (mod.targetUri.empty() && !resolvedFile.empty()) {
+        mod.targetUri = pathToUri(resolvedFile);
+    }
+
+    if (mod.targetUri.empty()) {
+        return mod;
+    }
+
+    // 取得模組原始碼 (優先使用記憶體編輯器緩衝區，次之使用磁碟檔案)
+    std::string sourceCode;
+    auto docIt = documents.find(mod.targetUri);
+    if (docIt != documents.end()) {
+        sourceCode = docIt->second;
+    } else if (!resolvedFile.empty()) {
+        std::ifstream file(resolvedFile);
+        if (file.is_open()) {
+            std::stringstream ss;
+            ss << file.rdbuf();
+            sourceCode = ss.str();
+        }
+    }
+
+    if (sourceCode.empty()) {
+        return mod;
+    }
+
+    // 解析模組中的匯出與定義
+    Lexer lexer(sourceCode);
+    std::vector<Token> tokens;
+    while (true) {
+        Token tok = lexer.nextToken();
+        tokens.push_back(tok);
+        if (tok.type == TokenType::TOKEN_EOF) break;
+    }
+
+    bool hasExplicitExports = false;
+    for (const auto& tok : tokens) {
+        if (tok.type == TokenType::EXPORT) {
+            hasExplicitExports = true;
+            break;
+        }
+    }
+
+    int braceDepth = 0;
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        const Token& tok = tokens[i];
+        if (tok.type == TokenType::TOKEN_EOF) break;
+
+        if (tok.type == TokenType::LEFT_BRACE) {
+            braceDepth++;
+            continue;
+        }
+        if (tok.type == TokenType::RIGHT_BRACE) {
+            if (braceDepth > 0) braceDepth--;
+            continue;
+        }
+
+        bool isExported = false;
+        size_t declIdx = i;
+
+        if (hasExplicitExports) {
+            if (tok.type == TokenType::EXPORT && i + 1 < tokens.size()) {
+                isExported = true;
+                declIdx = i + 1;
+            }
+        } else {
+            // 沒有顯式 export 時，匯出所有頂層宣告 (braceDepth == 0)
+            if (braceDepth == 0 && (tok.type == TokenType::FN || tok.type == TokenType::CLASS ||
+                                     tok.type == TokenType::CONST || tok.type == TokenType::LET)) {
+                isExported = true;
+                declIdx = i;
+            }
+        }
+
+        if (!isExported) continue;
+
+        const Token& declTok = tokens[declIdx];
+        if (declTok.type == TokenType::FN && declIdx + 1 < tokens.size() && tokens[declIdx + 1].type == TokenType::IDENTIFIER) {
+            const Token& nameTok = tokens[declIdx + 1];
+            size_t p = declIdx + 2;
+            std::string sig = "fn " + std::string(nameTok.lexeme);
+            if (p < tokens.size() && tokens[p].type == TokenType::LEFT_PAREN) {
+                sig += "(";
+                p++;
+                while (p < tokens.size() && tokens[p].type != TokenType::RIGHT_PAREN && tokens[p].type != TokenType::TOKEN_EOF) {
+                    if (tokens[p].type == TokenType::COMMA) {
+                        sig += ", ";
+                    } else if (tokens[p].type == TokenType::COLON) {
+                        sig += ": ";
+                    } else if (tokens[p].type == TokenType::EQUAL) {
+                        sig += " = ";
+                    } else {
+                        if (!sig.empty() && sig.back() != '(' && sig.back() != ' ') {
+                            sig += " ";
+                        }
+                        sig += std::string(tokens[p].lexeme);
+                    }
+                    p++;
+                }
+                sig += ")";
+                if (p < tokens.size() && tokens[p].type == TokenType::RIGHT_PAREN) p++;
+                if (p < tokens.size() && tokens[p].type == TokenType::COLON) {
+                    sig += ": ";
+                    p++;
+                    while (p < tokens.size() && tokens[p].type != TokenType::LEFT_BRACE && tokens[p].type != TokenType::SEMICOLON && tokens[p].type != TokenType::TOKEN_EOF) {
+                        sig += std::string(tokens[p].lexeme);
+                        p++;
+                    }
+                }
+            }
+
+            ExportedSymbol sym;
+            sym.name = std::string(nameTok.lexeme);
+            sym.kind = 3; // Function
+            sym.line = nameTok.line - 1;
+            sym.column = nameTok.column - 1;
+            sym.length = static_cast<int>(nameTok.lexeme.size());
+            sym.signature = sig;
+            sym.doc = extractDocComment(sourceCode, tok.line - 1);
+            sym.sourceUri = mod.targetUri;
+            mod.symbols.push_back(std::move(sym));
+            i = declIdx;
+        } else if (declTok.type == TokenType::CLASS && declIdx + 1 < tokens.size() && tokens[declIdx + 1].type == TokenType::IDENTIFIER) {
+            const Token& nameTok = tokens[declIdx + 1];
+            ExportedSymbol sym;
+            sym.name = std::string(nameTok.lexeme);
+            sym.kind = 7; // Class
+            sym.line = nameTok.line - 1;
+            sym.column = nameTok.column - 1;
+            sym.length = static_cast<int>(nameTok.lexeme.size());
+            sym.signature = "class " + std::string(nameTok.lexeme);
+            sym.doc = extractDocComment(sourceCode, tok.line - 1);
+            sym.sourceUri = mod.targetUri;
+            mod.symbols.push_back(std::move(sym));
+            i = declIdx;
+        } else if ((declTok.type == TokenType::LET || declTok.type == TokenType::CONST) && declIdx + 1 < tokens.size() && tokens[declIdx + 1].type == TokenType::IDENTIFIER) {
+            const Token& nameTok = tokens[declIdx + 1];
+            ExportedSymbol sym;
+            sym.name = std::string(nameTok.lexeme);
+            sym.kind = (declTok.type == TokenType::CONST) ? 21 : 6; // Constant / Variable
+            sym.line = nameTok.line - 1;
+            sym.column = nameTok.column - 1;
+            sym.length = static_cast<int>(nameTok.lexeme.size());
+            sym.signature = (declTok.type == TokenType::CONST ? "const " : "let ") + std::string(nameTok.lexeme);
+            sym.doc = extractDocComment(sourceCode, tok.line - 1);
+            sym.sourceUri = mod.targetUri;
+            mod.symbols.push_back(std::move(sym));
+            i = declIdx;
+        }
+    }
+
+    return mod;
 }
 
 // -----------------------------------------------------------------------------
@@ -303,7 +779,7 @@ static std::string getWordAtPosition(const std::string& text, int line, int char
 static void addCompletion(Json& list, const std::string& label, int kind, const std::string& detail, const std::string& doc = "") {
     Json item = Json::object();
     item["label"] = label;
-    item["kind"] = kind; // 14=Keyword, 3=Function, 7=Class, 9=Module, 6=Variable
+    item["kind"] = kind;
     item["detail"] = detail;
     if (!doc.empty()) {
         Json d = Json::object();
@@ -318,110 +794,157 @@ Json LspServer::handleCompletion(const std::string& uri, int line, int character
     auto it = documents.find(uri);
     std::string text = (it != documents.end()) ? it->second : "";
     std::string prefix = getLinePrefix(text, line, character);
+    std::string lineStr = getLineText(text, line);
 
     Json items = Json::array();
+    std::vector<ImportInfo> docImports = parseDocumentImports(text);
 
-    // 1. 模組/類別點運算子提示
-    if (prefix.ends_with("io.") || (prefix.find("io.") != std::string::npos && prefix.back() == '.')) {
-        addCompletion(items, "write", 2, "write(...args): void", "Prints arguments to stdout without automatic newline.");
-        addCompletion(items, "writeln", 2, "writeln(...args): void", "Prints arguments to stdout followed by newline.");
-        addCompletion(items, "writeError", 2, "writeError(...args): void", "Prints arguments to stderr without newline.");
-        addCompletion(items, "writeErrorln", 2, "writeErrorln(...args): void", "Prints arguments to stderr followed by newline.");
-        addCompletion(items, "readLine", 2, "readLine(): string", "Reads a line from stdin (stripping trailing \\r\\n).");
-        addCompletion(items, "readAll", 2, "readAll(): string", "Reads entire standard input until EOF.");
-        addCompletion(items, "readChar", 2, "readChar(): string", "Reads a single unbuffered keystroke immediately.");
-        addCompletion(items, "flush", 2, "flush(): void", "Flushes the stdout buffer.");
-        addCompletion(items, "flushError", 2, "flushError(): void", "Flushes the stderr buffer.");
-        addCompletion(items, "setEncoding", 2, "setEncoding(encoding: string | int, setInput = true): bool", "Sets terminal character encoding (e.g. 'utf-8', 'big5', 'gbk').");
-        addCompletion(items, "getEncoding", 2, "getEncoding(): string", "Gets current terminal character encoding name.");
-        addCompletion(items, "Terminal", 7, "class Terminal", "Terminal screen and cursor manipulation class.");
-        addCompletion(items, "Color", 7, "class Color", "ANSI terminal colors and text styles class.");
-        addCompletion(items, "Prompt", 7, "class Prompt", "Interactive CLI user dialog and prompt class.");
-        return items;
-    }
-
-    if (prefix.ends_with("Color.") || (prefix.find("Color.") != std::string::npos && prefix.back() == '.')) {
-        const char* colors[] = {"red", "green", "yellow", "blue", "magenta", "cyan", "white", "gray"};
-        for (const char* c : colors) {
-            addCompletion(items, c, 2, std::string(c) + "(text: string): string", "Wraps text with ANSI foreground color.");
-        }
-        const char* bgColors[] = {"bgRed", "bgGreen", "bgYellow", "bgBlue", "bgMagenta", "bgCyan", "bgWhite", "bgGray"};
-        for (const char* c : bgColors) {
-            addCompletion(items, c, 2, std::string(c) + "(text: string): string", "Wraps text with ANSI background color.");
-        }
-        const char* styles[] = {"bold", "dim", "italic", "underline", "inverse"};
-        for (const char* s : styles) {
-            addCompletion(items, s, 2, std::string(s) + "(text: string): string", "Wraps text with ANSI style.");
-        }
-        addCompletion(items, "rgb", 2, "rgb(r, g, b, text): string", "24-bit TrueColor foreground wrapper.");
-        addCompletion(items, "bgRgb", 2, "bgRgb(r, g, b, text): string", "24-bit TrueColor background wrapper.");
-        addCompletion(items, "strip", 2, "strip(text: string): string", "Removes all ANSI escape sequences from string.");
-        addCompletion(items, "RED", 6, "const RED: string", "ANSI escape code for Red.");
-        addCompletion(items, "GREEN", 6, "const GREEN: string", "ANSI escape code for Green.");
-        addCompletion(items, "RESET", 6, "const RESET: string", "ANSI escape code for Reset.");
-        return items;
-    }
-
-    if (prefix.ends_with("Terminal.") || (prefix.find("Terminal.") != std::string::npos && prefix.back() == '.')) {
-        addCompletion(items, "clear", 2, "clear(): void", "Clears the terminal screen and moves cursor to (1, 1).");
-        addCompletion(items, "clearLine", 2, "clearLine(): void", "Clears current line and returns cursor to beginning.");
-        addCompletion(items, "clearToEnd", 2, "clearToEnd(): void", "Clears from cursor to the end of the screen.");
-        addCompletion(items, "setCursor", 2, "setCursor(x, y): void", "Sets terminal cursor position (1-based).");
-        addCompletion(items, "getCursor", 2, "getCursor(): Map {x, y}", "Gets current cursor position coordinates.");
-        addCompletion(items, "moveUp", 2, "moveUp(n = 1): void", "Moves cursor up by n rows.");
-        addCompletion(items, "moveDown", 2, "moveDown(n = 1): void", "Moves cursor down by n rows.");
-        addCompletion(items, "moveLeft", 2, "moveLeft(n = 1): void", "Moves cursor left by n columns.");
-        addCompletion(items, "moveRight", 2, "moveRight(n = 1): void", "Moves cursor right by n columns.");
-        addCompletion(items, "hideCursor", 2, "hideCursor(): void", "Hides the terminal cursor.");
-        addCompletion(items, "showCursor", 2, "showCursor(): void", "Shows the terminal cursor.");
-        addCompletion(items, "getWidth", 2, "getWidth(): int", "Gets terminal column width.");
-        addCompletion(items, "getHeight", 2, "getHeight(): int", "Gets terminal row height.");
-        addCompletion(items, "getSize", 2, "getSize(): Map {width, height}", "Gets terminal dimensions.");
-        addCompletion(items, "isTerminal", 2, "isTerminal(): bool", "Returns true if running in interactive terminal.");
-        addCompletion(items, "beep", 2, "beep(): void", "Emits console audio bell alert.");
-        addCompletion(items, "setEncoding", 2, "setEncoding(encoding, setInput = true): bool", "Sets terminal encoding.");
-        addCompletion(items, "getEncoding", 2, "getEncoding(): string", "Gets current terminal encoding name.");
-        addCompletion(items, "setCodePage", 2, "setCodePage(cp: int, setInput = true): bool", "Sets Windows CodePage.");
-        addCompletion(items, "getCodePage", 2, "getCodePage(): int", "Gets current Windows CodePage integer.");
-        return items;
-    }
-
-    if (prefix.ends_with("Prompt.") || (prefix.find("Prompt.") != std::string::npos && prefix.back() == '.')) {
-        addCompletion(items, "ask", 2, "ask(question, defaultVal = ''): string", "Interactive user input prompt with default value.");
-        addCompletion(items, "confirm", 2, "confirm(question, defaultVal = false): bool", "Interactive [y/N] confirmation prompt.");
-        addCompletion(items, "password", 2, "password(question, maskChar = '*'): string", "Secure hidden/masked password input.");
-        addCompletion(items, "choose", 2, "choose(question, options): int", "Interactive numbered list chooser.");
-        return items;
-    }
-
-    if (prefix.ends_with("Math.") || (prefix.find("Math.") != std::string::npos && prefix.back() == '.')) {
-        addCompletion(items, "PI", 6, "const PI: double = 3.14159...", "Mathematical constant Pi.");
-        addCompletion(items, "E", 6, "const E: double = 2.71828...", "Mathematical constant Euler's number.");
-        addCompletion(items, "sqrt", 2, "sqrt(x: double): double", "Square root of x.");
-        addCompletion(items, "pow", 2, "pow(base, exp): double", "Calculates base raised to power exp.");
-        addCompletion(items, "abs", 2, "abs(x): number", "Absolute value of x.");
-        addCompletion(items, "floor", 2, "floor(x: double): int", "Rounds down to nearest integer.");
-        addCompletion(items, "ceil", 2, "ceil(x: double): int", "Rounds up to nearest integer.");
-        addCompletion(items, "round", 2, "round(x: double): int", "Rounds to nearest integer.");
-        addCompletion(items, "min", 2, "min(a, b): number", "Returns smaller of a and b.");
-        addCompletion(items, "max", 2, "max(a, b): number", "Returns larger of a and b.");
-        addCompletion(items, "clamp", 2, "clamp(val, min, max): number", "Clamps value between min and max.");
-        addCompletion(items, "random", 2, "random(): double", "Random floating-point in [0, 1).");
-        addCompletion(items, "randomInt", 2, "randomInt(min, max): int", "Random integer between min and max inclusive.");
-        return items;
-    }
-
-    // 2. 模組路徑補全 (import "...")
-    if (prefix.find("import \"") != std::string::npos || prefix.find("from \"") != std::string::npos) {
+    // 1. 模組路徑補全 (import "..." 或 from "...")
+    if (prefix.find("import \"") != std::string::npos || prefix.find("from \"") != std::string::npos ||
+        prefix.find("import '") != std::string::npos || prefix.find("from '") != std::string::npos) {
         addCompletion(items, "std/io", 9, "module std/io", "Standard I/O, terminal colors, and cursor control.");
         addCompletion(items, "std/fs", 9, "module std/fs", "Filesystem reading, writing, and directory operations.");
         addCompletion(items, "std/path", 9, "module std/path", "Path manipulation, normalization, and joining.");
         addCompletion(items, "std/os", 9, "module std/os", "Operating system environment, platform, and processes.");
         addCompletion(items, "std/math", 9, "module std/math", "Mathematical functions, trigonometry, and constants.");
+
+        // 搜尋當前檔案同層目錄下的 .easy 與 .esc 模組
+        std::string currentPath = uriToPath(uri);
+        fs::path currentDir = fs::path(currentPath).parent_path();
+        try {
+            if (fs::exists(currentDir) && fs::is_directory(currentDir)) {
+                for (const auto& entry : fs::directory_iterator(currentDir)) {
+                    if (entry.is_regular_file()) {
+                        std::string ext = entry.path().extension().string();
+                        if (ext == ".easy" || ext == ".esc") {
+                            std::string filename = entry.path().filename().string();
+                            std::string stem = entry.path().stem().string();
+                            if (entry.path() != fs::path(currentPath)) {
+                                addCompletion(items, "./" + filename, 17, "module " + filename, "Local EasyScript module file");
+                                addCompletion(items, "./" + stem, 17, "module " + stem, "Local EasyScript module");
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (...) {}
+
         return items;
     }
 
-    // 3. 通用關鍵字補全
+    // 2. 解構匯入提示: import { | } from "module"
+    size_t importPos = lineStr.find("import");
+    size_t braceStart = lineStr.find('{');
+    size_t fromPos = lineStr.find("from");
+    if (importPos != std::string::npos && braceStart != std::string::npos && character > static_cast<int>(braceStart)) {
+        size_t braceEnd = lineStr.find('}', braceStart);
+        if (braceEnd == std::string::npos || character <= static_cast<int>(braceEnd)) {
+            if (fromPos != std::string::npos && fromPos > braceStart) {
+                size_t q1 = lineStr.find_first_of("\"'", fromPos);
+                if (q1 != std::string::npos) {
+                    char quote = lineStr[q1];
+                    size_t q2 = lineStr.find(quote, q1 + 1);
+                    if (q2 != std::string::npos) {
+                        std::string modPath = lineStr.substr(q1 + 1, q2 - q1 - 1);
+                        ResolvedModule mod = resolveModule(uri, modPath);
+                        for (const auto& sym : mod.symbols) {
+                            addCompletion(items, sym.name, sym.kind, sym.signature, sym.doc);
+                        }
+                        return items;
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. 模組別名或物件點運算子提示 (<alias>.)
+    size_t lastDot = prefix.rfind('.');
+    if (lastDot != std::string::npos && lastDot + 1 == prefix.size()) {
+        size_t idStart = lastDot;
+        while (idStart > 0 && (std::isalnum(static_cast<unsigned char>(prefix[idStart - 1])) || prefix[idStart - 1] == '_' || prefix[idStart - 1] == '$')) {
+            idStart--;
+        }
+        std::string objName = prefix.substr(idStart, lastDot - idStart);
+        if (!objName.empty()) {
+            // 先檢查是否為文檔中匯入的模組別名
+            for (const auto& imp : docImports) {
+                if (imp.alias == objName) {
+                    ResolvedModule mod = resolveModule(uri, imp.modulePath);
+                    for (const auto& sym : mod.symbols) {
+                        addCompletion(items, sym.name, sym.kind, sym.signature, sym.doc);
+                    }
+                    return items;
+                }
+            }
+
+            // 檢查常見內建模組
+            if (objName == "io") {
+                ResolvedModule mod = resolveModule(uri, "std/io");
+                for (const auto& sym : mod.symbols) addCompletion(items, sym.name, sym.kind, sym.signature, sym.doc);
+                return items;
+            } else if (objName == "fs") {
+                ResolvedModule mod = resolveModule(uri, "std/fs");
+                for (const auto& sym : mod.symbols) addCompletion(items, sym.name, sym.kind, sym.signature, sym.doc);
+                return items;
+            } else if (objName == "path") {
+                ResolvedModule mod = resolveModule(uri, "std/path");
+                for (const auto& sym : mod.symbols) addCompletion(items, sym.name, sym.kind, sym.signature, sym.doc);
+                return items;
+            } else if (objName == "os") {
+                ResolvedModule mod = resolveModule(uri, "std/os");
+                for (const auto& sym : mod.symbols) addCompletion(items, sym.name, sym.kind, sym.signature, sym.doc);
+                return items;
+            } else if (objName == "Math" || objName == "math") {
+                ResolvedModule mod = resolveModule(uri, "std/math");
+                for (const auto& sym : mod.symbols) addCompletion(items, sym.name, sym.kind, sym.signature, sym.doc);
+                return items;
+            } else if (objName == "Color") {
+                const char* colors[] = {"red", "green", "yellow", "blue", "magenta", "cyan", "white", "gray"};
+                for (const char* c : colors) addCompletion(items, c, 3, std::string(c) + "(text: string): string", "ANSI foreground color.");
+                const char* bgColors[] = {"bgRed", "bgGreen", "bgYellow", "bgBlue", "bgMagenta", "bgCyan", "bgWhite", "bgGray"};
+                for (const char* c : bgColors) addCompletion(items, c, 3, std::string(c) + "(text: string): string", "ANSI background color.");
+                const char* styles[] = {"bold", "dim", "italic", "underline", "inverse"};
+                for (const char* s : styles) addCompletion(items, s, 3, std::string(s) + "(text: string): string", "ANSI style.");
+                addCompletion(items, "rgb", 3, "rgb(r, g, b, text): string", "24-bit TrueColor foreground.");
+                addCompletion(items, "bgRgb", 3, "bgRgb(r, g, b, text): string", "24-bit TrueColor background.");
+                addCompletion(items, "strip", 3, "strip(text: string): string", "Removes ANSI sequences.");
+                addCompletion(items, "RED", 21, "const RED: string", "ANSI Red code.");
+                addCompletion(items, "GREEN", 21, "const GREEN: string", "ANSI Green code.");
+                addCompletion(items, "RESET", 21, "const RESET: string", "ANSI Reset code.");
+                return items;
+            } else if (objName == "Terminal") {
+                addCompletion(items, "clear", 3, "clear(): void", "Clears terminal screen.");
+                addCompletion(items, "clearLine", 3, "clearLine(): void", "Clears current line.");
+                addCompletion(items, "clearToEnd", 3, "clearToEnd(): void", "Clears to end of screen.");
+                addCompletion(items, "setCursor", 3, "setCursor(x, y): void", "Sets cursor position (1-based).");
+                addCompletion(items, "getCursor", 3, "getCursor(): Map {x, y}", "Gets cursor position.");
+                addCompletion(items, "moveUp", 3, "moveUp(n = 1): void", "Moves cursor up.");
+                addCompletion(items, "moveDown", 3, "moveDown(n = 1): void", "Moves cursor down.");
+                addCompletion(items, "moveLeft", 3, "moveLeft(n = 1): void", "Moves cursor left.");
+                addCompletion(items, "moveRight", 3, "moveRight(n = 1): void", "Moves cursor right.");
+                addCompletion(items, "hideCursor", 3, "hideCursor(): void", "Hides cursor.");
+                addCompletion(items, "showCursor", 3, "showCursor(): void", "Shows cursor.");
+                addCompletion(items, "getWidth", 3, "getWidth(): int", "Gets terminal width.");
+                addCompletion(items, "getHeight", 3, "getHeight(): int", "Gets terminal height.");
+                addCompletion(items, "getSize", 3, "getSize(): Map {width, height}", "Gets terminal size.");
+                addCompletion(items, "isTerminal", 3, "isTerminal(): bool", "Checks if interactive terminal.");
+                addCompletion(items, "beep", 3, "beep(): void", "Emits console bell alert.");
+                addCompletion(items, "setEncoding", 3, "setEncoding(encoding, setInput = true): bool", "Sets console encoding.");
+                addCompletion(items, "getEncoding", 3, "getEncoding(): string", "Gets console encoding.");
+                addCompletion(items, "setCodePage", 3, "setCodePage(cp, setInput = true): bool", "Sets Windows CodePage.");
+                addCompletion(items, "getCodePage", 3, "getCodePage(): int", "Gets Windows CodePage.");
+                return items;
+            } else if (objName == "Prompt") {
+                addCompletion(items, "ask", 3, "ask(question, defaultVal = ''): string", "Interactive user prompt.");
+                addCompletion(items, "confirm", 3, "confirm(question, defaultVal = false): bool", "Interactive [y/N] prompt.");
+                addCompletion(items, "password", 3, "password(question, maskChar = '*'): string", "Hidden password prompt.");
+                addCompletion(items, "choose", 3, "choose(question, options): int", "Option chooser dialog.");
+                return items;
+            }
+        }
+    }
+
+    // 4. 通用關鍵字補全
     const char* keywords[] = {
         "fn", "function", "class", "extends", "let", "const", "var",
         "if", "else", "while", "for", "in", "break", "continue", "return",
@@ -432,7 +955,7 @@ Json LspServer::handleCompletion(const std::string& uri, int line, int character
         addCompletion(items, kw, 14, "keyword", "");
     }
 
-    // 4. 內建函式與標準命名空間
+    // 5. 內建函式與標準命名空間
     addCompletion(items, "print", 3, "print(value: any): void", "Prints value to stdout with newline.");
     addCompletion(items, "println", 3, "println(value: any): void", "Prints value to stdout with newline.");
     addCompletion(items, "assert", 3, "assert(condition: bool, message = ''): void", "Asserts condition is true.");
@@ -441,7 +964,17 @@ Json LspServer::handleCompletion(const std::string& uri, int line, int character
     addCompletion(items, "Prompt", 7, "class Prompt", "Standard CLI prompt dialog class.");
     addCompletion(items, "Math", 7, "module Math", "Standard math module.");
 
-    // 5. 掃描當前文檔的所有識別字
+    // 6. 加入所有已匯入的別名與具名符號
+    for (const auto& imp : docImports) {
+        if (!imp.alias.empty()) {
+            addCompletion(items, imp.alias, 9, "module " + imp.alias, "Imported from " + imp.modulePath);
+        }
+        for (const auto& sym : imp.namedSymbols) {
+            addCompletion(items, sym, 3, sym, "Imported from " + imp.modulePath);
+        }
+    }
+
+    // 7. 掃描當前文檔的所有識別字
     Lexer lexer(text);
     std::vector<std::string> seen;
     while (true) {
@@ -466,33 +999,127 @@ Json LspServer::handleCompletion(const std::string& uri, int line, int character
 Json LspServer::handleHover(const std::string& uri, int line, int character) {
     auto it = documents.find(uri);
     std::string text = (it != documents.end()) ? it->second : "";
-    std::string word = getWordAtPosition(text, line, character);
-    if (word.empty()) return Json();
+    if (text.empty()) return Json();
 
+    std::vector<ImportInfo> docImports = parseDocumentImports(text);
+
+    // 1. 檢查游標是否停在 import 路徑字串上
+    for (const auto& imp : docImports) {
+        if (imp.line == line && character >= imp.pathColStart && character <= imp.pathColEnd) {
+            ResolvedModule mod = resolveModule(uri, imp.modulePath);
+            std::string doc = "### Module: `" + imp.modulePath + "`\n\n";
+            doc += mod.isStandard ? "**Type**: Standard Library Module\n\n" : "**Type**: Local EasyScript Module\n\n";
+            if (!mod.symbols.empty()) {
+                doc += "**Exports (" + std::to_string(mod.symbols.size()) + "):**\n\n";
+                for (const auto& s : mod.symbols) {
+                    doc += "- `" + s.signature + "`\n";
+                }
+            }
+            Json result = Json::object();
+            Json contents = Json::object();
+            contents["kind"] = "markdown";
+            contents["value"] = doc;
+            result["contents"] = contents;
+            return result;
+        }
+    }
+
+    WordContext ctx = getWordContext(text, line, character);
+    if (ctx.word.empty()) return Json();
+
+    // 2. 檢查游標是否在 `<alias>.<member>` 上的 member
+    if (!ctx.parentObject.empty()) {
+        for (const auto& imp : docImports) {
+            if (imp.alias == ctx.parentObject) {
+                ResolvedModule mod = resolveModule(uri, imp.modulePath);
+                for (const auto& s : mod.symbols) {
+                    if (s.name == ctx.word) {
+                        std::string doc = "```easyscript\n" + s.signature + "\n```\n\n";
+                        doc += "*From module `" + imp.modulePath + "`*\n\n";
+                        if (!s.doc.empty()) doc += s.doc + "\n";
+                        Json result = Json::object();
+                        Json contents = Json::object();
+                        contents["kind"] = "markdown";
+                        contents["value"] = doc;
+                        result["contents"] = contents;
+                        return result;
+                    }
+                }
+            }
+        }
+
+        // 檢查未顯式 import 的標準命名空間 (io, fs, path, os, Math)
+        std::string stdPath;
+        if (ctx.parentObject == "io") stdPath = "std/io";
+        else if (ctx.parentObject == "fs") stdPath = "std/fs";
+        else if (ctx.parentObject == "path") stdPath = "std/path";
+        else if (ctx.parentObject == "os") stdPath = "std/os";
+        else if (ctx.parentObject == "Math" || ctx.parentObject == "math") stdPath = "std/math";
+
+        if (!stdPath.empty()) {
+            ResolvedModule mod = resolveModule(uri, stdPath);
+            for (const auto& s : mod.symbols) {
+                if (s.name == ctx.word) {
+                    std::string doc = "```easyscript\n" + s.signature + "\n```\n\n";
+                    doc += "*From standard library `" + stdPath + "`*\n\n";
+                    if (!s.doc.empty()) doc += s.doc + "\n";
+                    Json result = Json::object();
+                    Json contents = Json::object();
+                    contents["kind"] = "markdown";
+                    contents["value"] = doc;
+                    result["contents"] = contents;
+                    return result;
+                }
+            }
+        }
+    }
+
+    // 3. 檢查游標是否在具名匯入符號上 (import { foo } from "...")
+    for (const auto& imp : docImports) {
+        if (std::find(imp.namedSymbols.begin(), imp.namedSymbols.end(), ctx.word) != imp.namedSymbols.end()) {
+            ResolvedModule mod = resolveModule(uri, imp.modulePath);
+            for (const auto& s : mod.symbols) {
+                if (s.name == ctx.word) {
+                    std::string doc = "```easyscript\n" + s.signature + "\n```\n\n";
+                    doc += "*Imported from `" + imp.modulePath + "`*\n\n";
+                    if (!s.doc.empty()) doc += s.doc + "\n";
+                    Json result = Json::object();
+                    Json contents = Json::object();
+                    contents["kind"] = "markdown";
+                    contents["value"] = doc;
+                    result["contents"] = contents;
+                    return result;
+                }
+            }
+        }
+        if (imp.alias == ctx.word) {
+            std::string doc = "### Module `" + imp.alias + "`\n\nImported from `" + imp.modulePath + "`";
+            Json result = Json::object();
+            Json contents = Json::object();
+            contents["kind"] = "markdown";
+            contents["value"] = doc;
+            result["contents"] = contents;
+            return result;
+        }
+    }
+
+    // 4. 關鍵字與內建型別/函式 hover
     std::string doc;
-    if (word == "fn" || word == "function") {
+    if (ctx.word == "fn" || ctx.word == "function") {
         doc = "**fn** (keyword)\n\nDeclares a function in EasyScript.\n\n```easyscript\nfn add(a, b) {\n    return a + b;\n}\n```";
-    } else if (word == "class") {
+    } else if (ctx.word == "class") {
         doc = "**class** (keyword)\n\nDeclares an object-oriented class with fields and methods.\n\n```easyscript\nclass Greeter {\n    greet(name) {\n        print('Hello ' + name);\n    }\n}\n```";
-    } else if (word == "print" || word == "println") {
+    } else if (ctx.word == "print" || ctx.word == "println") {
         doc = "**print(value: any): void**\n\nBuilt-in function to print formatted string to standard output.";
-    } else if (word == "write") {
-        doc = "**io.write(...args): void**\n\nWrites arguments directly to standard output without automatic newline.";
-    } else if (word == "writeln") {
-        doc = "**io.writeln(...args): void**\n\nWrites arguments to standard output followed by a newline.";
-    } else if (word == "readLine") {
-        doc = "**io.readLine(): string**\n\nReads a line from standard input, stripping trailing newline characters.";
-    } else if (word == "Terminal") {
+    } else if (ctx.word == "assert") {
+        doc = "**assert(condition: bool, message = ''): void**\n\nAsserts condition is true, throwing error otherwise.";
+    } else if (ctx.word == "Terminal") {
         doc = "**class Terminal** (`std/io`)\n\nProvides cursor position control, screen clearing, and terminal metrics.";
-    } else if (word == "Color") {
+    } else if (ctx.word == "Color") {
         doc = "**class Color** (`std/io`)\n\nProvides ANSI text styling, foreground/background colors, and RGB formatting.";
-    } else if (word == "Prompt") {
+    } else if (ctx.word == "Prompt") {
         doc = "**class Prompt** (`std/io`)\n\nInteractive CLI prompt utilities for user input, confirmation, and password masking.";
-    } else if (word == "setEncoding") {
-        doc = "**Terminal.setEncoding(encoding: string | int, setInput = true): bool**\n\nSets output and input character encoding (e.g. `'utf-8'`, `'big5'`, `'gbk'` or CodePage integer like `65001`).";
-    } else if (word == "getEncoding") {
-        doc = "**Terminal.getEncoding(): string**\n\nReturns current terminal character encoding name.";
-    } else if (word == "Math") {
+    } else if (ctx.word == "Math") {
         doc = "**module Math** (`std/math`)\n\nStandard mathematical functions and constants (`PI`, `E`, `sqrt`, `pow`, `random`).";
     }
 
@@ -564,16 +1191,93 @@ Json LspServer::handleDocumentSymbol(const std::string& uri) {
 Json LspServer::handleDefinition(const std::string& uri, int line, int character) {
     auto it = documents.find(uri);
     std::string text = (it != documents.end()) ? it->second : "";
-    std::string word = getWordAtPosition(text, line, character);
-    if (word.empty()) return Json();
+    if (text.empty()) return Json();
 
+    std::vector<ImportInfo> docImports = parseDocumentImports(text);
+
+    // 1. 檢查游標是否在 import 路徑字串上 -> 跨檔案跳轉到模組檔案開頭
+    for (const auto& imp : docImports) {
+        if (imp.line == line && character >= imp.pathColStart && character <= imp.pathColEnd) {
+            ResolvedModule mod = resolveModule(uri, imp.modulePath);
+            if (!mod.targetUri.empty()) {
+                Json loc = Json::object();
+                loc["uri"] = mod.targetUri;
+                Json range = Json::object();
+                Json start = Json::object();
+                start["line"] = 0;
+                start["character"] = 0;
+                Json end = Json::object();
+                end["line"] = 0;
+                end["character"] = 0;
+                range["start"] = start;
+                range["end"] = end;
+                loc["range"] = range;
+                return loc;
+            }
+        }
+    }
+
+    WordContext ctx = getWordContext(text, line, character);
+    if (ctx.word.empty()) return Json();
+
+    // 2. 跨模組成員跳轉: <alias>.<member> -> 跳轉至模組內的宣告行
+    if (!ctx.parentObject.empty()) {
+        for (const auto& imp : docImports) {
+            if (imp.alias == ctx.parentObject) {
+                ResolvedModule mod = resolveModule(uri, imp.modulePath);
+                for (const auto& s : mod.symbols) {
+                    if (s.name == ctx.word && !s.sourceUri.empty()) {
+                        Json loc = Json::object();
+                        loc["uri"] = s.sourceUri;
+                        Json range = Json::object();
+                        Json start = Json::object();
+                        start["line"] = s.line;
+                        start["character"] = s.column;
+                        Json end = Json::object();
+                        end["line"] = s.line;
+                        end["character"] = s.column + s.length;
+                        range["start"] = start;
+                        range["end"] = end;
+                        loc["range"] = range;
+                        return loc;
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. 具名匯入跳轉: import { foo } from "./mod" -> 跳轉至模組內的宣告行
+    for (const auto& imp : docImports) {
+        if (std::find(imp.namedSymbols.begin(), imp.namedSymbols.end(), ctx.word) != imp.namedSymbols.end()) {
+            ResolvedModule mod = resolveModule(uri, imp.modulePath);
+            for (const auto& s : mod.symbols) {
+                if (s.name == ctx.word && !s.sourceUri.empty()) {
+                    Json loc = Json::object();
+                    loc["uri"] = s.sourceUri;
+                    Json range = Json::object();
+                    Json start = Json::object();
+                    start["line"] = s.line;
+                    start["character"] = s.column;
+                    Json end = Json::object();
+                    end["line"] = s.line;
+                    end["character"] = s.column + s.length;
+                    range["start"] = start;
+                    range["end"] = end;
+                    loc["range"] = range;
+                    return loc;
+                }
+            }
+        }
+    }
+
+    // 4. 當前文檔內的定義跳轉 (fn, class, let, const)
     Lexer lexer(text);
     Token prev;
     while (true) {
         Token tok = lexer.nextToken();
         if (tok.type == TokenType::TOKEN_EOF) break;
 
-        if (tok.type == TokenType::IDENTIFIER && tok.lexeme == word) {
+        if (tok.type == TokenType::IDENTIFIER && tok.lexeme == ctx.word) {
             if (prev.type == TokenType::FN || prev.type == TokenType::CLASS ||
                 prev.type == TokenType::LET || prev.type == TokenType::CONST) {
                 Json loc = Json::object();

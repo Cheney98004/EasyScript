@@ -94,17 +94,21 @@ static std::string defaultEscPath(const std::string& path) {
 }
 
 int main(int argc, char* argv[]) {
+    // 優先檢查是否有 --lsp 或 --stdio 語言伺服器參數
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--lsp" || arg == "lsp" || arg == "--stdio") {
+            lsp::LspServer server;
+            server.run();
+            return 0;
+        }
+    }
+
     VM vm;
 
     if (argc == 1) {
         repl(vm);
     } else if (argc == 2) {
-        std::string arg = argv[1];
-        if (arg == "--lsp") {
-            lsp::LspServer server;
-            server.run();
-            return 0;
-        }
         return runFile(vm, argv[1]);
     } else if (argc >= 3) {
         std::string command = argv[1];

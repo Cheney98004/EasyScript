@@ -7,6 +7,33 @@
 
 namespace lsp {
 
+struct ExportedSymbol {
+    std::string name;
+    int kind{0};
+    int line{0};
+    int column{0};
+    int length{0};
+    std::string signature;
+    std::string doc;
+    std::string sourceUri;
+};
+
+struct ResolvedModule {
+    std::string path;
+    std::string targetUri;
+    bool isStandard{false};
+    std::vector<ExportedSymbol> symbols;
+};
+
+struct ImportInfo {
+    std::string modulePath;
+    std::string alias;
+    std::vector<std::string> namedSymbols;
+    int line{0};
+    int pathColStart{0};
+    int pathColEnd{0};
+};
+
 class LspServer {
 public:
     LspServer();
@@ -30,6 +57,9 @@ private:
     Json handleDocumentSymbol(const std::string& uri);
     Json handleDefinition(const std::string& uri, int line, int character);
     Json handleSemanticTokens(const std::string& uri);
+
+    std::vector<ImportInfo> parseDocumentImports(const std::string& text);
+    ResolvedModule resolveModule(const std::string& currentDocUri, const std::string& importPath);
 };
 
 } // namespace lsp
