@@ -417,6 +417,61 @@ static WordContext getWordContext(const std::string& text, int line, int charact
     return ctx;
 }
 
+struct AccessChain {
+    std::vector<std::string> chain;
+    std::string memberFilter;
+};
+
+static AccessChain parseAccessChain(const std::string& lineStr, int character) {
+    AccessChain ac;
+    int p = character - 1;
+    if (p < 0 || p >= static_cast<int>(lineStr.size())) {
+        if (p >= static_cast<int>(lineStr.size())) p = static_cast<int>(lineStr.size()) - 1;
+        else return ac;
+    }
+
+    // 1. 抓取游標左側正在輸入的成員前綴 (memberFilter)
+    int filterEnd = p + 1;
+    while (p >= 0 && (std::isalnum(static_cast<unsigned char>(lineStr[p])) || lineStr[p] == '_' || lineStr[p] == '$')) {
+        p--;
+    }
+    ac.memberFilter = lineStr.substr(p + 1, filterEnd - (p + 1));
+
+    // 2. 跳過空白字元
+    while (p >= 0 && (lineStr[p] == ' ' || lineStr[p] == '\t')) {
+        p--;
+    }
+
+    // 3. 必須有 '.' 才是成員存取
+    if (p >= 0 && lineStr[p] == '.') {
+        while (p >= 0 && lineStr[p] == '.') {
+            p--;
+            while (p >= 0 && (lineStr[p] == ' ' || lineStr[p] == '\t')) p--;
+            int idEnd = p + 1;
+            while (p >= 0 && (std::isalnum(static_cast<unsigned char>(lineStr[p])) || lineStr[p] == '_' || lineStr[p] == '$')) {
+                p--;
+            }
+            int idStart = p + 1;
+            if (idEnd > idStart) {
+                ac.chain.push_back(lineStr.substr(idStart, idEnd - idStart));
+            } else {
+                break;
+            }
+            while (p >= 0 && (lineStr[p] == ' ' || lineStr[p] == '\t')) p--;
+        }
+    }
+    std::reverse(ac.chain.begin(), ac.chain.end());
+    return ac;
+}
+
+static std::string cleanStringLiteral(std::string_view lexeme) {
+    std::string s(lexeme);
+    if (s.size() >= 2 && ((s.front() == '"' && s.back() == '"') || (s.front() == '\'' && s.back() == '\''))) {
+        return s.substr(1, s.size() - 2);
+    }
+    return s;
+}
+
 // -----------------------------------------------------------------------------
 // 模組解析與匯出符號提取 (Module Resolution & Symbol Extraction)
 // -----------------------------------------------------------------------------
@@ -424,17 +479,56 @@ static WordContext getWordContext(const std::string& text, int line, int charact
 std::vector<ImportInfo> LspServer::parseDocumentImports(const std::string& text) {
     std::vector<ImportInfo> imports;
     Lexer lexer(text);
-    Token tok = lexer.nextToken();
+    std::vector<Token> tokens;
+    while (true) {
+        Token tok = lexer.nextToken();
+        tokens.push_back(tok);
+        if (tok.type == TokenType::TOKEN_EOF) break;
+    }
 
-    while (tok.type != TokenType::TOKEN_EOF) {
-        if (tok.type == TokenType::IMPORT) {
-            Token next = lexer.nextToken();
-            if (next.type == TokenType::STRING) {
-                // import "path";
-                std::string pathStr = std::string(next.lexeme);
-                if (pathStr.size() >= 2 && pathStr.front() == '"' && pathStr.back() == '"') {
-                    pathStr = pathStr.substr(1, pathStr.size() - 2);
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        if (tokens[i].type != TokenType::IMPORT) continue;
+
+        // 1. import "path" [as alias];
+        if (i + 1 < tokens.size() && tokens[i + 1].type == TokenType::STRING) {
+            const Token& pathTok = tokens[i + 1];
+            std::string pathStr = cleanStringLiteral(pathTok.lexeme);
+            std::string alias = pathStr;
+            size_t slash = alias.find_last_of("/\\");
+            if (slash != std::string::npos) alias = alias.substr(slash + 1);
+            if (alias.ends_with(".easy") || alias.ends_with(".esc")) {
+                alias = alias.substr(0, alias.find_last_of('.'));
+            }
+
+            if (i + 3 < tokens.size() && tokens[i + 2].type == TokenType::IDENTIFIER && tokens[i + 2].lexeme == "as" && tokens[i + 3].type == TokenType::IDENTIFIER) {
+                alias = std::string(tokens[i + 3].lexeme);
+                i += 3;
+            } else {
+                i += 1;
+            }
+
+            ImportInfo info;
+            info.modulePath = pathStr;
+            info.alias = alias;
+            info.line = pathTok.line - 1;
+            info.pathColStart = pathTok.column - 1;
+            info.pathColEnd = pathTok.column - 1 + static_cast<int>(pathTok.lexeme.size());
+            imports.push_back(std::move(info));
+        }
+        // 2. import { a, b, c } from "path";
+        else if (i + 1 < tokens.size() && tokens[i + 1].type == TokenType::LEFT_BRACE) {
+            size_t p = i + 2;
+            std::vector<std::string> symbols;
+            while (p < tokens.size() && tokens[p].type != TokenType::RIGHT_BRACE && tokens[p].type != TokenType::TOKEN_EOF) {
+                if (tokens[p].type == TokenType::IDENTIFIER) {
+                    symbols.push_back(std::string(tokens[p].lexeme));
                 }
+                p++;
+            }
+            if (p < tokens.size() && tokens[p].type == TokenType::RIGHT_BRACE) p++;
+            if (p + 1 < tokens.size() && tokens[p].type == TokenType::FROM && tokens[p + 1].type == TokenType::STRING) {
+                const Token& pathTok = tokens[p + 1];
+                std::string pathStr = cleanStringLiteral(pathTok.lexeme);
                 std::string alias = pathStr;
                 size_t slash = alias.find_last_of("/\\");
                 if (slash != std::string::npos) alias = alias.substr(slash + 1);
@@ -444,67 +538,42 @@ std::vector<ImportInfo> LspServer::parseDocumentImports(const std::string& text)
                 ImportInfo info;
                 info.modulePath = pathStr;
                 info.alias = alias;
-                info.line = next.line - 1;
-                info.pathColStart = next.column - 1;
-                info.pathColEnd = next.column - 1 + static_cast<int>(next.lexeme.size());
+                info.namedSymbols = std::move(symbols);
+                info.line = pathTok.line - 1;
+                info.pathColStart = pathTok.column - 1;
+                info.pathColEnd = pathTok.column - 1 + static_cast<int>(pathTok.lexeme.size());
                 imports.push_back(std::move(info));
-            } else if (next.type == TokenType::LEFT_BRACE) {
-                // import { a, b, c } from "path";
-                std::vector<std::string> symbols;
-                Token symTok = lexer.nextToken();
-                while (symTok.type != TokenType::RIGHT_BRACE && symTok.type != TokenType::TOKEN_EOF) {
-                    if (symTok.type == TokenType::IDENTIFIER) {
-                        symbols.push_back(std::string(symTok.lexeme));
-                    }
-                    symTok = lexer.nextToken();
-                }
-                Token fromTok = lexer.nextToken();
-                if (fromTok.type == TokenType::FROM) {
-                    Token pathTok = lexer.nextToken();
-                    if (pathTok.type == TokenType::STRING) {
-                        std::string pathStr = std::string(pathTok.lexeme);
-                        if (pathStr.size() >= 2 && pathStr.front() == '"' && pathStr.back() == '"') {
-                            pathStr = pathStr.substr(1, pathStr.size() - 2);
-                        }
-                        std::string alias = pathStr;
-                        size_t slash = alias.find_last_of("/\\");
-                        if (slash != std::string::npos) alias = alias.substr(slash + 1);
-                        if (alias.ends_with(".easy") || alias.ends_with(".esc")) {
-                            alias = alias.substr(0, alias.find_last_of('.'));
-                        }
-                        ImportInfo info;
-                        info.modulePath = pathStr;
-                        info.alias = alias;
-                        info.namedSymbols = std::move(symbols);
-                        info.line = pathTok.line - 1;
-                        info.pathColStart = pathTok.column - 1;
-                        info.pathColEnd = pathTok.column - 1 + static_cast<int>(pathTok.lexeme.size());
-                        imports.push_back(std::move(info));
-                    }
-                }
-            } else if (next.type == TokenType::IDENTIFIER) {
-                // import alias from "path";
-                std::string alias(next.lexeme);
-                Token fromTok = lexer.nextToken();
-                if (fromTok.type == TokenType::FROM) {
-                    Token pathTok = lexer.nextToken();
-                    if (pathTok.type == TokenType::STRING) {
-                        std::string pathStr = std::string(pathTok.lexeme);
-                        if (pathStr.size() >= 2 && pathStr.front() == '"' && pathStr.back() == '"') {
-                            pathStr = pathStr.substr(1, pathStr.size() - 2);
-                        }
-                        ImportInfo info;
-                        info.modulePath = pathStr;
-                        info.alias = alias;
-                        info.line = pathTok.line - 1;
-                        info.pathColStart = pathTok.column - 1;
-                        info.pathColEnd = pathTok.column - 1 + static_cast<int>(pathTok.lexeme.size());
-                        imports.push_back(std::move(info));
-                    }
-                }
+                i = p + 1;
             }
         }
-        tok = lexer.nextToken();
+        // 3. import * as alias from "path";
+        else if (i + 5 < tokens.size() && tokens[i + 1].type == TokenType::STAR && tokens[i + 2].type == TokenType::IDENTIFIER && tokens[i + 2].lexeme == "as" && tokens[i + 3].type == TokenType::IDENTIFIER && tokens[i + 4].type == TokenType::FROM && tokens[i + 5].type == TokenType::STRING) {
+            std::string alias = std::string(tokens[i + 3].lexeme);
+            const Token& pathTok = tokens[i + 5];
+            std::string pathStr = cleanStringLiteral(pathTok.lexeme);
+            ImportInfo info;
+            info.modulePath = pathStr;
+            info.alias = alias;
+            info.line = pathTok.line - 1;
+            info.pathColStart = pathTok.column - 1;
+            info.pathColEnd = pathTok.column - 1 + static_cast<int>(pathTok.lexeme.size());
+            imports.push_back(std::move(info));
+            i += 5;
+        }
+        // 4. import alias from "path";
+        else if (i + 3 < tokens.size() && tokens[i + 1].type == TokenType::IDENTIFIER && tokens[i + 2].type == TokenType::FROM && tokens[i + 3].type == TokenType::STRING) {
+            std::string alias = std::string(tokens[i + 1].lexeme);
+            const Token& pathTok = tokens[i + 3];
+            std::string pathStr = cleanStringLiteral(pathTok.lexeme);
+            ImportInfo info;
+            info.modulePath = pathStr;
+            info.alias = alias;
+            info.line = pathTok.line - 1;
+            info.pathColStart = pathTok.column - 1;
+            info.pathColEnd = pathTok.column - 1 + static_cast<int>(pathTok.lexeme.size());
+            imports.push_back(std::move(info));
+            i += 3;
+        }
     }
     return imports;
 }
@@ -527,9 +596,52 @@ ResolvedModule LspServer::resolveModule(const std::string& currentDocUri, const 
         mod.symbols.push_back({"flushError", 3, 0, 0, 10, "flushError(): void", "Flushes stderr buffer."});
         mod.symbols.push_back({"setEncoding", 3, 0, 0, 11, "setEncoding(encoding, setInput = true): bool", "Sets console output and input character encoding."});
         mod.symbols.push_back({"getEncoding", 3, 0, 0, 11, "getEncoding(): string", "Gets current console output character encoding name."});
-        mod.symbols.push_back({"Terminal", 7, 0, 0, 8, "class Terminal", "Terminal screen and cursor manipulation class."});
-        mod.symbols.push_back({"Color", 7, 0, 0, 5, "class Color", "ANSI terminal colors and text styles class."});
-        mod.symbols.push_back({"Prompt", 7, 0, 0, 6, "class Prompt", "Interactive CLI prompt dialog class."});
+
+        ExportedSymbol termSym{"Terminal", 7, 0, 0, 8, "class Terminal", "Terminal screen and cursor manipulation class."};
+        termSym.members.push_back({"clear", 3, 0, 0, 5, "clear(): void", "Clears terminal screen."});
+        termSym.members.push_back({"clearLine", 3, 0, 0, 9, "clearLine(): void", "Clears current line."});
+        termSym.members.push_back({"clearToEnd", 3, 0, 0, 10, "clearToEnd(): void", "Clears to end of screen."});
+        termSym.members.push_back({"setCursor", 3, 0, 0, 9, "setCursor(x, y): void", "Sets cursor position (1-based)."});
+        termSym.members.push_back({"getCursor", 3, 0, 0, 9, "getCursor(): Map {x, y}", "Gets cursor position."});
+        termSym.members.push_back({"moveUp", 3, 0, 0, 6, "moveUp(n = 1): void", "Moves cursor up."});
+        termSym.members.push_back({"moveDown", 3, 0, 0, 8, "moveDown(n = 1): void", "Moves cursor down."});
+        termSym.members.push_back({"moveLeft", 3, 0, 0, 8, "moveLeft(n = 1): void", "Moves cursor left."});
+        termSym.members.push_back({"moveRight", 3, 0, 0, 9, "moveRight(n = 1): void", "Moves cursor right."});
+        termSym.members.push_back({"hideCursor", 3, 0, 0, 10, "hideCursor(): void", "Hides cursor."});
+        termSym.members.push_back({"showCursor", 3, 0, 0, 10, "showCursor(): void", "Shows cursor."});
+        termSym.members.push_back({"getWidth", 3, 0, 0, 8, "getWidth(): int", "Gets terminal width."});
+        termSym.members.push_back({"getHeight", 3, 0, 0, 9, "getHeight(): int", "Gets terminal height."});
+        termSym.members.push_back({"getSize", 3, 0, 0, 7, "getSize(): Map {width, height}", "Gets terminal size."});
+        termSym.members.push_back({"isTerminal", 3, 0, 0, 10, "isTerminal(): bool", "Checks if interactive terminal."});
+        termSym.members.push_back({"beep", 3, 0, 0, 4, "beep(): void", "Emits console bell alert."});
+        termSym.members.push_back({"setEncoding", 3, 0, 0, 11, "setEncoding(encoding, setInput = true): bool", "Sets console encoding."});
+        termSym.members.push_back({"getEncoding", 3, 0, 0, 11, "getEncoding(): string", "Gets console encoding."});
+        termSym.members.push_back({"setCodePage", 3, 0, 0, 11, "setCodePage(cp, setInput = true): bool", "Sets Windows CodePage."});
+        termSym.members.push_back({"getCodePage", 3, 0, 0, 11, "getCodePage(): int", "Gets Windows CodePage."});
+        mod.symbols.push_back(std::move(termSym));
+
+        ExportedSymbol colorSym{"Color", 7, 0, 0, 5, "class Color", "ANSI terminal colors and text styles class."};
+        const char* colors[] = {"red", "green", "yellow", "blue", "magenta", "cyan", "white", "gray"};
+        for (const char* c : colors) colorSym.members.push_back({c, 3, 0, 0, static_cast<int>(strlen(c)), std::string(c) + "(text: string): string", "ANSI foreground color."});
+        const char* bgColors[] = {"bgRed", "bgGreen", "bgYellow", "bgBlue", "bgMagenta", "bgCyan", "bgWhite", "bgGray"};
+        for (const char* c : bgColors) colorSym.members.push_back({c, 3, 0, 0, static_cast<int>(strlen(c)), std::string(c) + "(text: string): string", "ANSI background color."});
+        const char* styles[] = {"bold", "dim", "italic", "underline", "inverse"};
+        for (const char* s : styles) colorSym.members.push_back({s, 3, 0, 0, static_cast<int>(strlen(s)), std::string(s) + "(text: string): string", "ANSI style."});
+        colorSym.members.push_back({"rgb", 3, 0, 0, 3, "rgb(r, g, b, text): string", "24-bit TrueColor foreground."});
+        colorSym.members.push_back({"bgRgb", 3, 0, 0, 5, "bgRgb(r, g, b, text): string", "24-bit TrueColor background."});
+        colorSym.members.push_back({"strip", 3, 0, 0, 5, "strip(text: string): string", "Removes ANSI sequences."});
+        colorSym.members.push_back({"RED", 21, 0, 0, 3, "const RED: string", "ANSI Red code."});
+        colorSym.members.push_back({"GREEN", 21, 0, 0, 5, "const GREEN: string", "ANSI Green code."});
+        colorSym.members.push_back({"RESET", 21, 0, 0, 5, "const RESET: string", "ANSI Reset code."});
+        mod.symbols.push_back(std::move(colorSym));
+
+        ExportedSymbol promptSym{"Prompt", 7, 0, 0, 6, "class Prompt", "Interactive CLI prompt dialog class."};
+        promptSym.members.push_back({"ask", 3, 0, 0, 3, "ask(question, defaultVal = ''): string", "Interactive user prompt."});
+        promptSym.members.push_back({"confirm", 3, 0, 0, 7, "confirm(question, defaultVal = false): bool", "Interactive [y/N] prompt."});
+        promptSym.members.push_back({"password", 3, 0, 0, 8, "password(question, maskChar = '*'): string", "Hidden password prompt."});
+        promptSym.members.push_back({"choose", 3, 0, 0, 6, "choose(question, options): int", "Option chooser dialog."});
+        mod.symbols.push_back(std::move(promptSym));
+
         return mod;
     } else if (importPath == "std/fs") {
         mod.isStandard = true;
@@ -751,6 +863,86 @@ ResolvedModule LspServer::resolveModule(const std::string& currentDocUri, const 
             sym.signature = "class " + std::string(nameTok.lexeme);
             sym.doc = extractDocComment(sourceCode, tok.line - 1);
             sym.sourceUri = mod.targetUri;
+
+            // 尋找類別主體 { ... } 並收集成員方法與建構子
+            size_t bodyIdx = declIdx + 2;
+            while (bodyIdx < tokens.size() && tokens[bodyIdx].type != TokenType::LEFT_BRACE && tokens[bodyIdx].type != TokenType::TOKEN_EOF) {
+                bodyIdx++;
+            }
+            if (bodyIdx < tokens.size() && tokens[bodyIdx].type == TokenType::LEFT_BRACE) {
+                int cDepth = 1;
+                size_t mIdx = bodyIdx + 1;
+                while (mIdx < tokens.size() && cDepth > 0) {
+                    if (tokens[mIdx].type == TokenType::LEFT_BRACE) {
+                        cDepth++;
+                    } else if (tokens[mIdx].type == TokenType::RIGHT_BRACE) {
+                        cDepth--;
+                        if (cDepth == 0) break;
+                    } else if (cDepth == 1) {
+                        if (tokens[mIdx].type == TokenType::FN && mIdx + 1 < tokens.size() && tokens[mIdx + 1].type == TokenType::IDENTIFIER) {
+                            const Token& mName = tokens[mIdx + 1];
+                            ExportedSymbol mSym;
+                            mSym.name = std::string(mName.lexeme);
+                            mSym.kind = 2; // Method
+                            mSym.line = mName.line - 1;
+                            mSym.column = mName.column - 1;
+                            mSym.length = static_cast<int>(mName.lexeme.size());
+                            mSym.signature = "fn " + std::string(mName.lexeme) + "()";
+                            size_t mp = mIdx + 2;
+                            if (mp < tokens.size() && tokens[mp].type == TokenType::LEFT_PAREN) {
+                                std::string msig = "fn " + std::string(mName.lexeme) + "(";
+                                mp++;
+                                while (mp < tokens.size() && tokens[mp].type != TokenType::RIGHT_PAREN && tokens[mp].type != TokenType::TOKEN_EOF) {
+                                    if (tokens[mp].type == TokenType::COMMA) msig += ", ";
+                                    else if (tokens[mp].type == TokenType::COLON) msig += ": ";
+                                    else if (tokens[mp].type == TokenType::EQUAL) msig += " = ";
+                                    else {
+                                        if (!msig.empty() && msig.back() != '(' && msig.back() != ' ') msig += " ";
+                                        msig += std::string(tokens[mp].lexeme);
+                                    }
+                                    mp++;
+                                }
+                                msig += ")";
+                                mSym.signature = msig;
+                            }
+                            mSym.doc = extractDocComment(sourceCode, tokens[mIdx].line - 1);
+                            mSym.sourceUri = mod.targetUri;
+                            sym.members.push_back(std::move(mSym));
+                        } else if (tokens[mIdx].type == TokenType::INIT) {
+                            const Token& mName = tokens[mIdx];
+                            ExportedSymbol mSym;
+                            mSym.name = "init";
+                            mSym.kind = 4; // Constructor
+                            mSym.line = mName.line - 1;
+                            mSym.column = mName.column - 1;
+                            mSym.length = static_cast<int>(mName.lexeme.size());
+                            mSym.signature = "init()";
+                            size_t mp = mIdx + 1;
+                            if (mp < tokens.size() && tokens[mp].type == TokenType::LEFT_PAREN) {
+                                std::string msig = "init(";
+                                mp++;
+                                while (mp < tokens.size() && tokens[mp].type != TokenType::RIGHT_PAREN && tokens[mp].type != TokenType::TOKEN_EOF) {
+                                    if (tokens[mp].type == TokenType::COMMA) msig += ", ";
+                                    else if (tokens[mp].type == TokenType::COLON) msig += ": ";
+                                    else if (tokens[mp].type == TokenType::EQUAL) msig += " = ";
+                                    else {
+                                        if (!msig.empty() && msig.back() != '(' && msig.back() != ' ') msig += " ";
+                                        msig += std::string(tokens[mp].lexeme);
+                                    }
+                                    mp++;
+                                }
+                                msig += ")";
+                                mSym.signature = msig;
+                            }
+                            mSym.doc = extractDocComment(sourceCode, tokens[mIdx].line - 1);
+                            mSym.sourceUri = mod.targetUri;
+                            sym.members.push_back(std::move(mSym));
+                        }
+                    }
+                    mIdx++;
+                }
+            }
+
             mod.symbols.push_back(std::move(sym));
             i = declIdx;
         } else if ((declTok.type == TokenType::LET || declTok.type == TokenType::CONST) && declIdx + 1 < tokens.size() && tokens[declIdx + 1].type == TokenType::IDENTIFIER) {
@@ -857,91 +1049,88 @@ Json LspServer::handleCompletion(const std::string& uri, int line, int character
         }
     }
 
-    // 3. 模組別名或物件點運算子提示 (<alias>.)
-    size_t lastDot = prefix.rfind('.');
-    if (lastDot != std::string::npos && lastDot + 1 == prefix.size()) {
-        size_t idStart = lastDot;
-        while (idStart > 0 && (std::isalnum(static_cast<unsigned char>(prefix[idStart - 1])) || prefix[idStart - 1] == '_' || prefix[idStart - 1] == '$')) {
-            idStart--;
+    // 3. 模組別名或物件成員點運算子提示 (<alias>., <alias>.<filter>, <alias>.<Class>., etc.)
+    AccessChain ac = parseAccessChain(lineStr, character);
+    if (!ac.chain.empty()) {
+        const std::string& root = ac.chain[0];
+
+        auto addSymbols = [&](const std::vector<ExportedSymbol>& syms) {
+            for (const auto& sym : syms) {
+                addCompletion(items, sym.name, sym.kind, sym.signature, sym.doc);
+            }
+        };
+
+        // A. 尋找 root 是否為匯入的模組
+        const ImportInfo* matchedImp = nullptr;
+        for (const auto& imp : docImports) {
+            if (imp.alias == root) {
+                matchedImp = &imp;
+                break;
+            }
         }
-        std::string objName = prefix.substr(idStart, lastDot - idStart);
-        if (!objName.empty()) {
-            // 先檢查是否為文檔中匯入的模組別名
-            for (const auto& imp : docImports) {
-                if (imp.alias == objName) {
-                    ResolvedModule mod = resolveModule(uri, imp.modulePath);
-                    for (const auto& sym : mod.symbols) {
-                        addCompletion(items, sym.name, sym.kind, sym.signature, sym.doc);
+
+        ResolvedModule mod;
+        bool foundMod = false;
+        if (matchedImp) {
+            mod = resolveModule(uri, matchedImp->modulePath);
+            foundMod = true;
+        } else if (root == "io") {
+            mod = resolveModule(uri, "std/io");
+            foundMod = true;
+        } else if (root == "fs") {
+            mod = resolveModule(uri, "std/fs");
+            foundMod = true;
+        } else if (root == "path") {
+            mod = resolveModule(uri, "std/path");
+            foundMod = true;
+        } else if (root == "os") {
+            mod = resolveModule(uri, "std/os");
+            foundMod = true;
+        } else if (root == "Math" || root == "math") {
+            mod = resolveModule(uri, "std/math");
+            foundMod = true;
+        }
+
+        if (foundMod) {
+            if (ac.chain.size() == 1) {
+                // <module>.<method/member>
+                addSymbols(mod.symbols);
+                return items;
+            } else if (ac.chain.size() == 2) {
+                // <module>.<Class>.<method> (例如 io.Terminal. 或 calc.Calculator.)
+                const std::string& memberClass = ac.chain[1];
+                for (const auto& sym : mod.symbols) {
+                    if (sym.name == memberClass && !sym.members.empty()) {
+                        addSymbols(sym.members);
+                        return items;
                     }
-                    return items;
                 }
             }
+        }
 
-            // 檢查常見內建模組
-            if (objName == "io") {
-                ResolvedModule mod = resolveModule(uri, "std/io");
-                for (const auto& sym : mod.symbols) addCompletion(items, sym.name, sym.kind, sym.signature, sym.doc);
-                return items;
-            } else if (objName == "fs") {
-                ResolvedModule mod = resolveModule(uri, "std/fs");
-                for (const auto& sym : mod.symbols) addCompletion(items, sym.name, sym.kind, sym.signature, sym.doc);
-                return items;
-            } else if (objName == "path") {
-                ResolvedModule mod = resolveModule(uri, "std/path");
-                for (const auto& sym : mod.symbols) addCompletion(items, sym.name, sym.kind, sym.signature, sym.doc);
-                return items;
-            } else if (objName == "os") {
-                ResolvedModule mod = resolveModule(uri, "std/os");
-                for (const auto& sym : mod.symbols) addCompletion(items, sym.name, sym.kind, sym.signature, sym.doc);
-                return items;
-            } else if (objName == "Math" || objName == "math") {
-                ResolvedModule mod = resolveModule(uri, "std/math");
-                for (const auto& sym : mod.symbols) addCompletion(items, sym.name, sym.kind, sym.signature, sym.doc);
-                return items;
-            } else if (objName == "Color") {
-                const char* colors[] = {"red", "green", "yellow", "blue", "magenta", "cyan", "white", "gray"};
-                for (const char* c : colors) addCompletion(items, c, 3, std::string(c) + "(text: string): string", "ANSI foreground color.");
-                const char* bgColors[] = {"bgRed", "bgGreen", "bgYellow", "bgBlue", "bgMagenta", "bgCyan", "bgWhite", "bgGray"};
-                for (const char* c : bgColors) addCompletion(items, c, 3, std::string(c) + "(text: string): string", "ANSI background color.");
-                const char* styles[] = {"bold", "dim", "italic", "underline", "inverse"};
-                for (const char* s : styles) addCompletion(items, s, 3, std::string(s) + "(text: string): string", "ANSI style.");
-                addCompletion(items, "rgb", 3, "rgb(r, g, b, text): string", "24-bit TrueColor foreground.");
-                addCompletion(items, "bgRgb", 3, "bgRgb(r, g, b, text): string", "24-bit TrueColor background.");
-                addCompletion(items, "strip", 3, "strip(text: string): string", "Removes ANSI sequences.");
-                addCompletion(items, "RED", 21, "const RED: string", "ANSI Red code.");
-                addCompletion(items, "GREEN", 21, "const GREEN: string", "ANSI Green code.");
-                addCompletion(items, "RESET", 21, "const RESET: string", "ANSI Reset code.");
-                return items;
-            } else if (objName == "Terminal") {
-                addCompletion(items, "clear", 3, "clear(): void", "Clears terminal screen.");
-                addCompletion(items, "clearLine", 3, "clearLine(): void", "Clears current line.");
-                addCompletion(items, "clearToEnd", 3, "clearToEnd(): void", "Clears to end of screen.");
-                addCompletion(items, "setCursor", 3, "setCursor(x, y): void", "Sets cursor position (1-based).");
-                addCompletion(items, "getCursor", 3, "getCursor(): Map {x, y}", "Gets cursor position.");
-                addCompletion(items, "moveUp", 3, "moveUp(n = 1): void", "Moves cursor up.");
-                addCompletion(items, "moveDown", 3, "moveDown(n = 1): void", "Moves cursor down.");
-                addCompletion(items, "moveLeft", 3, "moveLeft(n = 1): void", "Moves cursor left.");
-                addCompletion(items, "moveRight", 3, "moveRight(n = 1): void", "Moves cursor right.");
-                addCompletion(items, "hideCursor", 3, "hideCursor(): void", "Hides cursor.");
-                addCompletion(items, "showCursor", 3, "showCursor(): void", "Shows cursor.");
-                addCompletion(items, "getWidth", 3, "getWidth(): int", "Gets terminal width.");
-                addCompletion(items, "getHeight", 3, "getHeight(): int", "Gets terminal height.");
-                addCompletion(items, "getSize", 3, "getSize(): Map {width, height}", "Gets terminal size.");
-                addCompletion(items, "isTerminal", 3, "isTerminal(): bool", "Checks if interactive terminal.");
-                addCompletion(items, "beep", 3, "beep(): void", "Emits console bell alert.");
-                addCompletion(items, "setEncoding", 3, "setEncoding(encoding, setInput = true): bool", "Sets console encoding.");
-                addCompletion(items, "getEncoding", 3, "getEncoding(): string", "Gets console encoding.");
-                addCompletion(items, "setCodePage", 3, "setCodePage(cp, setInput = true): bool", "Sets Windows CodePage.");
-                addCompletion(items, "getCodePage", 3, "getCodePage(): int", "Gets Windows CodePage.");
-                return items;
-            } else if (objName == "Prompt") {
-                addCompletion(items, "ask", 3, "ask(question, defaultVal = ''): string", "Interactive user prompt.");
-                addCompletion(items, "confirm", 3, "confirm(question, defaultVal = false): bool", "Interactive [y/N] prompt.");
-                addCompletion(items, "password", 3, "password(question, maskChar = '*'): string", "Hidden password prompt.");
-                addCompletion(items, "choose", 3, "choose(question, options): int", "Option chooser dialog.");
+        // B. 檢查 root 是否為直接全域類別 (例如 Terminal, Color, Prompt)
+        ResolvedModule ioMod = resolveModule(uri, "std/io");
+        for (const auto& sym : ioMod.symbols) {
+            if (sym.name == root && !sym.members.empty()) {
+                addSymbols(sym.members);
                 return items;
             }
         }
+
+        // C. 檢查 root 是否為具名匯入中的類別 (import { Calculator } from "./calc")
+        for (const auto& imp : docImports) {
+            if (std::find(imp.namedSymbols.begin(), imp.namedSymbols.end(), root) != imp.namedSymbols.end()) {
+                ResolvedModule namedMod = resolveModule(uri, imp.modulePath);
+                for (const auto& sym : namedMod.symbols) {
+                    if (sym.name == root && !sym.members.empty()) {
+                        addSymbols(sym.members);
+                        return items;
+                    }
+                }
+            }
+        }
+
+        return items;
     }
 
     // 4. 通用關鍵字補全
@@ -959,10 +1148,14 @@ Json LspServer::handleCompletion(const std::string& uri, int line, int character
     addCompletion(items, "print", 3, "print(value: any): void", "Prints value to stdout with newline.");
     addCompletion(items, "println", 3, "println(value: any): void", "Prints value to stdout with newline.");
     addCompletion(items, "assert", 3, "assert(condition: bool, message = ''): void", "Asserts condition is true.");
+    addCompletion(items, "io", 9, "module std/io", "Standard I/O, terminal colors, and cursor control.");
+    addCompletion(items, "fs", 9, "module std/fs", "Filesystem reading, writing, and directory operations.");
+    addCompletion(items, "path", 9, "module std/path", "Path manipulation, normalization, and joining.");
+    addCompletion(items, "os", 9, "module std/os", "Operating system environment, platform, and processes.");
+    addCompletion(items, "Math", 7, "module Math", "Standard math module.");
     addCompletion(items, "Terminal", 7, "class Terminal", "Standard terminal manipulation class.");
     addCompletion(items, "Color", 7, "class Color", "Standard ANSI terminal color class.");
     addCompletion(items, "Prompt", 7, "class Prompt", "Standard CLI prompt dialog class.");
-    addCompletion(items, "Math", 7, "module Math", "Standard math module.");
 
     // 6. 加入所有已匯入的別名與具名符號
     for (const auto& imp : docImports) {
@@ -1069,6 +1262,26 @@ Json LspServer::handleHover(const std::string& uri, int line, int character) {
                     contents["value"] = doc;
                     result["contents"] = contents;
                     return result;
+                }
+            }
+        }
+
+        // 檢查 parentObject 是否為標準類別 (例如 Terminal.clear, Color.red, Prompt.ask)
+        ResolvedModule ioMod = resolveModule(uri, "std/io");
+        for (const auto& sym : ioMod.symbols) {
+            if (sym.name == ctx.parentObject) {
+                for (const auto& m : sym.members) {
+                    if (m.name == ctx.word) {
+                        std::string doc = "```easyscript\n" + m.signature + "\n```\n\n";
+                        doc += "*From `" + sym.name + "` (`std/io`)*\n\n";
+                        if (!m.doc.empty()) doc += m.doc + "\n";
+                        Json result = Json::object();
+                        Json contents = Json::object();
+                        contents["kind"] = "markdown";
+                        contents["value"] = doc;
+                        result["contents"] = contents;
+                        return result;
+                    }
                 }
             }
         }

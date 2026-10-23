@@ -16,6 +16,7 @@ struct ExportedSymbol {
     std::string signature;
     std::string doc;
     std::string sourceUri;
+    std::vector<ExportedSymbol> members{};
 };
 
 struct ResolvedModule {
