@@ -55,6 +55,7 @@ private:
     void validateDocument(const std::string& uri, const std::string& text);
     Json handleCompletion(const std::string& uri, int line, int character);
     Json handleHover(const std::string& uri, int line, int character);
+    Json handleSignatureHelp(const std::string& uri, int line, int character);
     Json handleDocumentSymbol(const std::string& uri);
     Json handleDefinition(const std::string& uri, int line, int character);
     Json handleSemanticTokens(const std::string& uri);

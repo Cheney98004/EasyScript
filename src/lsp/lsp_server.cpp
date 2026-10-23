@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <algorithm>
 #include <cctype>
+#include <unordered_set>
 
 namespace fs = std::filesystem;
 
@@ -121,6 +122,14 @@ void LspServer::handleRequest(const Json& msg) {
         caps["documentSymbolProvider"] = true;
         caps["definitionProvider"] = true;
 
+        // Signature Help (參數提示)
+        Json sig = Json::object();
+        Json sigTrig = Json::array();
+        sigTrig.push_back("(");
+        sigTrig.push_back(",");
+        sig["triggerCharacters"] = sigTrig;
+        caps["signatureHelpProvider"] = sig;
+
         // Semantic Tokens (語意上色)
         Json semTokens = Json::object();
         Json legend = Json::object();
@@ -163,6 +172,11 @@ void LspServer::handleRequest(const Json& msg) {
         int line = static_cast<int>(params["position"]["line"].asInt());
         int character = static_cast<int>(params["position"]["character"].asInt());
         sendResponse(id, handleHover(uri, line, character));
+    } else if (method == "textDocument/signatureHelp") {
+        std::string uri = params["textDocument"]["uri"].asString();
+        int line = static_cast<int>(params["position"]["line"].asInt());
+        int character = static_cast<int>(params["position"]["character"].asInt());
+        sendResponse(id, handleSignatureHelp(uri, line, character));
     } else if (method == "textDocument/documentSymbol") {
         std::string uri = params["textDocument"]["uri"].asString();
         sendResponse(id, handleDocumentSymbol(uri));
@@ -410,6 +424,23 @@ static WordContext getWordContext(const std::string& text, int line, int charact
             int objStart = p + 1;
             if (objEnd > objStart) {
                 ctx.parentObject = lineStr.substr(objStart, objEnd - objStart);
+            } else if (p >= 0 && (lineStr[p] == ')' || lineStr[p] == '"' || lineStr[p] == '\'' || lineStr[p] == ']' || lineStr[p] == '}')) {
+                char closeCh = lineStr[p];
+                char openCh = (closeCh == ')') ? '(' : (closeCh == ']') ? '[' : (closeCh == '}') ? '{' : closeCh;
+                int depth = 1;
+                int exprEnd = p + 1;
+                p--;
+                while (p >= 0 && depth > 0) {
+                    if (closeCh == '"' || closeCh == '\'') {
+                        if (lineStr[p] == closeCh && (p == 0 || lineStr[p - 1] != '\\')) depth--;
+                    } else {
+                        if (lineStr[p] == closeCh) depth++;
+                        else if (lineStr[p] == openCh) depth--;
+                    }
+                    if (depth > 0) p--;
+                }
+                int exprStart = std::max(0, p);
+                ctx.parentObject = lineStr.substr(exprStart, exprEnd - exprStart);
             }
         }
     }
@@ -454,6 +485,23 @@ static AccessChain parseAccessChain(const std::string& lineStr, int character) {
             int idStart = p + 1;
             if (idEnd > idStart) {
                 ac.chain.push_back(lineStr.substr(idStart, idEnd - idStart));
+            } else if (p >= 0 && (lineStr[p] == ')' || lineStr[p] == '"' || lineStr[p] == '\'' || lineStr[p] == ']' || lineStr[p] == '}')) {
+                char closeCh = lineStr[p];
+                char openCh = (closeCh == ')') ? '(' : (closeCh == ']') ? '[' : (closeCh == '}') ? '{' : closeCh;
+                int depth = 1;
+                int exprEnd = p + 1;
+                p--;
+                while (p >= 0 && depth > 0) {
+                    if (closeCh == '"' || closeCh == '\'') {
+                        if (lineStr[p] == closeCh && (p == 0 || lineStr[p - 1] != '\\')) depth--;
+                    } else {
+                        if (lineStr[p] == closeCh) depth++;
+                        else if (lineStr[p] == openCh) depth--;
+                    }
+                    if (depth > 0) p--;
+                }
+                int exprStart = std::max(0, p);
+                ac.chain.push_back(lineStr.substr(exprStart, exprEnd - exprStart));
             } else {
                 break;
             }
@@ -470,6 +518,286 @@ static std::string cleanStringLiteral(std::string_view lexeme) {
         return s.substr(1, s.size() - 2);
     }
     return s;
+}
+
+// -----------------------------------------------------------------------------
+// 內建型別成員資料結構 (Built-in Types & Methods for Collections and Primitives)
+// -----------------------------------------------------------------------------
+
+struct BuiltinMemberInfo {
+    std::string typeName;     // "Array", "String", "Number", "Map", "Range", "Bool", "Nil"
+    std::string name;         // "map", "filter", "abs", etc.
+    bool isMethod{true};      // true for method (kind 2), false for property (kind 10)
+    std::string signature;    // e.g. "map(callback: fn(item, index?): any): Array"
+    std::string doc;          // Description of method/property
+    std::vector<std::string> paramNames; // For signature help parameter highlighting
+};
+
+enum class InferredType {
+    UNKNOWN,
+    STRING,
+    NUMBER,
+    ARRAY,
+    MAP,
+    RANGE,
+    BOOL,
+    NIL
+};
+
+static const std::vector<BuiltinMemberInfo>& getBuiltinMembers() {
+    static const std::vector<BuiltinMemberInfo> members = {
+        // === Array ===
+        {"Array", "length", false, "length: int", "Returns the number of elements in the array.", {}},
+        {"Array", "size", false, "size: int", "Returns the number of elements in the array (alias for length).", {}},
+        {"Array", "isEmpty", false, "isEmpty: bool", "Returns true if the array contains no elements.", {}},
+        {"Array", "first", false, "first: any", "Returns the first element of the array, or nil if empty.", {}},
+        {"Array", "last", false, "last: any", "Returns the last element of the array, or nil if empty.", {}},
+        {"Array", "push", true, "push(...items: any): int", "Appends elements to the end of the array and returns the new length.", {"...items"}},
+        {"Array", "pop", true, "pop(): any", "Removes and returns the last element of the array, or nil if empty.", {}},
+        {"Array", "insert", true, "insert(index: int, value: any): void", "Inserts an element at the specified index.", {"index", "value"}},
+        {"Array", "removeAt", true, "removeAt(index: int): any", "Removes and returns the element at the specified index.", {"index"}},
+        {"Array", "clear", true, "clear(): void", "Removes all elements from the array.", {}},
+        {"Array", "contains", true, "contains(value: any): bool", "Returns true if the array contains the specified element.", {"value"}},
+        {"Array", "indexOf", true, "indexOf(value: any): int", "Returns the index of the first occurrence of the specified value, or -1.", {"value"}},
+        {"Array", "join", true, "join(delimiter = ','): string", "Joins all elements of the array into a string separated by delimiter.", {"delimiter"}},
+        {"Array", "slice", true, "slice(start: int, end?: int): Array", "Returns a shallow copy of a portion of an array.", {"start", "end"}},
+        {"Array", "reverse", true, "reverse(): Array", "Reverses the array in place and returns it.", {}},
+        {"Array", "isEmpty", true, "isEmpty(): bool", "Returns true if the array contains no elements.", {}},
+        {"Array", "first", true, "first(): any", "Returns the first element of the array, or nil if empty.", {}},
+        {"Array", "last", true, "last(): any", "Returns the last element of the array, or nil if empty.", {}},
+        {"Array", "map", true, "map(callback: fn(item: any, index?: int): any): Array", "Calls a defined callback function on each element and returns an array of the results.", {"callback"}},
+        {"Array", "filter", true, "filter(callback: fn(item: any, index?: int): bool): Array", "Returns the elements of an array that meet the condition specified in a callback function.", {"callback"}},
+        {"Array", "reduce", true, "reduce(callback: fn(accumulator: any, item: any, index?: int): any, initial?: any): any", "Calls the callback function for all elements and accumulates the result into a single value.", {"callback", "initial"}},
+        {"Array", "forEach", true, "forEach(callback: fn(item: any, index?: int): void): void", "Performs the specified callback action for each element in the array.", {"callback"}},
+        {"Array", "find", true, "find(callback: fn(item: any, index?: int): bool): any", "Returns the first element in the array that satisfies the testing function, or nil.", {"callback"}},
+        {"Array", "findIndex", true, "findIndex(callback: fn(item: any, index?: int): bool): int", "Returns the index of the first element in the array that satisfies the testing function, or -1.", {"callback"}},
+        {"Array", "every", true, "every(callback: fn(item: any, index?: int): bool): bool", "Determines whether all elements of the array satisfy the specified test.", {"callback"}},
+        {"Array", "some", true, "some(callback: fn(item: any, index?: int): bool): bool", "Determines whether any element of the array satisfies the specified test.", {"callback"}},
+        {"Array", "sort", true, "sort(comparator?: fn(a: any, b: any): any): Array", "Sorts the elements of an array in place (using natural order or comparator) and returns it.", {"comparator"}},
+
+        // === String ===
+        {"String", "length", false, "length: int", "Returns the length of the string.", {}},
+        {"String", "size", false, "size: int", "Returns the length of the string (alias for length).", {}},
+        {"String", "isEmpty", false, "isEmpty: bool", "Returns true if the string is empty.", {}},
+        {"String", "isEmpty", true, "isEmpty(): bool", "Returns true if the string is empty.", {}},
+        {"String", "substring", true, "substring(start: int, end?: int): string", "Returns a substring between the specified indices.", {"start", "end"}},
+        {"String", "slice", true, "slice(start: int, end?: int): string", "Returns a slice between the specified indices.", {"start", "end"}},
+        {"String", "indexOf", true, "indexOf(target: string, start = 0): int", "Returns the index of the first occurrence of target, or -1.", {"target", "start"}},
+        {"String", "contains", true, "contains(target: string): bool", "Returns true if the string contains the target substring.", {"target"}},
+        {"String", "startsWith", true, "startsWith(prefix: string): bool", "Returns true if the string begins with prefix.", {"prefix"}},
+        {"String", "endsWith", true, "endsWith(suffix: string): bool", "Returns true if the string ends with suffix.", {"suffix"}},
+        {"String", "toUpper", true, "toUpper(): string", "Converts all characters in the string to uppercase.", {}},
+        {"String", "toLower", true, "toLower(): string", "Converts all characters in the string to lowercase.", {}},
+        {"String", "trim", true, "trim(): string", "Removes whitespace from both ends of the string.", {}},
+        {"String", "trimStart", true, "trimStart(): string", "Removes whitespace from the beginning of the string.", {}},
+        {"String", "trimEnd", true, "trimEnd(): string", "Removes whitespace from the end of the string.", {}},
+        {"String", "split", true, "split(delimiter = ' '): Array", "Splits a string into substrings using the specified delimiter.", {"delimiter"}},
+        {"String", "replace", true, "replace(from: string, to: string): string", "Replaces all occurrences of from with to.", {"from", "to"}},
+        {"String", "repeat", true, "repeat(count: int): string", "Returns a new string which contains count copies of this string.", {"count"}},
+        {"String", "lines", true, "lines(): Array", "Splits the string into lines separated by newline characters (\\n, \\r\\n).", {}},
+        {"String", "padStart", true, "padStart(targetLength: int, padString = ' '): string", "Pads the beginning of the string until targetLength is reached.", {"targetLength", "padString"}},
+        {"String", "padEnd", true, "padEnd(targetLength: int, padString = ' '): string", "Pads the end of the string until targetLength is reached.", {"targetLength", "padString"}},
+        {"String", "charAt", true, "charAt(index: int): string", "Returns the character at the specified index, or empty string.", {"index"}},
+        {"String", "charCodeAt", true, "charCodeAt(index: int): int", "Returns the character code at the specified index, or nil if out of bounds.", {"index"}},
+        {"String", "toInt", true, "toInt(radix = 10): int", "Parses an integer from the string with the specified radix, or nil if invalid.", {"radix"}},
+        {"String", "toDouble", true, "toDouble(): double", "Parses a double-precision float from the string, or nil if invalid.", {}},
+
+        // === Number ===
+        {"Number", "isEven", false, "isEven: bool", "Returns true if the integer is even.", {}},
+        {"Number", "isOdd", false, "isOdd: bool", "Returns true if the integer is odd.", {}},
+        {"Number", "sign", false, "sign: int", "Returns 1 for positive numbers, -1 for negative numbers, or 0.", {}},
+        {"Number", "isNaN", false, "isNaN: bool", "Returns true if the number is NaN.", {}},
+        {"Number", "isFinite", false, "isFinite: bool", "Returns true if the number is finite.", {}},
+        {"Number", "toString", true, "toString(): string", "Returns a string representing the number.", {}},
+        {"Number", "toInt", true, "toInt(): int", "Converts the number to a 64-bit integer.", {}},
+        {"Number", "toDouble", true, "toDouble(): double", "Converts the number to a 64-bit double.", {}},
+        {"Number", "abs", true, "abs(): number", "Returns the absolute value of the number.", {}},
+        {"Number", "clamp", true, "clamp(min: number, max: number): number", "Clamps the number within the [min, max] range.", {"min", "max"}},
+        {"Number", "min", true, "min(other: number): number", "Returns the smaller of this number and other.", {"other"}},
+        {"Number", "max", true, "max(other: number): number", "Returns the larger of this number and other.", {"other"}},
+        {"Number", "sign", true, "sign(): int", "Returns 1 for positive numbers, -1 for negative numbers, or 0.", {}},
+        {"Number", "floor", true, "floor(): number", "Returns the greatest integer less than or equal to the number.", {}},
+        {"Number", "ceil", true, "ceil(): number", "Returns the smallest integer greater than or equal to the number.", {}},
+        {"Number", "round", true, "round(): number", "Returns the value of the number rounded to the nearest integer.", {}},
+        {"Number", "toFixed", true, "toFixed(digits = 0): string", "Formats the number using fixed-point notation with specified decimal places.", {"digits"}},
+        {"Number", "toHex", true, "toHex(): string", "Converts the integer to its hexadecimal string representation.", {}},
+        {"Number", "toBin", true, "toBin(): string", "Converts the integer to its binary string representation.", {}},
+        {"Number", "isEven", true, "isEven(): bool", "Returns true if the integer is even.", {}},
+        {"Number", "isOdd", true, "isOdd(): bool", "Returns true if the integer is odd.", {}},
+        {"Number", "times", true, "times(callback: fn(index: int): void): void", "Executes callback n times, passing 0 to n - 1.", {"callback"}},
+        {"Number", "upTo", true, "upTo(limit: int, callback?: fn(index: int): void): Array|void", "Iterates from this number up to limit, or returns an array [this..limit].", {"limit", "callback"}},
+        {"Number", "downTo", true, "downTo(limit: int, callback?: fn(index: int): void): Array|void", "Iterates from this number down to limit, or returns an array [this..limit].", {"limit", "callback"}},
+        {"Number", "isFinite", true, "isFinite(): bool", "Returns true if the number is finite.", {}},
+        {"Number", "isInfinite", true, "isInfinite(): bool", "Returns true if the number is infinite.", {}},
+        {"Number", "isNaN", true, "isNaN(): bool", "Returns true if the number is NaN.", {}},
+
+        // === Map ===
+        {"Map", "length", false, "length: int", "Returns the number of key-value pairs in the map.", {}},
+        {"Map", "size", false, "size: int", "Returns the number of key-value pairs in the map (alias for length).", {}},
+        {"Map", "isEmpty", false, "isEmpty: bool", "Returns true if the map contains no key-value pairs.", {}},
+        {"Map", "isEmpty", true, "isEmpty(): bool", "Returns true if the map contains no key-value pairs.", {}},
+        {"Map", "has", true, "has(key: any): bool", "Returns true if the specified key exists in the map.", {"key"}},
+        {"Map", "contains", true, "contains(key: any): bool", "Returns true if the specified key exists in the map.", {"key"}},
+        {"Map", "get", true, "get(key: any): any", "Returns the value mapped to key, or nil if not found.", {"key"}},
+        {"Map", "getOrDefault", true, "getOrDefault(key: any, defaultVal: any): any", "Returns the value mapped to key, or defaultVal if not found.", {"key", "defaultVal"}},
+        {"Map", "remove", true, "remove(key: any): any", "Removes the entry for key and returns its value, or nil if not found.", {"key"}},
+        {"Map", "keys", true, "keys(): Array", "Returns an array containing all keys in the map.", {}},
+        {"Map", "values", true, "values(): Array", "Returns an array containing all values in the map.", {}},
+        {"Map", "entries", true, "entries(): Array", "Returns an array of 2-element [key, value] pairs.", {}},
+        {"Map", "merge", true, "merge(other: Map): Map", "Inserts all entries from other map into this map and returns this map.", {"other"}},
+        {"Map", "clear", true, "clear(): void", "Removes all key-value pairs from the map.", {}},
+
+        // === Range ===
+        {"Range", "start", false, "start: int", "Start of the range.", {}},
+        {"Range", "end", false, "end: int", "End of the range.", {}},
+        {"Range", "step", false, "step: int", "Step size of the range.", {}},
+        {"Range", "length", false, "length: int", "Number of values in the range.", {}},
+        {"Range", "size", false, "size: int", "Number of values in the range.", {}},
+        {"Range", "toArray", true, "toArray(): Array", "Converts the range to an array of integers.", {}},
+
+        // === Bool ===
+        {"Bool", "toString", true, "toString(): string", "Returns 'true' or 'false'.", {}},
+        {"Bool", "toInt", true, "toInt(): int", "Returns 1 for true, 0 for false.", {}},
+        {"Bool", "not", true, "not(): bool", "Returns the boolean negation.", {}},
+
+        // === Nil ===
+        {"Nil", "toString", true, "toString(): string", "Returns 'nil'.", {}},
+        {"Nil", "isNil", true, "isNil(): bool", "Returns true.", {}},
+        {"Nil", "orDefault", true, "orDefault(fallback: any): any", "Returns fallback value since receiver is nil.", {"fallback"}}
+    };
+    return members;
+}
+
+static InferredType inferTypeFromText(const std::string& text, const std::string& root) {
+    if (root.empty()) return InferredType::UNKNOWN;
+
+    // Direct literals or expressions
+    if (root.front() == '"' || root.front() == '\'') return InferredType::STRING;
+    if (root.front() == '[' || root.back() == ']') return InferredType::ARRAY;
+    if (root.front() == '{' || root.back() == '}') return InferredType::MAP;
+    if (root == "true" || root == "false") return InferredType::BOOL;
+    if (root == "nil" || root == "null") return InferredType::NIL;
+    if (root.find("..") != std::string::npos) return InferredType::RANGE;
+    if (std::all_of(root.begin(), root.end(), [](char c) { return std::isdigit(static_cast<unsigned char>(c)) || c == '.'; })) {
+        return InferredType::NUMBER;
+    }
+    if (root.front() == '(' && root.back() == ')' && root.size() > 2) {
+        std::string inner = root.substr(1, root.size() - 2);
+        return inferTypeFromText(text, inner);
+    }
+
+    // Heuristics based on variable name
+    std::string lowerRoot = root;
+    for (char& c : lowerRoot) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (lowerRoot == "str" || lowerRoot == "msg" || lowerRoot == "text" || lowerRoot == "s" ||
+        lowerRoot.ends_with("str") || lowerRoot.ends_with("string") || lowerRoot.ends_with("name") || lowerRoot.ends_with("path")) {
+        return InferredType::STRING;
+    }
+    if (lowerRoot == "arr" || lowerRoot == "list" || lowerRoot == "items" || lowerRoot == "elements" ||
+        lowerRoot.ends_with("arr") || lowerRoot.ends_with("array") || lowerRoot.ends_with("list") || (lowerRoot.ends_with("s") && lowerRoot.size() > 3)) {
+        return InferredType::ARRAY;
+    }
+    if (lowerRoot == "map" || lowerRoot == "dict" || lowerRoot == "table" || lowerRoot.ends_with("map") || lowerRoot.ends_with("dict")) {
+        return InferredType::MAP;
+    }
+    if (lowerRoot == "range" || lowerRoot == "rng" || lowerRoot == "r" || lowerRoot.ends_with("range")) {
+        return InferredType::RANGE;
+    }
+    if (lowerRoot == "num" || lowerRoot == "count" || lowerRoot == "idx" || lowerRoot == "index" ||
+        lowerRoot == "len" || lowerRoot == "i" || lowerRoot == "j" || lowerRoot == "x" || lowerRoot == "y" || lowerRoot == "pi") {
+        return InferredType::NUMBER;
+    }
+    if (lowerRoot == "b" || lowerRoot.starts_with("is") || lowerRoot.starts_with("has")) {
+        return InferredType::BOOL;
+    }
+
+    // Scan text for declaration: `let/const/var root: type` or `let/const/var root = ...`
+    size_t pos = 0;
+    while ((pos = text.find(root, pos)) != std::string::npos) {
+        bool leftBoundary = (pos == 0 || (!std::isalnum(static_cast<unsigned char>(text[pos - 1])) && text[pos - 1] != '_'));
+        bool rightBoundary = (pos + root.size() >= text.size() || (!std::isalnum(static_cast<unsigned char>(text[pos + root.size()])) && text[pos + root.size()] != '_'));
+        if (leftBoundary && rightBoundary) {
+            size_t after = pos + root.size();
+            while (after < text.size() && (text[after] == ' ' || text[after] == '\t')) after++;
+            if (after < text.size() && text[after] == ':') {
+                after++;
+                while (after < text.size() && (text[after] == ' ' || text[after] == '\t')) after++;
+                size_t tStart = after;
+                while (after < text.size() && (std::isalnum(static_cast<unsigned char>(text[after])) || text[after] == '_')) after++;
+                std::string tName = text.substr(tStart, after - tStart);
+                if (tName == "string") return InferredType::STRING;
+                if (tName == "int" || tName == "double" || tName == "number") return InferredType::NUMBER;
+                if (tName == "bool") return InferredType::BOOL;
+                if (tName == "Array") return InferredType::ARRAY;
+                if (tName == "Map") return InferredType::MAP;
+                if (tName == "Range") return InferredType::RANGE;
+            } else if (after < text.size() && text[after] == '=') {
+                after++;
+                while (after < text.size() && (text[after] == ' ' || text[after] == '\t')) after++;
+                if (after < text.size()) {
+                    if (text[after] == '"' || text[after] == '\'') return InferredType::STRING;
+                    if (text[after] == '[') return InferredType::ARRAY;
+                    if (text[after] == '{') return InferredType::MAP;
+                    if (text.substr(after, 4) == "true" || text.substr(after, 5) == "false") return InferredType::BOOL;
+                    if (std::isdigit(static_cast<unsigned char>(text[after])) || text[after] == '-') {
+                        size_t lineEnd = text.find_first_of("\r\n;", after);
+                        std::string expr = text.substr(after, lineEnd == std::string::npos ? 30 : lineEnd - after);
+                        if (expr.find("..") != std::string::npos) return InferredType::RANGE;
+                        return InferredType::NUMBER;
+                    }
+                }
+            }
+        }
+        pos += root.size();
+    }
+
+    return InferredType::UNKNOWN;
+}
+
+static std::vector<BuiltinMemberInfo> getMembersForType(InferredType type) {
+    const auto& all = getBuiltinMembers();
+    std::vector<BuiltinMemberInfo> res;
+    std::string targetType;
+    switch (type) {
+        case InferredType::ARRAY: targetType = "Array"; break;
+        case InferredType::STRING: targetType = "String"; break;
+        case InferredType::NUMBER: targetType = "Number"; break;
+        case InferredType::MAP: targetType = "Map"; break;
+        case InferredType::RANGE: targetType = "Range"; break;
+        case InferredType::BOOL: targetType = "Bool"; break;
+        case InferredType::NIL: targetType = "Nil"; break;
+        case InferredType::UNKNOWN: {
+            std::unordered_set<std::string> seen;
+            for (const auto& bm : all) {
+                if (seen.insert(bm.name + (bm.isMethod ? ":m" : ":p")).second) {
+                    res.push_back(bm);
+                }
+            }
+            return res;
+        }
+    }
+    for (const auto& bm : all) {
+        if (bm.typeName == targetType) {
+            res.push_back(bm);
+        }
+    }
+    return res;
+}
+
+static bool isBuiltinMethod(const std::string_view& name) {
+    const auto& all = getBuiltinMembers();
+    for (const auto& m : all) {
+        if (m.isMethod && m.name == name) return true;
+    }
+    return false;
+}
+
+static bool isBuiltinProperty(const std::string_view& name) {
+    const auto& all = getBuiltinMembers();
+    for (const auto& m : all) {
+        if (!m.isMethod && m.name == name) return true;
+    }
+    return false;
 }
 
 // -----------------------------------------------------------------------------
@@ -1130,6 +1458,15 @@ Json LspServer::handleCompletion(const std::string& uri, int line, int character
             }
         }
 
+        // D. 檢查是否為基礎型別或容器方法 (Array, String, Number, Map, Range, Bool, Nil)
+        InferredType inferred = inferTypeFromText(text, root);
+        auto builtinMembers = getMembersForType(inferred);
+        for (const auto& bm : builtinMembers) {
+            if (ac.memberFilter.empty() || bm.name.find(ac.memberFilter) != std::string::npos) {
+                addCompletion(items, bm.name, bm.isMethod ? 2 : 10, bm.signature, bm.doc);
+            }
+        }
+
         return items;
     }
 
@@ -1285,6 +1622,23 @@ Json LspServer::handleHover(const std::string& uri, int line, int character) {
                 }
             }
         }
+
+        // 檢查 parentObject 是否為基礎型別或容器 (例如 arr.map, str.lines, x.toFixed, map.entries)
+        InferredType inferred = inferTypeFromText(text, ctx.parentObject);
+        auto builtinMembers = getMembersForType(inferred);
+        for (const auto& bm : builtinMembers) {
+            if (bm.name == ctx.word) {
+                std::string doc = "```easyscript\n";
+                doc += (bm.isMethod ? "(method) " : "(property) ") + bm.typeName + ".prototype." + bm.signature + "\n```\n\n";
+                if (!bm.doc.empty()) doc += bm.doc + "\n";
+                Json result = Json::object();
+                Json contents = Json::object();
+                contents["kind"] = "markdown";
+                contents["value"] = doc;
+                result["contents"] = contents;
+                return result;
+            }
+        }
     }
 
     // 3. 檢查游標是否在具名匯入符號上 (import { foo } from "...")
@@ -1336,6 +1690,24 @@ Json LspServer::handleHover(const std::string& uri, int line, int character) {
         doc = "**module Math** (`std/math`)\n\nStandard mathematical functions and constants (`PI`, `E`, `sqrt`, `pow`, `random`).";
     }
 
+    if (doc.empty()) {
+        const auto& all = getBuiltinMembers();
+        std::vector<const BuiltinMemberInfo*> matches;
+        for (const auto& bm : all) {
+            if (bm.name == ctx.word) {
+                matches.push_back(&bm);
+            }
+        }
+        if (!matches.empty()) {
+            doc = "```easyscript\n";
+            for (const auto* m : matches) {
+                doc += (m->isMethod ? "(method) " : "(property) ") + m->typeName + ".prototype." + m->signature + "\n";
+            }
+            doc += "```\n\n";
+            doc += matches[0]->doc + "\n";
+        }
+    }
+
     if (doc.empty()) return Json();
 
     Json result = Json::object();
@@ -1343,6 +1715,84 @@ Json LspServer::handleHover(const std::string& uri, int line, int character) {
     contents["kind"] = "markdown";
     contents["value"] = doc;
     result["contents"] = contents;
+    return result;
+}
+
+// -----------------------------------------------------------------------------
+// 參數簽名提示 (Signature Help)
+// -----------------------------------------------------------------------------
+
+Json LspServer::handleSignatureHelp(const std::string& uri, int line, int character) {
+    auto it = documents.find(uri);
+    std::string text = (it != documents.end()) ? it->second : "";
+    if (text.empty()) return Json();
+
+    std::string lineStr = getLineText(text, line);
+    if (character > static_cast<int>(lineStr.size())) character = static_cast<int>(lineStr.size());
+
+    // 搜尋左括號 '('
+    int p = character - 1;
+    int parenDepth = 0;
+    int commaCount = 0;
+    while (p >= 0) {
+        char c = lineStr[p];
+        if (c == ')') {
+            parenDepth++;
+        } else if (c == '(') {
+            if (parenDepth == 0) {
+                break;
+            }
+            parenDepth--;
+        } else if (c == ',' && parenDepth == 0) {
+            commaCount++;
+        }
+        p--;
+    }
+
+    if (p < 0 || lineStr[p] != '(') return Json();
+
+    p--;
+    while (p >= 0 && (lineStr[p] == ' ' || lineStr[p] == '\t')) p--;
+    int wordEnd = p + 1;
+    while (p >= 0 && (std::isalnum(static_cast<unsigned char>(lineStr[p])) || lineStr[p] == '_' || lineStr[p] == '$')) p--;
+    int wordStart = p + 1;
+    if (wordEnd <= wordStart) return Json();
+    std::string fnName = lineStr.substr(wordStart, wordEnd - wordStart);
+
+    const auto& allMembers = getBuiltinMembers();
+    std::vector<const BuiltinMemberInfo*> matches;
+    for (const auto& bm : allMembers) {
+        if (bm.isMethod && bm.name == fnName) {
+            matches.push_back(&bm);
+        }
+    }
+
+    if (matches.empty()) return Json();
+
+    Json result = Json::object();
+    Json signatures = Json::array();
+    for (const auto* m : matches) {
+        Json sig = Json::object();
+        sig["label"] = m->signature;
+        if (!m->doc.empty()) {
+            Json doc = Json::object();
+            doc["kind"] = "markdown";
+            doc["value"] = m->doc;
+            sig["documentation"] = doc;
+        }
+        Json params = Json::array();
+        for (const auto& pName : m->paramNames) {
+            Json paramObj = Json::object();
+            paramObj["label"] = pName;
+            params.push_back(paramObj);
+        }
+        sig["parameters"] = params;
+        signatures.push_back(sig);
+    }
+
+    result["signatures"] = signatures;
+    result["activeSignature"] = 0;
+    result["activeParameter"] = commaCount;
     return result;
 }
 
@@ -1569,12 +2019,20 @@ Json LspServer::handleSemanticTokens(const std::string& uri) {
             } else if (prevTok.type == TokenType::CONST) {
                 // 常數宣告 (variable: 3, declaration | readonly: 3)
                 rawTokens.push_back({tok.line - 1, tok.column - 1, static_cast<int>(tok.lexeme.size()), 3, 3});
+            } else if (prevTok.type == TokenType::DOT) {
+                if (nextTok.type == TokenType::LEFT_PAREN) {
+                    // 內建方法調用 (function: 2, defaultLibrary: 4)
+                    int mod = isBuiltinMethod(tok.lexeme) ? 4 : 0;
+                    rawTokens.push_back({tok.line - 1, tok.column - 1, static_cast<int>(tok.lexeme.size()), 2, mod});
+                } else {
+                    // 內建屬性讀取 (property: 5, defaultLibrary: 4)
+                    int mod = isBuiltinProperty(tok.lexeme) ? 4 : 0;
+                    rawTokens.push_back({tok.line - 1, tok.column - 1, static_cast<int>(tok.lexeme.size()), 5, mod});
+                }
             } else if (nextTok.type == TokenType::LEFT_PAREN) {
                 // 函式調用 (function: 2)
-                rawTokens.push_back({tok.line - 1, tok.column - 1, static_cast<int>(tok.lexeme.size()), 2, 0});
-            } else if (prevTok.type == TokenType::DOT) {
-                // 物件屬性 (property: 5)
-                rawTokens.push_back({tok.line - 1, tok.column - 1, static_cast<int>(tok.lexeme.size()), 5, 0});
+                int mod = isBuiltinMethod(tok.lexeme) ? 4 : 0;
+                rawTokens.push_back({tok.line - 1, tok.column - 1, static_cast<int>(tok.lexeme.size()), 2, mod});
             } else {
                 // 一般變數存取 (variable: 3)
                 rawTokens.push_back({tok.line - 1, tok.column - 1, static_cast<int>(tok.lexeme.size()), 3, 0});
