@@ -679,19 +679,15 @@ bool JitCompiler::compile(ObjFunction* fn) {
     // callerSlots 在 RDX
     uint32_t initSlots = static_cast<uint32_t>(fn->arity + 1);
     for (uint32_t i = 0; i < initSlots; ++i) {
-        uint32_t offset = i * 16;
+        uint32_t offset = i * 8;
         // mov rax, [rdx + offset]
         a.emitByte(0x48); a.emitByte(0x8B); a.emitByte(0x82); a.emitDword(offset);
         // mov [r13 + offset], rax
         a.emitByte(0x49); a.emitByte(0x89); a.emitByte(0x85); a.emitDword(offset);
-        // mov rax, [rdx + offset + 8]
-        a.emitByte(0x48); a.emitByte(0x8B); a.emitByte(0x82); a.emitDword(offset + 8);
-        // mov [r13 + offset + 8], rax
-        a.emitByte(0x49); a.emitByte(0x89); a.emitByte(0x85); a.emitDword(offset + 8);
     }
 
-    // lea rsi, [r13 + initSlots * 16] (初始運算元棧頂部)
-    uint32_t initStackDisp = initSlots * 16;
+    // lea rsi, [r13 + initSlots * 8] (初始運算元棧頂部)
+    uint32_t initStackDisp = initSlots * 8;
     a.emitByte(0x49); a.emitByte(0x8D); a.emitByte(0xB5); a.emitDword(initStackDisp);
 
     std::unordered_map<size_t, size_t> bytecodeToNative;
@@ -745,65 +741,59 @@ bool JitCompiler::compile(ObjFunction* fn) {
                 uint64_t addr = reinterpret_cast<uint64_t>(&fn->constants[constIdx]);
                 // mov rbx, imm64
                 a.emitByte(0x48); a.emitByte(0xBB); a.emitQword(addr);
-                // mov rax, [rbx]; mov rdx, [rbx + 8]
+                // mov rax, [rbx]
                 a.emitByte(0x48); a.emitByte(0x8B); a.emitByte(0x03);
-                a.emitByte(0x48); a.emitByte(0x8B); a.emitByte(0x53); a.emitByte(0x08);
-                // mov [rsi], rax; mov [rsi + 8], rdx; add rsi, 16
+                // mov [rsi], rax; add rsi, 8
                 a.emitByte(0x48); a.emitByte(0x89); a.emitByte(0x06);
-                a.emitByte(0x48); a.emitByte(0x89); a.emitByte(0x56); a.emitByte(0x08);
-                a.emitByte(0x48); a.emitByte(0x83); a.emitByte(0xC6); a.emitByte(0x10);
+                a.emitByte(0x48); a.emitByte(0x83); a.emitByte(0xC6); a.emitByte(0x08);
                 break;
             }
             case OpCode::OP_NIL: {
-                // mov qword ptr [rsi], 0; mov qword ptr [rsi + 8], 0; add rsi, 16
-                a.emitByte(0x48); a.emitByte(0xC7); a.emitByte(0x06); a.emitDword(0);
-                a.emitByte(0x48); a.emitByte(0xC7); a.emitByte(0x46); a.emitByte(0x08); a.emitDword(0);
-                a.emitByte(0x48); a.emitByte(0x83); a.emitByte(0xC6); a.emitByte(0x10);
+                // mov rax, imm64 (TAG_NIL)
+                a.emitMovRaxImm64(nanbox::TAG_NIL);
+                // mov [rsi], rax; add rsi, 8
+                a.emitByte(0x48); a.emitByte(0x89); a.emitByte(0x06);
+                a.emitByte(0x48); a.emitByte(0x83); a.emitByte(0xC6); a.emitByte(0x08);
                 break;
             }
             case OpCode::OP_TRUE: {
-                // mov qword ptr [rsi], 1; mov qword ptr [rsi + 8], 1 (bool tag); add rsi, 16
-                a.emitByte(0x48); a.emitByte(0xC7); a.emitByte(0x06); a.emitDword(1);
-                a.emitByte(0x48); a.emitByte(0xC7); a.emitByte(0x46); a.emitByte(0x08); a.emitDword(1);
-                a.emitByte(0x48); a.emitByte(0x83); a.emitByte(0xC6); a.emitByte(0x10);
+                // mov rax, imm64 (TAG_TRUE)
+                a.emitMovRaxImm64(nanbox::TAG_TRUE);
+                // mov [rsi], rax; add rsi, 8
+                a.emitByte(0x48); a.emitByte(0x89); a.emitByte(0x06);
+                a.emitByte(0x48); a.emitByte(0x83); a.emitByte(0xC6); a.emitByte(0x08);
                 break;
             }
             case OpCode::OP_FALSE: {
-                // mov qword ptr [rsi], 0; mov qword ptr [rsi + 8], 1 (bool tag); add rsi, 16
-                a.emitByte(0x48); a.emitByte(0xC7); a.emitByte(0x06); a.emitDword(0);
-                a.emitByte(0x48); a.emitByte(0xC7); a.emitByte(0x46); a.emitByte(0x08); a.emitDword(1);
-                a.emitByte(0x48); a.emitByte(0x83); a.emitByte(0xC6); a.emitByte(0x10);
+                // mov rax, imm64 (TAG_FALSE)
+                a.emitMovRaxImm64(nanbox::TAG_FALSE);
+                // mov [rsi], rax; add rsi, 8
+                a.emitByte(0x48); a.emitByte(0x89); a.emitByte(0x06);
+                a.emitByte(0x48); a.emitByte(0x83); a.emitByte(0xC6); a.emitByte(0x08);
                 break;
             }
             case OpCode::OP_POP: {
-                // sub rsi, 16
-                a.emitByte(0x48); a.emitByte(0x83); a.emitByte(0xEE); a.emitByte(0x10);
+                // sub rsi, 8
+                a.emitByte(0x48); a.emitByte(0x83); a.emitByte(0xEE); a.emitByte(0x08);
                 break;
             }
             case OpCode::OP_GET_LOCAL: {
                 uint8_t slot = code[ip++];
-                uint32_t slotOffset = static_cast<uint32_t>(slot * 16);
+                uint32_t slotOffset = static_cast<uint32_t>(slot * 8);
                 // mov rax, [r13 + slotOffset]
                 a.emitByte(0x49); a.emitByte(0x8B); a.emitByte(0x85); a.emitDword(slotOffset);
-                // mov rdx, [r13 + slotOffset + 8]
-                a.emitByte(0x49); a.emitByte(0x8B); a.emitByte(0x95); a.emitDword(slotOffset + 8);
-                // mov [rsi], rax; mov [rsi + 8], rdx; add rsi, 16
+                // mov [rsi], rax; add rsi, 8
                 a.emitByte(0x48); a.emitByte(0x89); a.emitByte(0x06);
-                a.emitByte(0x48); a.emitByte(0x89); a.emitByte(0x56); a.emitByte(0x08);
-                a.emitByte(0x48); a.emitByte(0x83); a.emitByte(0xC6); a.emitByte(0x10);
+                a.emitByte(0x48); a.emitByte(0x83); a.emitByte(0xC6); a.emitByte(0x08);
                 break;
             }
             case OpCode::OP_SET_LOCAL: {
                 uint8_t slot = code[ip++];
-                uint32_t slotOffset = static_cast<uint32_t>(slot * 16);
-                // mov rax, [rsi - 16]
-                a.emitByte(0x48); a.emitByte(0x8B); a.emitByte(0x46); a.emitByte(0xF0);
-                // mov rdx, [rsi - 8]
-                a.emitByte(0x48); a.emitByte(0x8B); a.emitByte(0x56); a.emitByte(0xF8);
+                uint32_t slotOffset = static_cast<uint32_t>(slot * 8);
+                // mov rax, [rsi - 8]
+                a.emitByte(0x48); a.emitByte(0x8B); a.emitByte(0x46); a.emitByte(0xF8);
                 // mov [r13 + slotOffset], rax
                 a.emitByte(0x49); a.emitByte(0x89); a.emitByte(0x85); a.emitDword(slotOffset);
-                // mov [r13 + slotOffset + 8], rdx
-                a.emitByte(0x49); a.emitByte(0x89); a.emitByte(0x95); a.emitDword(slotOffset + 8);
                 break;
             }
             case OpCode::OP_GET_GLOBAL: {
@@ -825,17 +815,12 @@ bool JitCompiler::compile(ObjFunction* fn) {
                 size_t jmpSlow = a.offset();
                 a.emitDword(0);
 
-                // === FAST PATH: 直接從快取的 Value* 指針以暫存器載入 ===
+                // === FAST PATH: 直接從快取的 Value* 指針載入 ===
                 // mov rdx, [rax]
                 a.emitByte(0x48); a.emitByte(0x8B); a.emitByte(0x10);
-                // mov rcx, [rax + 8]
-                a.emitByte(0x48); a.emitByte(0x8B); a.emitByte(0x48); a.emitByte(0x08);
-                // mov [rsi], rdx
+                // mov [rsi], rdx; add rsi, 8
                 a.emitByte(0x48); a.emitByte(0x89); a.emitByte(0x16);
-                // mov [rsi + 8], rcx
-                a.emitByte(0x48); a.emitByte(0x89); a.emitByte(0x4E); a.emitByte(0x08);
-                // add rsi, 16
-                a.emitByte(0x48); a.emitByte(0x83); a.emitByte(0xC6); a.emitByte(0x10);
+                a.emitByte(0x48); a.emitByte(0x83); a.emitByte(0xC6); a.emitByte(0x08);
                 // jmp done
                 a.emitByte(0xE9);
                 size_t jmpDone = a.offset();
@@ -856,8 +841,8 @@ bool JitCompiler::compile(ObjFunction* fn) {
                 // call easyscript_jit_get_global_cached
                 a.emitMovRaxImm64(reinterpret_cast<uint64_t>(&easyscript_jit_get_global_cached));
                 a.emitCallRax();
-                // add rsi, 16
-                a.emitByte(0x48); a.emitByte(0x83); a.emitByte(0xC6); a.emitByte(0x10);
+                // add rsi, 8
+                a.emitByte(0x48); a.emitByte(0x83); a.emitByte(0xC6); a.emitByte(0x08);
 
                 // === DONE ===
                 size_t doneOffset = a.offset();
@@ -871,8 +856,8 @@ bool JitCompiler::compile(ObjFunction* fn) {
                 a.emitMovRcxR12();
                 // mov rdx, imm64 (constAddr)
                 a.emitMovRdxImm64(constAddr);
-                // lea r8, [rsi - 16] (val)
-                a.emitLeaR8RsiDisp8(-16);
+                // lea r8, [rsi - 8] (val)
+                a.emitLeaR8RsiDisp8(-8);
                 // call easyscript_jit_set_global
                 a.emitMovRaxImm64(reinterpret_cast<uint64_t>(&easyscript_jit_set_global));
                 a.emitCallRax();
@@ -881,8 +866,8 @@ bool JitCompiler::compile(ObjFunction* fn) {
             case OpCode::OP_DEFINE_GLOBAL: {
                 uint8_t constIdx = code[ip++];
                 uint64_t constAddr = reinterpret_cast<uint64_t>(&fn->constants[constIdx]);
-                // sub rsi, 16
-                a.emitByte(0x48); a.emitByte(0x83); a.emitByte(0xEE); a.emitByte(0x10);
+                // sub rsi, 8
+                a.emitByte(0x48); a.emitByte(0x83); a.emitByte(0xEE); a.emitByte(0x08);
                 // mov rcx, r12 (vm)
                 a.emitMovRcxR12();
                 // mov rdx, imm64 (constAddr)
@@ -895,19 +880,34 @@ bool JitCompiler::compile(ObjFunction* fn) {
                 break;
             }
             case OpCode::OP_ADD: {
-                // sub rsi, 16
-                a.emitByte(0x48); a.emitByte(0x83); a.emitByte(0xEE); a.emitByte(0x10);
-                // cmp byte ptr [rsi - 8], 2 (is a int?)
-                a.emitByte(0x80); a.emitByte(0x7E); a.emitByte(0xF8); a.emitByte(0x02);
+                // sub rsi, 8
+                a.emitByte(0x48); a.emitByte(0x83); a.emitByte(0xEE); a.emitByte(0x08);
+                // cmp word ptr [rsi - 2], 0xFFFB (is a int?)
+                a.emitByte(0x66); a.emitByte(0x81); a.emitByte(0x7E); a.emitByte(0xFE); a.emitByte(0xFB); a.emitByte(0xFF);
                 a.emitByte(0x75); size_t jne1 = a.offset(); a.emitByte(0x00);
-                // cmp byte ptr [rsi + 8], 2 (is b int?)
-                a.emitByte(0x80); a.emitByte(0x7E); a.emitByte(0x08); a.emitByte(0x02);
+                // cmp word ptr [rsi + 6], 0xFFFB (is b int?)
+                a.emitByte(0x66); a.emitByte(0x81); a.emitByte(0x7E); a.emitByte(0x06); a.emitByte(0xFB); a.emitByte(0xFF);
                 a.emitByte(0x75); size_t jne2 = a.offset(); a.emitByte(0x00);
 
-                // Fast path: mov rax, [rsi - 16]; add rax, [rsi]; mov [rsi - 16], rax
-                a.emitByte(0x48); a.emitByte(0x8B); a.emitByte(0x46); a.emitByte(0xF0);
-                a.emitByte(0x48); a.emitByte(0x03); a.emitByte(0x06);
-                a.emitByte(0x48); a.emitByte(0x89); a.emitByte(0x46); a.emitByte(0xF0);
+                // Fast path:
+                // mov rax, [rsi - 8]; shl rax, 16; sar rax, 16
+                a.emitByte(0x48); a.emitByte(0x8B); a.emitByte(0x46); a.emitByte(0xF8);
+                a.emitByte(0x48); a.emitByte(0xC1); a.emitByte(0xE0); a.emitByte(0x10);
+                a.emitByte(0x48); a.emitByte(0xC1); a.emitByte(0xF8); a.emitByte(0x10);
+                // mov rdx, [rsi]; shl rdx, 16; sar rdx, 16
+                a.emitByte(0x48); a.emitByte(0x8B); a.emitByte(0x16);
+                a.emitByte(0x48); a.emitByte(0xC1); a.emitByte(0xE2); a.emitByte(0x10);
+                a.emitByte(0x48); a.emitByte(0xC1); a.emitByte(0xFA); a.emitByte(0x10);
+                // add rax, rdx
+                a.emitByte(0x48); a.emitByte(0x01); a.emitByte(0xD0);
+                // shl rax, 16; shr rax, 16
+                a.emitByte(0x48); a.emitByte(0xC1); a.emitByte(0xE0); a.emitByte(0x10);
+                a.emitByte(0x48); a.emitByte(0xC1); a.emitByte(0xE8); a.emitByte(0x10);
+                // mov rdx, imm64 (TAG_INT); or rax, rdx
+                a.emitByte(0x48); a.emitByte(0xBA); a.emitQword(nanbox::TAG_INT);
+                a.emitByte(0x48); a.emitByte(0x09); a.emitByte(0xD0);
+                // mov [rsi - 8], rax
+                a.emitByte(0x48); a.emitByte(0x89); a.emitByte(0x46); a.emitByte(0xF8);
                 a.emitByte(0xEB); size_t jmpDone = a.offset(); a.emitByte(0x00);
 
                 // Fallback path
@@ -916,8 +916,8 @@ bool JitCompiler::compile(ObjFunction* fn) {
                 a.patchByte(jne2, static_cast<uint8_t>(fallbackStart - (jne2 + 1)));
                 // mov rcx, r12 (vm)
                 a.emitMovRcxR12();
-                // lea rdx, [rsi - 16] (a)
-                a.emitLeaRdxRsiDisp8(-16);
+                // lea rdx, [rsi - 8] (a)
+                a.emitLeaRdxRsiDisp8(-8);
                 // mov r8, rsi (b)
                 a.emitMovR8Rsi();
                 // call easyscript_jit_add
@@ -929,26 +929,36 @@ bool JitCompiler::compile(ObjFunction* fn) {
                 break;
             }
             case OpCode::OP_SUB: {
-                // sub rsi, 16
-                a.emitByte(0x48); a.emitByte(0x83); a.emitByte(0xEE); a.emitByte(0x10);
-                // cmp byte ptr [rsi - 8], 2
-                a.emitByte(0x80); a.emitByte(0x7E); a.emitByte(0xF8); a.emitByte(0x02);
+                // sub rsi, 8
+                a.emitByte(0x48); a.emitByte(0x83); a.emitByte(0xEE); a.emitByte(0x08);
+                // cmp word ptr [rsi - 2], 0xFFFB
+                a.emitByte(0x66); a.emitByte(0x81); a.emitByte(0x7E); a.emitByte(0xFE); a.emitByte(0xFB); a.emitByte(0xFF);
                 a.emitByte(0x75); size_t jne1 = a.offset(); a.emitByte(0x00);
-                // cmp byte ptr [rsi + 8], 2
-                a.emitByte(0x80); a.emitByte(0x7E); a.emitByte(0x08); a.emitByte(0x02);
+                // cmp word ptr [rsi + 6], 0xFFFB
+                a.emitByte(0x66); a.emitByte(0x81); a.emitByte(0x7E); a.emitByte(0x06); a.emitByte(0xFB); a.emitByte(0xFF);
                 a.emitByte(0x75); size_t jne2 = a.offset(); a.emitByte(0x00);
 
-                // Fast path: mov rax, [rsi - 16]; sub rax, [rsi]; mov [rsi - 16], rax
-                a.emitByte(0x48); a.emitByte(0x8B); a.emitByte(0x46); a.emitByte(0xF0);
-                a.emitByte(0x48); a.emitByte(0x2B); a.emitByte(0x06);
-                a.emitByte(0x48); a.emitByte(0x89); a.emitByte(0x46); a.emitByte(0xF0);
+                // Fast path:
+                a.emitByte(0x48); a.emitByte(0x8B); a.emitByte(0x46); a.emitByte(0xF8);
+                a.emitByte(0x48); a.emitByte(0xC1); a.emitByte(0xE0); a.emitByte(0x10);
+                a.emitByte(0x48); a.emitByte(0xC1); a.emitByte(0xF8); a.emitByte(0x10);
+                a.emitByte(0x48); a.emitByte(0x8B); a.emitByte(0x16);
+                a.emitByte(0x48); a.emitByte(0xC1); a.emitByte(0xE2); a.emitByte(0x10);
+                a.emitByte(0x48); a.emitByte(0xC1); a.emitByte(0xFA); a.emitByte(0x10);
+                // sub rax, rdx
+                a.emitByte(0x48); a.emitByte(0x29); a.emitByte(0xD0);
+                a.emitByte(0x48); a.emitByte(0xC1); a.emitByte(0xE0); a.emitByte(0x10);
+                a.emitByte(0x48); a.emitByte(0xC1); a.emitByte(0xE8); a.emitByte(0x10);
+                a.emitByte(0x48); a.emitByte(0xBA); a.emitQword(nanbox::TAG_INT);
+                a.emitByte(0x48); a.emitByte(0x09); a.emitByte(0xD0);
+                a.emitByte(0x48); a.emitByte(0x89); a.emitByte(0x46); a.emitByte(0xF8);
                 a.emitByte(0xEB); size_t jmpDone = a.offset(); a.emitByte(0x00);
 
                 size_t fallbackStart = a.offset();
                 a.patchByte(jne1, static_cast<uint8_t>(fallbackStart - (jne1 + 1)));
                 a.patchByte(jne2, static_cast<uint8_t>(fallbackStart - (jne2 + 1)));
                 a.emitMovRcxR12();
-                a.emitLeaRdxRsiDisp8(-16);
+                a.emitLeaRdxRsiDisp8(-8);
                 a.emitMovR8Rsi();
                 a.emitMovRaxImm64(reinterpret_cast<uint64_t>(&easyscript_jit_sub));
                 a.emitCallRax();
@@ -958,26 +968,36 @@ bool JitCompiler::compile(ObjFunction* fn) {
                 break;
             }
             case OpCode::OP_MUL: {
-                // sub rsi, 16
-                a.emitByte(0x48); a.emitByte(0x83); a.emitByte(0xEE); a.emitByte(0x10);
-                // cmp byte ptr [rsi - 8], 2
-                a.emitByte(0x80); a.emitByte(0x7E); a.emitByte(0xF8); a.emitByte(0x02);
+                // sub rsi, 8
+                a.emitByte(0x48); a.emitByte(0x83); a.emitByte(0xEE); a.emitByte(0x08);
+                // cmp word ptr [rsi - 2], 0xFFFB
+                a.emitByte(0x66); a.emitByte(0x81); a.emitByte(0x7E); a.emitByte(0xFE); a.emitByte(0xFB); a.emitByte(0xFF);
                 a.emitByte(0x75); size_t jne1 = a.offset(); a.emitByte(0x00);
-                // cmp byte ptr [rsi + 8], 2
-                a.emitByte(0x80); a.emitByte(0x7E); a.emitByte(0x08); a.emitByte(0x02);
+                // cmp word ptr [rsi + 6], 0xFFFB
+                a.emitByte(0x66); a.emitByte(0x81); a.emitByte(0x7E); a.emitByte(0x06); a.emitByte(0xFB); a.emitByte(0xFF);
                 a.emitByte(0x75); size_t jne2 = a.offset(); a.emitByte(0x00);
 
-                // Fast path: mov rax, [rsi - 16]; imul rax, [rsi]; mov [rsi - 16], rax
-                a.emitByte(0x48); a.emitByte(0x8B); a.emitByte(0x46); a.emitByte(0xF0);
-                a.emitByte(0x48); a.emitByte(0x0F); a.emitByte(0xAF); a.emitByte(0x06);
-                a.emitByte(0x48); a.emitByte(0x89); a.emitByte(0x46); a.emitByte(0xF0);
+                // Fast path:
+                a.emitByte(0x48); a.emitByte(0x8B); a.emitByte(0x46); a.emitByte(0xF8);
+                a.emitByte(0x48); a.emitByte(0xC1); a.emitByte(0xE0); a.emitByte(0x10);
+                a.emitByte(0x48); a.emitByte(0xC1); a.emitByte(0xF8); a.emitByte(0x10);
+                a.emitByte(0x48); a.emitByte(0x8B); a.emitByte(0x16);
+                a.emitByte(0x48); a.emitByte(0xC1); a.emitByte(0xE2); a.emitByte(0x10);
+                a.emitByte(0x48); a.emitByte(0xC1); a.emitByte(0xFA); a.emitByte(0x10);
+                // imul rax, rdx
+                a.emitByte(0x48); a.emitByte(0x0F); a.emitByte(0xAF); a.emitByte(0xC2);
+                a.emitByte(0x48); a.emitByte(0xC1); a.emitByte(0xE0); a.emitByte(0x10);
+                a.emitByte(0x48); a.emitByte(0xC1); a.emitByte(0xE8); a.emitByte(0x10);
+                a.emitByte(0x48); a.emitByte(0xBA); a.emitQword(nanbox::TAG_INT);
+                a.emitByte(0x48); a.emitByte(0x09); a.emitByte(0xD0);
+                a.emitByte(0x48); a.emitByte(0x89); a.emitByte(0x46); a.emitByte(0xF8);
                 a.emitByte(0xEB); size_t jmpDone = a.offset(); a.emitByte(0x00);
 
                 size_t fallbackStart = a.offset();
                 a.patchByte(jne1, static_cast<uint8_t>(fallbackStart - (jne1 + 1)));
                 a.patchByte(jne2, static_cast<uint8_t>(fallbackStart - (jne2 + 1)));
                 a.emitMovRcxR12();
-                a.emitLeaRdxRsiDisp8(-16);
+                a.emitLeaRdxRsiDisp8(-8);
                 a.emitMovR8Rsi();
                 a.emitMovRaxImm64(reinterpret_cast<uint64_t>(&easyscript_jit_mul));
                 a.emitCallRax();
@@ -987,60 +1007,61 @@ bool JitCompiler::compile(ObjFunction* fn) {
                 break;
             }
             case OpCode::OP_DIV: {
-                // sub rsi, 16
-                a.emitByte(0x48); a.emitByte(0x83); a.emitByte(0xEE); a.emitByte(0x10);
+                // sub rsi, 8
+                a.emitByte(0x48); a.emitByte(0x83); a.emitByte(0xEE); a.emitByte(0x08);
                 a.emitMovRcxR12();
-                a.emitLeaRdxRsiDisp8(-16);
+                a.emitLeaRdxRsiDisp8(-8);
                 a.emitMovR8Rsi();
                 a.emitMovRaxImm64(reinterpret_cast<uint64_t>(&easyscript_jit_div));
                 a.emitCallRax();
                 break;
             }
             case OpCode::OP_MOD: {
-                // sub rsi, 16
-                a.emitByte(0x48); a.emitByte(0x83); a.emitByte(0xEE); a.emitByte(0x10);
+                // sub rsi, 8
+                a.emitByte(0x48); a.emitByte(0x83); a.emitByte(0xEE); a.emitByte(0x08);
                 a.emitMovRcxR12();
-                a.emitLeaRdxRsiDisp8(-16);
+                a.emitLeaRdxRsiDisp8(-8);
                 a.emitMovR8Rsi();
                 a.emitMovRaxImm64(reinterpret_cast<uint64_t>(&easyscript_jit_mod));
                 a.emitCallRax();
                 break;
             }
             case OpCode::OP_NEGATE: {
-                a.emitLeaRdxRsiDisp8(-16);
+                a.emitLeaRdxRsiDisp8(-8);
                 a.emitMovRaxImm64(reinterpret_cast<uint64_t>(&easyscript_jit_negate));
                 a.emitCallRax();
                 break;
             }
             case OpCode::OP_NOT: {
-                a.emitLeaRdxRsiDisp8(-16);
+                a.emitLeaRdxRsiDisp8(-8);
                 a.emitMovRaxImm64(reinterpret_cast<uint64_t>(&easyscript_jit_not));
                 a.emitCallRax();
                 break;
             }
             case OpCode::OP_EQUAL: {
-                // sub rsi, 16
-                a.emitByte(0x48); a.emitByte(0x83); a.emitByte(0xEE); a.emitByte(0x10);
-                // cmp byte ptr [rsi - 8], 2
-                a.emitByte(0x80); a.emitByte(0x7E); a.emitByte(0xF8); a.emitByte(0x02);
+                // sub rsi, 8
+                a.emitByte(0x48); a.emitByte(0x83); a.emitByte(0xEE); a.emitByte(0x08);
+                // cmp word ptr [rsi - 2], 0xFFFB
+                a.emitByte(0x66); a.emitByte(0x81); a.emitByte(0x7E); a.emitByte(0xFE); a.emitByte(0xFB); a.emitByte(0xFF);
                 a.emitByte(0x75); size_t jne1 = a.offset(); a.emitByte(0x00);
-                // cmp byte ptr [rsi + 8], 2
-                a.emitByte(0x80); a.emitByte(0x7E); a.emitByte(0x08); a.emitByte(0x02);
+                // cmp word ptr [rsi + 6], 0xFFFB
+                a.emitByte(0x66); a.emitByte(0x81); a.emitByte(0x7E); a.emitByte(0x06); a.emitByte(0xFB); a.emitByte(0xFF);
                 a.emitByte(0x75); size_t jne2 = a.offset(); a.emitByte(0x00);
 
-                // Fast path: cmp rax, [rsi]; sete al; movzx rax, al; mov [rsi - 16], rax; mov qword ptr [rsi - 8], 1
-                a.emitByte(0x48); a.emitByte(0x8B); a.emitByte(0x46); a.emitByte(0xF0);
+                // Fast path:
+                a.emitByte(0x48); a.emitByte(0x8B); a.emitByte(0x46); a.emitByte(0xF8);
                 a.emitByte(0x48); a.emitByte(0x3B); a.emitByte(0x06);
                 a.emitByte(0x0F); a.emitByte(0x94); a.emitByte(0xC0); // sete al
                 a.emitByte(0x48); a.emitByte(0x0F); a.emitByte(0xB6); a.emitByte(0xC0);
-                a.emitByte(0x48); a.emitByte(0x89); a.emitByte(0x46); a.emitByte(0xF0);
-                a.emitByte(0x48); a.emitByte(0xC7); a.emitByte(0x46); a.emitByte(0xF8); a.emitDword(1);
+                a.emitByte(0x48); a.emitByte(0xBA); a.emitQword(nanbox::TAG_FALSE);
+                a.emitByte(0x48); a.emitByte(0x09); a.emitByte(0xD0);
+                a.emitByte(0x48); a.emitByte(0x89); a.emitByte(0x46); a.emitByte(0xF8);
                 a.emitByte(0xEB); size_t jmpDone = a.offset(); a.emitByte(0x00);
 
                 size_t fallbackStart = a.offset();
                 a.patchByte(jne1, static_cast<uint8_t>(fallbackStart - (jne1 + 1)));
                 a.patchByte(jne2, static_cast<uint8_t>(fallbackStart - (jne2 + 1)));
-                a.emitLeaRdxRsiDisp8(-16);
+                a.emitLeaRdxRsiDisp8(-8);
                 a.emitMovR8Rsi();
                 a.emitMovRaxImm64(reinterpret_cast<uint64_t>(&easyscript_jit_equal));
                 a.emitCallRax();
@@ -1050,28 +1071,34 @@ bool JitCompiler::compile(ObjFunction* fn) {
                 break;
             }
             case OpCode::OP_LESS: {
-                // sub rsi, 16
-                a.emitByte(0x48); a.emitByte(0x83); a.emitByte(0xEE); a.emitByte(0x10);
-                // cmp byte ptr [rsi - 8], 2
-                a.emitByte(0x80); a.emitByte(0x7E); a.emitByte(0xF8); a.emitByte(0x02);
+                // sub rsi, 8
+                a.emitByte(0x48); a.emitByte(0x83); a.emitByte(0xEE); a.emitByte(0x08);
+                // cmp word ptr [rsi - 2], 0xFFFB
+                a.emitByte(0x66); a.emitByte(0x81); a.emitByte(0x7E); a.emitByte(0xFE); a.emitByte(0xFB); a.emitByte(0xFF);
                 a.emitByte(0x75); size_t jne1 = a.offset(); a.emitByte(0x00);
-                // cmp byte ptr [rsi + 8], 2
-                a.emitByte(0x80); a.emitByte(0x7E); a.emitByte(0x08); a.emitByte(0x02);
+                // cmp word ptr [rsi + 6], 0xFFFB
+                a.emitByte(0x66); a.emitByte(0x81); a.emitByte(0x7E); a.emitByte(0x06); a.emitByte(0xFB); a.emitByte(0xFF);
                 a.emitByte(0x75); size_t jne2 = a.offset(); a.emitByte(0x00);
 
-                // Fast path: cmp rax, [rsi]; setl al
-                a.emitByte(0x48); a.emitByte(0x8B); a.emitByte(0x46); a.emitByte(0xF0);
-                a.emitByte(0x48); a.emitByte(0x3B); a.emitByte(0x06);
+                // Fast path:
+                a.emitByte(0x48); a.emitByte(0x8B); a.emitByte(0x46); a.emitByte(0xF8);
+                a.emitByte(0x48); a.emitByte(0xC1); a.emitByte(0xE0); a.emitByte(0x10);
+                a.emitByte(0x48); a.emitByte(0xC1); a.emitByte(0xF8); a.emitByte(0x10);
+                a.emitByte(0x48); a.emitByte(0x8B); a.emitByte(0x16);
+                a.emitByte(0x48); a.emitByte(0xC1); a.emitByte(0xE2); a.emitByte(0x10);
+                a.emitByte(0x48); a.emitByte(0xC1); a.emitByte(0xFA); a.emitByte(0x10);
+                a.emitByte(0x48); a.emitByte(0x39); a.emitByte(0xD0);
                 a.emitByte(0x0F); a.emitByte(0x9C); a.emitByte(0xC0); // setl al
                 a.emitByte(0x48); a.emitByte(0x0F); a.emitByte(0xB6); a.emitByte(0xC0);
-                a.emitByte(0x48); a.emitByte(0x89); a.emitByte(0x46); a.emitByte(0xF0);
-                a.emitByte(0x48); a.emitByte(0xC7); a.emitByte(0x46); a.emitByte(0xF8); a.emitDword(1);
+                a.emitByte(0x48); a.emitByte(0xBA); a.emitQword(nanbox::TAG_FALSE);
+                a.emitByte(0x48); a.emitByte(0x09); a.emitByte(0xD0);
+                a.emitByte(0x48); a.emitByte(0x89); a.emitByte(0x46); a.emitByte(0xF8);
                 a.emitByte(0xEB); size_t jmpDone = a.offset(); a.emitByte(0x00);
 
                 size_t fallbackStart = a.offset();
                 a.patchByte(jne1, static_cast<uint8_t>(fallbackStart - (jne1 + 1)));
                 a.patchByte(jne2, static_cast<uint8_t>(fallbackStart - (jne2 + 1)));
-                a.emitLeaRdxRsiDisp8(-16);
+                a.emitLeaRdxRsiDisp8(-8);
                 a.emitMovR8Rsi();
                 a.emitMovRaxImm64(reinterpret_cast<uint64_t>(&easyscript_jit_less));
                 a.emitCallRax();
@@ -1081,28 +1108,34 @@ bool JitCompiler::compile(ObjFunction* fn) {
                 break;
             }
             case OpCode::OP_GREATER: {
-                // sub rsi, 16
-                a.emitByte(0x48); a.emitByte(0x83); a.emitByte(0xEE); a.emitByte(0x10);
-                // cmp byte ptr [rsi - 8], 2
-                a.emitByte(0x80); a.emitByte(0x7E); a.emitByte(0xF8); a.emitByte(0x02);
+                // sub rsi, 8
+                a.emitByte(0x48); a.emitByte(0x83); a.emitByte(0xEE); a.emitByte(0x08);
+                // cmp word ptr [rsi - 2], 0xFFFB
+                a.emitByte(0x66); a.emitByte(0x81); a.emitByte(0x7E); a.emitByte(0xFE); a.emitByte(0xFB); a.emitByte(0xFF);
                 a.emitByte(0x75); size_t jne1 = a.offset(); a.emitByte(0x00);
-                // cmp byte ptr [rsi + 8], 2
-                a.emitByte(0x80); a.emitByte(0x7E); a.emitByte(0x08); a.emitByte(0x02);
+                // cmp word ptr [rsi + 6], 0xFFFB
+                a.emitByte(0x66); a.emitByte(0x81); a.emitByte(0x7E); a.emitByte(0x06); a.emitByte(0xFB); a.emitByte(0xFF);
                 a.emitByte(0x75); size_t jne2 = a.offset(); a.emitByte(0x00);
 
-                // Fast path: cmp rax, [rsi]; setg al
-                a.emitByte(0x48); a.emitByte(0x8B); a.emitByte(0x46); a.emitByte(0xF0);
-                a.emitByte(0x48); a.emitByte(0x3B); a.emitByte(0x06);
+                // Fast path:
+                a.emitByte(0x48); a.emitByte(0x8B); a.emitByte(0x46); a.emitByte(0xF8);
+                a.emitByte(0x48); a.emitByte(0xC1); a.emitByte(0xE0); a.emitByte(0x10);
+                a.emitByte(0x48); a.emitByte(0xC1); a.emitByte(0xF8); a.emitByte(0x10);
+                a.emitByte(0x48); a.emitByte(0x8B); a.emitByte(0x16);
+                a.emitByte(0x48); a.emitByte(0xC1); a.emitByte(0xE2); a.emitByte(0x10);
+                a.emitByte(0x48); a.emitByte(0xC1); a.emitByte(0xFA); a.emitByte(0x10);
+                a.emitByte(0x48); a.emitByte(0x39); a.emitByte(0xD0);
                 a.emitByte(0x0F); a.emitByte(0x9F); a.emitByte(0xC0); // setg al
                 a.emitByte(0x48); a.emitByte(0x0F); a.emitByte(0xB6); a.emitByte(0xC0);
-                a.emitByte(0x48); a.emitByte(0x89); a.emitByte(0x46); a.emitByte(0xF0);
-                a.emitByte(0x48); a.emitByte(0xC7); a.emitByte(0x46); a.emitByte(0xF8); a.emitDword(1);
+                a.emitByte(0x48); a.emitByte(0xBA); a.emitQword(nanbox::TAG_FALSE);
+                a.emitByte(0x48); a.emitByte(0x09); a.emitByte(0xD0);
+                a.emitByte(0x48); a.emitByte(0x89); a.emitByte(0x46); a.emitByte(0xF8);
                 a.emitByte(0xEB); size_t jmpDone = a.offset(); a.emitByte(0x00);
 
                 size_t fallbackStart = a.offset();
                 a.patchByte(jne1, static_cast<uint8_t>(fallbackStart - (jne1 + 1)));
                 a.patchByte(jne2, static_cast<uint8_t>(fallbackStart - (jne2 + 1)));
-                a.emitLeaRdxRsiDisp8(-16);
+                a.emitLeaRdxRsiDisp8(-8);
                 a.emitMovR8Rsi();
                 a.emitMovRaxImm64(reinterpret_cast<uint64_t>(&easyscript_jit_greater));
                 a.emitCallRax();
@@ -1116,25 +1149,26 @@ bool JitCompiler::compile(ObjFunction* fn) {
                 ip += 2;
                 size_t targetBc = ip + offset;
 
-                // peek [rsi - 16]
-                // cmp byte ptr [rsi - 8], 0 (null?)
-                a.emitByte(0x80); a.emitByte(0x7E); a.emitByte(0xF8); a.emitByte(0x00);
+                // peek [rsi - 8]
+                // mov rax, [rsi - 8]
+                a.emitByte(0x48); a.emitByte(0x8B); a.emitByte(0x46); a.emitByte(0xF8);
+                // mov rbx, imm64 (TAG_NIL)
+                a.emitByte(0x48); a.emitByte(0xBB); a.emitQword(nanbox::TAG_NIL);
+                // cmp rax, rbx
+                a.emitByte(0x48); a.emitByte(0x39); a.emitByte(0xD8);
+                // je targetBc
                 a.emitByte(0x0F); a.emitByte(0x84);
                 pendingJumps.push_back({a.offset(), targetBc});
                 a.emitDword(0);
 
-                // cmp byte ptr [rsi - 8], 1 (bool?)
-                a.emitByte(0x80); a.emitByte(0x7E); a.emitByte(0xF8); a.emitByte(0x01);
-                a.emitByte(0x75); size_t jneNotFalse = a.offset(); a.emitByte(0x00);
-
-                // cmp qword ptr [rsi - 16], 0 (false?)
-                a.emitByte(0x48); a.emitByte(0x83); a.emitByte(0x7E); a.emitByte(0xF0); a.emitByte(0x00);
+                // mov rbx, imm64 (TAG_FALSE)
+                a.emitByte(0x48); a.emitByte(0xBB); a.emitQword(nanbox::TAG_FALSE);
+                // cmp rax, rbx
+                a.emitByte(0x48); a.emitByte(0x39); a.emitByte(0xD8);
+                // je targetBc
                 a.emitByte(0x0F); a.emitByte(0x84);
                 pendingJumps.push_back({a.offset(), targetBc});
                 a.emitDword(0);
-
-                size_t notFalseLabel = a.offset();
-                a.patchByte(jneNotFalse, static_cast<uint8_t>(notFalseLabel - (jneNotFalse + 1)));
                 break;
             }
             case OpCode::OP_JUMP: {
@@ -1165,7 +1199,7 @@ bool JitCompiler::compile(ObjFunction* fn) {
             }
             case OpCode::OP_CALL: {
                 uint8_t argCount = code[ip++];
-                int32_t calleeDisp = -static_cast<int32_t>((argCount + 1) * 16);
+                int32_t calleeDisp = -static_cast<int32_t>((argCount + 1) * 8);
 
                 JitCallSite* cs = &fn->jitCallSites[callSiteIdx++];
                 cs->expectedArity = argCount;
@@ -1181,10 +1215,12 @@ bool JitCompiler::compile(ObjFunction* fn) {
                 size_t jmpSlow1 = a.offset();
                 a.emitDword(0);
 
-                // 2. 檢查被調用者是否為物件 (tag == 4)
-                int32_t tagDisp = calleeDisp + 8;
-                // cmp byte ptr [rsi + tagDisp], 4
-                a.emitByte(0x80); a.emitByte(0xBE); a.emitDword(static_cast<uint32_t>(tagDisp)); a.emitByte(0x04);
+                // 2. 檢查被調用者是否為物件 (tag == TAG_OBJ, 即 high 16 bits == 0xFFFA)
+                int32_t tagDisp = calleeDisp + 6;
+                // cmp word ptr [rsi + tagDisp], 0xFFFA
+                a.emitByte(0x66); a.emitByte(0x81); a.emitByte(0xBE);
+                a.emitDword(static_cast<uint32_t>(tagDisp));
+                a.emitByte(0xFA); a.emitByte(0xFF);
                 // jne slowPath
                 a.emitByte(0x0F); a.emitByte(0x85);
                 size_t jmpSlow2 = a.offset();
@@ -1250,8 +1286,8 @@ bool JitCompiler::compile(ObjFunction* fn) {
                 size_t doneCallOffset = a.offset();
                 a.patchDword(jmpDone, static_cast<uint32_t>(doneCallOffset - (jmpDone + 4)));
 
-                // sub rsi, argCount * 16
-                uint32_t shrink = argCount * 16;
+                // sub rsi, argCount * 8
+                uint32_t shrink = argCount * 8;
                 a.emitByte(0x48); a.emitByte(0x81); a.emitByte(0xEE); a.emitDword(shrink);
                 break;
             }
@@ -1263,8 +1299,8 @@ bool JitCompiler::compile(ObjFunction* fn) {
 
                 // RCX = vm (r12)
                 a.emitMovRcxR12();
-                // RDX = target (&[rsi - 16])
-                a.emitLeaRdxRsiDisp8(-16);
+                // RDX = target (&[rsi - 8])
+                a.emitLeaRdxRsiDisp8(-8);
                 // R8 = constAddr (&fn->constants[constIdx])
                 a.emitMovR8Imm64(constAddr);
                 // R9 = psAddr
@@ -1282,12 +1318,12 @@ bool JitCompiler::compile(ObjFunction* fn) {
 
                 // RCX = vm (r12)
                 a.emitMovRcxR12();
-                // RDX = target (&[rsi - 32])
-                a.emitLeaRdxRsiDisp8(-32);
+                // RDX = target (&[rsi - 16])
+                a.emitLeaRdxRsiDisp8(-16);
                 // R8 = constAddr (&fn->constants[constIdx])
                 a.emitMovR8Imm64(constAddr);
-                // R9 = val (&[rsi - 16])
-                a.emitLeaR9RsiDisp8(-16);
+                // R9 = val (&[rsi - 8])
+                a.emitLeaR9RsiDisp8(-8);
                 // 5th param: psAddr -> [rsp + 32]
                 a.emitStoreShadow5thImm64(psAddr);
                 // call easyscript_jit_set_property_cached
@@ -1295,22 +1331,18 @@ bool JitCompiler::compile(ObjFunction* fn) {
                 a.emitCallRax();
 
                 // pop target, keep val at top:
-                // mov rax, [rsi - 16]
-                a.emitByte(0x48); a.emitByte(0x8B); a.emitByte(0x46); a.emitByte(0xF0);
-                // mov rdx, [rsi - 8]
-                a.emitByte(0x48); a.emitByte(0x8B); a.emitByte(0x56); a.emitByte(0xF8);
-                // mov [rsi - 32], rax
-                a.emitByte(0x48); a.emitByte(0x89); a.emitByte(0x46); a.emitByte(0xE0);
-                // mov [rsi - 24], rdx
-                a.emitByte(0x48); a.emitByte(0x89); a.emitByte(0x56); a.emitByte(0xE8);
-                // sub rsi, 16
-                a.emitByte(0x48); a.emitByte(0x83); a.emitByte(0xEE); a.emitByte(0x10);
+                // mov rax, [rsi - 8]
+                a.emitByte(0x48); a.emitByte(0x8B); a.emitByte(0x46); a.emitByte(0xF8);
+                // mov [rsi - 16], rax
+                a.emitByte(0x48); a.emitByte(0x89); a.emitByte(0x46); a.emitByte(0xF0);
+                // sub rsi, 8
+                a.emitByte(0x48); a.emitByte(0x83); a.emitByte(0xEE); a.emitByte(0x08);
                 break;
             }
             case OpCode::OP_INVOKE: {
                 uint8_t constIdx = code[ip++];
                 uint8_t argCount = code[ip++];
-                int32_t calleeDisp = -static_cast<int32_t>((argCount + 1) * 16);
+                int32_t calleeDisp = -static_cast<int32_t>((argCount + 1) * 8);
                 uint64_t constAddr = reinterpret_cast<uint64_t>(&fn->constants[constIdx]);
                 JitInvokeSite* isite = &fn->jitInvokeSites[invokeSiteIdx++];
                 uint64_t isiteAddr = reinterpret_cast<uint64_t>(isite);
@@ -1335,8 +1367,8 @@ bool JitCompiler::compile(ObjFunction* fn) {
                 jumpsToBailout.push_back(a.offset());
                 a.emitDword(0);
 
-                // sub rsi, argCount * 16
-                uint32_t shrink = argCount * 16;
+                // sub rsi, argCount * 8
+                uint32_t shrink = argCount * 8;
                 a.emitByte(0x48); a.emitByte(0x81); a.emitByte(0xEE); a.emitDword(shrink);
                 break;
             }
@@ -1345,8 +1377,8 @@ bool JitCompiler::compile(ObjFunction* fn) {
                 uint64_t constAddr = reinterpret_cast<uint64_t>(&fn->constants[constIdx]);
                 // RCX = vm (r12)
                 a.emitMovRcxR12();
-                // RDX = target (&[rsi - 16])
-                a.emitLeaRdxRsiDisp8(-16);
+                // RDX = target (&[rsi - 8])
+                a.emitLeaRdxRsiDisp8(-8);
                 // R8 = constAddr
                 a.emitMovR8Imm64(constAddr);
                 // call easyscript_jit_get_super
@@ -1357,7 +1389,7 @@ bool JitCompiler::compile(ObjFunction* fn) {
             case OpCode::OP_SUPER_INVOKE: {
                 uint8_t constIdx = code[ip++];
                 uint8_t argCount = code[ip++];
-                int32_t calleeDisp = -static_cast<int32_t>((argCount + 1) * 16);
+                int32_t calleeDisp = -static_cast<int32_t>((argCount + 1) * 8);
                 uint64_t constAddr = reinterpret_cast<uint64_t>(&fn->constants[constIdx]);
 
                 // RCX = vm (r12)
@@ -1378,20 +1410,18 @@ bool JitCompiler::compile(ObjFunction* fn) {
                 jumpsToBailout.push_back(a.offset());
                 a.emitDword(0);
 
-                // sub rsi, argCount * 16
-                uint32_t shrink = argCount * 16;
+                // sub rsi, argCount * 8
+                uint32_t shrink = argCount * 8;
                 a.emitByte(0x48); a.emitByte(0x81); a.emitByte(0xEE); a.emitDword(shrink);
                 break;
             }
             case OpCode::OP_RETURN: {
-                // sub rsi, 16
-                a.emitByte(0x48); a.emitByte(0x83); a.emitByte(0xEE); a.emitByte(0x10);
-                // mov rax, [rsi]; mov rdx, [rsi + 8]
+                // sub rsi, 8
+                a.emitByte(0x48); a.emitByte(0x83); a.emitByte(0xEE); a.emitByte(0x08);
+                // mov rax, [rsi]
                 a.emitByte(0x48); a.emitByte(0x8B); a.emitByte(0x06);
-                a.emitByte(0x48); a.emitByte(0x8B); a.emitByte(0x56); a.emitByte(0x08);
-                // mov [r14], rax; mov [r14 + 8], rdx
+                // mov [r14], rax
                 a.emitByte(0x49); a.emitByte(0x89); a.emitByte(0x06);
-                a.emitByte(0x49); a.emitByte(0x89); a.emitByte(0x56); a.emitByte(0x08);
                 // mov eax, 0 (JIT_OK)
                 a.emitByte(0xB8); a.emitDword(0);
                 emitJumpToEpilogue();
