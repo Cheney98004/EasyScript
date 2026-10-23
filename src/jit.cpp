@@ -129,20 +129,20 @@ void easyscript_jit_mod(VM* vm, Value* a, const Value* b) {
     }
 }
 
-void easyscript_jit_negate(Value* a) {
+void easyscript_jit_negate(VM*, Value* a) {
     if (a->isInt()) *a = Value(-*a->asInt());
     else if (a->isDouble()) *a = Value(-*a->asDouble());
 }
 
-void easyscript_jit_not(Value* a) {
+void easyscript_jit_not(VM*, Value* a) {
     *a = Value(a->isFalsey());
 }
 
-void easyscript_jit_equal(Value* a, const Value* b) {
+void easyscript_jit_equal(VM*, Value* a, const Value* b) {
     *a = Value(*a == *b);
 }
 
-void easyscript_jit_less(Value* a, const Value* b) {
+void easyscript_jit_less(VM*, Value* a, const Value* b) {
     if (a->isInt() && b->isInt()) {
         *a = Value(*a->asInt() < *b->asInt());
     } else if (a->isNumber() && b->isNumber()) {
@@ -152,7 +152,7 @@ void easyscript_jit_less(Value* a, const Value* b) {
     }
 }
 
-void easyscript_jit_greater(Value* a, const Value* b) {
+void easyscript_jit_greater(VM*, Value* a, const Value* b) {
     if (a->isInt() && b->isInt()) {
         *a = Value(*a->asInt() > *b->asInt());
     } else if (a->isNumber() && b->isNumber()) {
@@ -1027,12 +1027,14 @@ bool JitCompiler::compile(ObjFunction* fn) {
                 break;
             }
             case OpCode::OP_NEGATE: {
+                a.emitMovRcxR12();
                 a.emitLeaRdxRsiDisp8(-8);
                 a.emitMovRaxImm64(reinterpret_cast<uint64_t>(&easyscript_jit_negate));
                 a.emitCallRax();
                 break;
             }
             case OpCode::OP_NOT: {
+                a.emitMovRcxR12();
                 a.emitLeaRdxRsiDisp8(-8);
                 a.emitMovRaxImm64(reinterpret_cast<uint64_t>(&easyscript_jit_not));
                 a.emitCallRax();
@@ -1061,6 +1063,7 @@ bool JitCompiler::compile(ObjFunction* fn) {
                 size_t fallbackStart = a.offset();
                 a.patchByte(jne1, static_cast<uint8_t>(fallbackStart - (jne1 + 1)));
                 a.patchByte(jne2, static_cast<uint8_t>(fallbackStart - (jne2 + 1)));
+                a.emitMovRcxR12();
                 a.emitLeaRdxRsiDisp8(-8);
                 a.emitMovR8Rsi();
                 a.emitMovRaxImm64(reinterpret_cast<uint64_t>(&easyscript_jit_equal));
@@ -1098,6 +1101,7 @@ bool JitCompiler::compile(ObjFunction* fn) {
                 size_t fallbackStart = a.offset();
                 a.patchByte(jne1, static_cast<uint8_t>(fallbackStart - (jne1 + 1)));
                 a.patchByte(jne2, static_cast<uint8_t>(fallbackStart - (jne2 + 1)));
+                a.emitMovRcxR12();
                 a.emitLeaRdxRsiDisp8(-8);
                 a.emitMovR8Rsi();
                 a.emitMovRaxImm64(reinterpret_cast<uint64_t>(&easyscript_jit_less));
@@ -1135,6 +1139,7 @@ bool JitCompiler::compile(ObjFunction* fn) {
                 size_t fallbackStart = a.offset();
                 a.patchByte(jne1, static_cast<uint8_t>(fallbackStart - (jne1 + 1)));
                 a.patchByte(jne2, static_cast<uint8_t>(fallbackStart - (jne2 + 1)));
+                a.emitMovRcxR12();
                 a.emitLeaRdxRsiDisp8(-8);
                 a.emitMovR8Rsi();
                 a.emitMovRaxImm64(reinterpret_cast<uint64_t>(&easyscript_jit_greater));

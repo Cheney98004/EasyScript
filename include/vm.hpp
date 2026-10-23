@@ -98,6 +98,10 @@ private:
     bool invokeStringMethod(ObjString* str, const std::string& name, uint8_t argCount, Value receiver);
     bool invokeMapMethod(ObjMap* map, const std::string& name, uint8_t argCount, Value receiver);
     bool invokeRangeMethod(ObjRange* rng, const std::string& name, uint8_t argCount, Value receiver);
+    bool invokeNumberMethod(Value num, const std::string& name, uint8_t argCount);
+    bool invokeBoolMethod(Value b, const std::string& name, uint8_t argCount);
+    bool invokeNilMethod(const std::string& name, uint8_t argCount);
+    std::optional<Value> callCallback(Value callee, const std::vector<Value>& args);
 
     std::vector<GcHandle> openUpvalues;
     std::vector<TryHandler> tryHandlers;

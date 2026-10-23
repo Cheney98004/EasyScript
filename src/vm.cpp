@@ -10,6 +10,7 @@
 #include <fstream>
 #include <algorithm>
 #include <cctype>
+#include <iomanip>
 
 // -----------------------------------------------------------------------------
 // 原生函式預設實作
@@ -318,22 +319,35 @@ bool VM::callFromJit(Value* calleeSlot, uint8_t argCount) {
 
 bool VM::invokeFromJit(Value* receiverSlot, const std::string& name, uint8_t argCount) {
     Value receiver = receiverSlot[0];
-    if (!receiver.isObject()) {
-        runtimeError("Only instances, modules, and collections have methods.");
-        return false;
-    }
-    GcObject* gcObj = heap.get(*receiver.asObject());
-    if (!gcObj) {
-        runtimeError("Calling method on invalid object.");
-        return false;
-    }
-
     size_t savedStack = stack.size();
     for (uint8_t i = 0; i <= argCount; ++i) {
         push(receiverSlot[i]);
     }
 
     bool success = false;
+    GcObject* gcObj = nullptr;
+    if (receiver.isNumber()) {
+        success = invokeNumberMethod(receiver, name, argCount);
+        goto done_invoke;
+    } else if (receiver.isBool()) {
+        success = invokeBoolMethod(receiver, name, argCount);
+        goto done_invoke;
+    } else if (receiver.isNull()) {
+        success = invokeNilMethod(name, argCount);
+        goto done_invoke;
+    }
+
+    if (!receiver.isObject()) {
+        runtimeError("Only instances, modules, and collections have methods.");
+        stack.resize(savedStack);
+        return false;
+    }
+    gcObj = heap.get(*receiver.asObject());
+    if (!gcObj) {
+        runtimeError("Calling method on invalid object.");
+        stack.resize(savedStack);
+        return false;
+    }
     if (auto* instance = gcObj->as<ObjInstance>()) {
         auto* klass = heap.getAs<ObjClass>(instance->klass);
         if (klass) {
@@ -633,6 +647,50 @@ bool VM::call(Value callee, uint8_t argCount) {
     return false;
 }
 
+std::optional<Value> VM::callCallback(Value callee, const std::vector<Value>& args) {
+    int expectedArity = -1;
+    if (callee.isObject()) {
+        if (auto* closure = heap.getAs<ObjClosure>(*callee.asObject())) {
+            if (auto* fn = heap.getAs<ObjFunction>(closure->function)) {
+                expectedArity = fn->arity;
+            }
+        } else if (auto* fn = heap.getAs<ObjFunction>(*callee.asObject())) {
+            expectedArity = fn->arity;
+        } else if (auto* native = heap.getAs<ObjNativeFn>(*callee.asObject())) {
+            expectedArity = native->arity;
+        }
+    }
+
+    size_t passCount = args.size();
+    if (expectedArity >= 0) {
+        passCount = static_cast<size_t>(expectedArity);
+    }
+
+    size_t initialDepth = frames.size();
+    push(callee);
+    for (size_t i = 0; i < passCount; ++i) {
+        if (i < args.size()) {
+            push(args[i]);
+        } else {
+            push(Value());
+        }
+    }
+
+    if (!call(callee, static_cast<uint8_t>(passCount))) {
+        return std::nullopt;
+    }
+
+    if (frames.size() > initialDepth) {
+        InterpretResult res = run(initialDepth);
+        if (res != InterpretResult::OK) {
+            return std::nullopt;
+        }
+    }
+
+    Value result = pop();
+    return result;
+}
+
 // -----------------------------------------------------------------------------
 // 容器內建方法調用實作 (Built-in Collection Methods)
 // -----------------------------------------------------------------------------
@@ -780,6 +838,207 @@ bool VM::invokeArrayMethod(ObjArray* arr, const std::string& name, uint8_t argCo
         }
         std::reverse(arr->elements.begin(), arr->elements.end());
         return finish(receiver);
+    }
+    if (name == "isEmpty") {
+        if (argCount != 0) {
+            runtimeError("Expected 0 arguments for 'isEmpty'.");
+            return false;
+        }
+        return finish(Value(arr->elements.empty()));
+    }
+    if (name == "first") {
+        if (argCount != 0) {
+            runtimeError("Expected 0 arguments for 'first'.");
+            return false;
+        }
+        return finish(arr->elements.empty() ? Value() : arr->elements.front());
+    }
+    if (name == "last") {
+        if (argCount != 0) {
+            runtimeError("Expected 0 arguments for 'last'.");
+            return false;
+        }
+        return finish(arr->elements.empty() ? Value() : arr->elements.back());
+    }
+    if (name == "map") {
+        if (argCount != 1) {
+            runtimeError("map(callback) expects 1 argument.");
+            return false;
+        }
+        Value callback = args[0];
+        GcHandle newArrH = heap.allocateArray();
+        heap.pushTempRoot(newArrH);
+        auto* newArr = heap.getAs<ObjArray>(newArrH);
+        for (size_t i = 0; i < arr->elements.size(); ++i) {
+            auto res = callCallback(callback, {arr->elements[i], Value(static_cast<int64_t>(i))});
+            if (!res.has_value()) {
+                heap.popTempRoot();
+                return false;
+            }
+            newArr->elements.push_back(*res);
+        }
+        heap.popTempRoot();
+        return finish(Value(newArrH));
+    }
+    if (name == "filter") {
+        if (argCount != 1) {
+            runtimeError("filter(callback) expects 1 argument.");
+            return false;
+        }
+        Value callback = args[0];
+        GcHandle newArrH = heap.allocateArray();
+        heap.pushTempRoot(newArrH);
+        auto* newArr = heap.getAs<ObjArray>(newArrH);
+        for (size_t i = 0; i < arr->elements.size(); ++i) {
+            auto res = callCallback(callback, {arr->elements[i], Value(static_cast<int64_t>(i))});
+            if (!res.has_value()) {
+                heap.popTempRoot();
+                return false;
+            }
+            if (!res->isFalsey()) {
+                newArr->elements.push_back(arr->elements[i]);
+            }
+        }
+        heap.popTempRoot();
+        return finish(Value(newArrH));
+    }
+    if (name == "reduce") {
+        if (argCount < 1 || argCount > 2) {
+            runtimeError("reduce(callback, [initial]) expects 1 or 2 arguments.");
+            return false;
+        }
+        Value callback = args[0];
+        if (arr->elements.empty() && argCount == 1) {
+            runtimeError("Reduce of empty array with no initial value.");
+            return false;
+        }
+        Value acc = (argCount == 2) ? args[1] : arr->elements[0];
+        size_t startIdx = (argCount == 2) ? 0 : 1;
+        for (size_t i = startIdx; i < arr->elements.size(); ++i) {
+            auto res = callCallback(callback, {acc, arr->elements[i], Value(static_cast<int64_t>(i))});
+            if (!res.has_value()) {
+                return false;
+            }
+            acc = *res;
+        }
+        return finish(acc);
+    }
+    if (name == "forEach") {
+        if (argCount != 1) {
+            runtimeError("forEach(callback) expects 1 argument.");
+            return false;
+        }
+        Value callback = args[0];
+        for (size_t i = 0; i < arr->elements.size(); ++i) {
+            auto res = callCallback(callback, {arr->elements[i], Value(static_cast<int64_t>(i))});
+            if (!res.has_value()) {
+                return false;
+            }
+        }
+        return finish(Value());
+    }
+    if (name == "find") {
+        if (argCount != 1) {
+            runtimeError("find(callback) expects 1 argument.");
+            return false;
+        }
+        Value callback = args[0];
+        for (size_t i = 0; i < arr->elements.size(); ++i) {
+            auto res = callCallback(callback, {arr->elements[i], Value(static_cast<int64_t>(i))});
+            if (!res.has_value()) {
+                return false;
+            }
+            if (!res->isFalsey()) {
+                return finish(arr->elements[i]);
+            }
+        }
+        return finish(Value());
+    }
+    if (name == "findIndex") {
+        if (argCount != 1) {
+            runtimeError("findIndex(callback) expects 1 argument.");
+            return false;
+        }
+        Value callback = args[0];
+        for (size_t i = 0; i < arr->elements.size(); ++i) {
+            auto res = callCallback(callback, {arr->elements[i], Value(static_cast<int64_t>(i))});
+            if (!res.has_value()) {
+                return false;
+            }
+            if (!res->isFalsey()) {
+                return finish(Value(static_cast<int64_t>(i)));
+            }
+        }
+        return finish(Value(int64_t(-1)));
+    }
+    if (name == "every") {
+        if (argCount != 1) {
+            runtimeError("every(callback) expects 1 argument.");
+            return false;
+        }
+        Value callback = args[0];
+        for (size_t i = 0; i < arr->elements.size(); ++i) {
+            auto res = callCallback(callback, {arr->elements[i], Value(static_cast<int64_t>(i))});
+            if (!res.has_value()) {
+                return false;
+            }
+            if (res->isFalsey()) {
+                return finish(Value(false));
+            }
+        }
+        return finish(Value(true));
+    }
+    if (name == "some") {
+        if (argCount != 1) {
+            runtimeError("some(callback) expects 1 argument.");
+            return false;
+        }
+        Value callback = args[0];
+        for (size_t i = 0; i < arr->elements.size(); ++i) {
+            auto res = callCallback(callback, {arr->elements[i], Value(static_cast<int64_t>(i))});
+            if (!res.has_value()) {
+                return false;
+            }
+            if (!res->isFalsey()) {
+                return finish(Value(true));
+            }
+        }
+        return finish(Value(false));
+    }
+    if (name == "sort") {
+        if (argCount > 1) {
+            runtimeError("sort([comparator]) expects 0 or 1 argument.");
+            return false;
+        }
+        if (argCount == 0) {
+            std::stable_sort(arr->elements.begin(), arr->elements.end(), [this](const Value& a, const Value& b) {
+                if (a.isInt() && b.isInt()) return *a.asInt() < *b.asInt();
+                if (a.isNumber() && b.isNumber()) return *a.asNumber() < *b.asNumber();
+                if (a.isObject() && b.isObject()) {
+                    auto* sa = heap.getAs<ObjString>(*a.asObject());
+                    auto* sb = heap.getAs<ObjString>(*b.asObject());
+                    if (sa && sb) return sa->text < sb->text;
+                }
+                return valueToString(a) < valueToString(b);
+            });
+            return finish(receiver);
+        } else {
+            Value callback = args[0];
+            bool sortError = false;
+            std::stable_sort(arr->elements.begin(), arr->elements.end(), [this, callback, &sortError](const Value& a, const Value& b) {
+                if (sortError) return false;
+                auto res = callCallback(callback, {a, b});
+                if (!res.has_value()) {
+                    sortError = true;
+                    return false;
+                }
+                if (res->isBool()) return *res->asBool();
+                if (res->isNumber()) return *res->asNumber() < 0.0;
+                return false;
+            });
+            if (sortError) return false;
+            return finish(receiver);
+        }
     }
 
     runtimeError("Array has no method '%s'.", name.c_str());
@@ -950,12 +1209,167 @@ bool VM::invokeStringMethod(ObjString* str, const std::string& name, uint8_t arg
         GcHandle newStr = heap.allocateString(std::move(res));
         return finish(Value(newStr));
     }
+    if (name == "isEmpty") {
+        if (argCount != 0) {
+            runtimeError("Expected 0 arguments for 'isEmpty'.");
+            return false;
+        }
+        return finish(Value(str->text.empty()));
+    }
+    if (name == "repeat") {
+        if (argCount != 1 || !args[0].isInt()) {
+            runtimeError("repeat(count) expects 1 integer.");
+            return false;
+        }
+        int64_t count = *args[0].asInt();
+        if (count < 0) {
+            runtimeError("repeat count cannot be negative.");
+            return false;
+        }
+        std::string res;
+        if (count > 0 && !str->text.empty()) {
+            res.reserve(str->text.size() * count);
+            for (int64_t i = 0; i < count; ++i) res += str->text;
+        }
+        GcHandle resH = heap.allocateString(std::move(res));
+        return finish(Value(resH));
+    }
+    if (name == "lines") {
+        if (argCount != 0) {
+            runtimeError("lines() expects 0 arguments.");
+            return false;
+        }
+        std::vector<Value> lines;
+        std::istringstream stream(str->text);
+        std::string line;
+        while (std::getline(stream, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            lines.push_back(Value(heap.allocateString(line)));
+        }
+        GcHandle arrH = heap.allocateArray(std::move(lines));
+        return finish(Value(arrH));
+    }
+    if (name == "padStart") {
+        if (argCount < 1 || argCount > 2 || !args[0].isInt()) {
+            runtimeError("padStart(targetLength, [padString]) expects length as integer.");
+            return false;
+        }
+        int64_t targetLen = *args[0].asInt();
+        std::string pad = (argCount == 2) ? valueToString(args[1]) : " ";
+        if (pad.empty()) pad = " ";
+        std::string res = str->text;
+        if (static_cast<int64_t>(res.size()) < targetLen) {
+            size_t needed = targetLen - res.size();
+            std::string prefix;
+            while (prefix.size() < needed) prefix += pad;
+            prefix = prefix.substr(0, needed);
+            res = prefix + res;
+        }
+        return finish(Value(heap.allocateString(std::move(res))));
+    }
+    if (name == "padEnd") {
+        if (argCount < 1 || argCount > 2 || !args[0].isInt()) {
+            runtimeError("padEnd(targetLength, [padString]) expects length as integer.");
+            return false;
+        }
+        int64_t targetLen = *args[0].asInt();
+        std::string pad = (argCount == 2) ? valueToString(args[1]) : " ";
+        if (pad.empty()) pad = " ";
+        std::string res = str->text;
+        if (static_cast<int64_t>(res.size()) < targetLen) {
+            size_t needed = targetLen - res.size();
+            std::string suffix;
+            while (suffix.size() < needed) suffix += pad;
+            suffix = suffix.substr(0, needed);
+            res = res + suffix;
+        }
+        return finish(Value(heap.allocateString(std::move(res))));
+    }
+    if (name == "charAt") {
+        if (argCount != 1 || !args[0].isInt()) {
+            runtimeError("charAt(index) expects 1 integer.");
+            return false;
+        }
+        int64_t idx = *args[0].asInt();
+        if (idx < 0 || static_cast<size_t>(idx) >= str->text.size()) {
+            return finish(Value(heap.allocateString("")));
+        }
+        return finish(Value(heap.allocateString(std::string(1, str->text[idx]))));
+    }
+    if (name == "charCodeAt") {
+        if (argCount != 1 || !args[0].isInt()) {
+            runtimeError("charCodeAt(index) expects 1 integer.");
+            return false;
+        }
+        int64_t idx = *args[0].asInt();
+        if (idx < 0 || static_cast<size_t>(idx) >= str->text.size()) {
+            return finish(Value());
+        }
+        return finish(Value(static_cast<int64_t>(static_cast<unsigned char>(str->text[idx]))));
+    }
+    if (name == "toInt") {
+        int radix = 10;
+        if (argCount == 1) {
+            if (!args[0].isInt()) {
+                runtimeError("radix must be an integer.");
+                return false;
+            }
+            radix = static_cast<int>(*args[0].asInt());
+        } else if (argCount > 1) {
+            runtimeError("toInt([radix]) expects 0 or 1 argument.");
+            return false;
+        }
+        try {
+            size_t idx = 0;
+            int64_t v = std::stoll(str->text, &idx, radix);
+            return finish(Value(v));
+        } catch (...) {
+            return finish(Value());
+        }
+    }
+    if (name == "toDouble") {
+        if (argCount != 0) {
+            runtimeError("toDouble() expects 0 arguments.");
+            return false;
+        }
+        try {
+            size_t idx = 0;
+            double v = std::stod(str->text, &idx);
+            return finish(Value(v));
+        } catch (...) {
+            return finish(Value());
+        }
+    }
+    if (name == "trimStart") {
+        if (argCount != 0) {
+            runtimeError("trimStart() expects 0 arguments.");
+            return false;
+        }
+        const std::string& s = str->text;
+        size_t first = s.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos) {
+            return finish(Value(heap.allocateString("")));
+        }
+        return finish(Value(heap.allocateString(s.substr(first))));
+    }
+    if (name == "trimEnd") {
+        if (argCount != 0) {
+            runtimeError("trimEnd() expects 0 arguments.");
+            return false;
+        }
+        const std::string& s = str->text;
+        size_t last = s.find_last_not_of(" \t\r\n");
+        if (last == std::string::npos) {
+            return finish(Value(heap.allocateString("")));
+        }
+        return finish(Value(heap.allocateString(s.substr(0, last + 1))));
+    }
 
     runtimeError("String has no method '%s'.", name.c_str());
     return false;
 }
 
-bool VM::invokeMapMethod(ObjMap* map, const std::string& name, uint8_t argCount, Value /*receiver*/) {
+bool VM::invokeMapMethod(ObjMap* map, const std::string& name, uint8_t argCount, Value receiver) {
     Value* args = argCount > 0 ? &stack[stack.size() - argCount] : nullptr;
 
     auto finish = [this, argCount](Value result) {
@@ -1025,6 +1439,58 @@ bool VM::invokeMapMethod(ObjMap* map, const std::string& name, uint8_t argCount,
         map->table.clear();
         return finish(Value());
     }
+    if (name == "isEmpty") {
+        if (argCount != 0) {
+            runtimeError("Expected 0 arguments for 'isEmpty'.");
+            return false;
+        }
+        return finish(Value(map->table.empty()));
+    }
+    if (name == "get") {
+        if (argCount != 1) {
+            runtimeError("get(key) expects 1 argument.");
+            return false;
+        }
+        auto it = map->table.find(args[0]);
+        return finish(it != map->table.end() ? it->second : Value());
+    }
+    if (name == "getOrDefault") {
+        if (argCount != 2) {
+            runtimeError("getOrDefault(key, defaultVal) expects 2 arguments.");
+            return false;
+        }
+        auto it = map->table.find(args[0]);
+        return finish(it != map->table.end() ? it->second : args[1]);
+    }
+    if (name == "entries") {
+        if (argCount != 0) {
+            runtimeError("entries() expects 0 arguments.");
+            return false;
+        }
+        std::vector<Value> list;
+        list.reserve(map->table.size());
+        for (const auto& [k, v] : map->table) {
+            GcHandle pairH = heap.allocateArray({k, v});
+            list.push_back(Value(pairH));
+        }
+        GcHandle arrH = heap.allocateArray(std::move(list));
+        return finish(Value(arrH));
+    }
+    if (name == "merge") {
+        if (argCount != 1 || !args[0].isObject()) {
+            runtimeError("merge(other) expects 1 map argument.");
+            return false;
+        }
+        auto* other = heap.getAs<ObjMap>(*args[0].asObject());
+        if (!other) {
+            runtimeError("merge(other) expects a map.");
+            return false;
+        }
+        for (const auto& [k, v] : other->table) {
+            map->table[k] = v;
+        }
+        return finish(receiver);
+    }
 
     runtimeError("Map has no method '%s'.", name.c_str());
     return false;
@@ -1072,6 +1538,243 @@ bool VM::invokeRangeMethod(ObjRange* rng, const std::string& name, uint8_t argCo
     }
 
     runtimeError("Range has no method '%s'.", name.c_str());
+    return false;
+}
+
+bool VM::invokeNumberMethod(Value num, const std::string& name, uint8_t argCount) {
+    Value* args = argCount > 0 ? &stack[stack.size() - argCount] : nullptr;
+
+    auto finish = [this, argCount](Value result) {
+        stack.resize(stack.size() - argCount - 1);
+        push(result);
+        return true;
+    };
+
+    if (name == "toString") {
+        if (argCount != 0) { runtimeError("toString() expects 0 arguments."); return false; }
+        return finish(Value(heap.allocateString(valueToString(num))));
+    }
+    if (name == "toInt") {
+        if (argCount != 0) { runtimeError("toInt() expects 0 arguments."); return false; }
+        int64_t v = num.isInt() ? *num.asInt() : static_cast<int64_t>(*num.asDouble());
+        return finish(Value(v));
+    }
+    if (name == "toDouble") {
+        if (argCount != 0) { runtimeError("toDouble() expects 0 arguments."); return false; }
+        double v = num.isDouble() ? *num.asDouble() : static_cast<double>(*num.asInt());
+        return finish(Value(v));
+    }
+    if (name == "abs") {
+        if (argCount != 0) { runtimeError("abs() expects 0 arguments."); return false; }
+        if (num.isInt()) return finish(Value(std::abs(*num.asInt())));
+        return finish(Value(std::fabs(*num.asDouble())));
+    }
+    if (name == "clamp") {
+        if (argCount != 2 || !args[0].isNumber() || !args[1].isNumber()) {
+            runtimeError("clamp(min, max) expects 2 numbers.");
+            return false;
+        }
+        if (num.isInt() && args[0].isInt() && args[1].isInt()) {
+            int64_t val = *num.asInt(), lo = *args[0].asInt(), hi = *args[1].asInt();
+            return finish(Value(std::clamp(val, lo, hi)));
+        }
+        double val = *num.asNumber(), lo = *args[0].asNumber(), hi = *args[1].asNumber();
+        return finish(Value(std::clamp(val, lo, hi)));
+    }
+    if (name == "min") {
+        if (argCount != 1 || !args[0].isNumber()) { runtimeError("min(other) expects 1 number."); return false; }
+        if (num.isInt() && args[0].isInt()) return finish(Value(std::min(*num.asInt(), *args[0].asInt())));
+        return finish(Value(std::min(*num.asNumber(), *args[0].asNumber())));
+    }
+    if (name == "max") {
+        if (argCount != 1 || !args[0].isNumber()) { runtimeError("max(other) expects 1 number."); return false; }
+        if (num.isInt() && args[0].isInt()) return finish(Value(std::max(*num.asInt(), *args[0].asInt())));
+        return finish(Value(std::max(*num.asNumber(), *args[0].asNumber())));
+    }
+    if (name == "sign") {
+        if (argCount != 0) { runtimeError("sign() expects 0 arguments."); return false; }
+        if (num.isInt()) {
+            int64_t v = *num.asInt();
+            return finish(Value(int64_t(v > 0 ? 1 : (v < 0 ? -1 : 0))));
+        }
+        double d = *num.asDouble();
+        return finish(Value(int64_t(d > 0.0 ? 1 : (d < 0.0 ? -1 : 0))));
+    }
+    if (name == "floor") {
+        if (argCount != 0) { runtimeError("floor() expects 0 arguments."); return false; }
+        if (num.isInt()) return finish(num);
+        return finish(Value(std::floor(*num.asDouble())));
+    }
+    if (name == "ceil") {
+        if (argCount != 0) { runtimeError("ceil() expects 0 arguments."); return false; }
+        if (num.isInt()) return finish(num);
+        return finish(Value(std::ceil(*num.asDouble())));
+    }
+    if (name == "round") {
+        if (argCount != 0) { runtimeError("round() expects 0 arguments."); return false; }
+        if (num.isInt()) return finish(num);
+        return finish(Value(std::round(*num.asDouble())));
+    }
+    if (name == "toFixed") {
+        if (argCount > 1) { runtimeError("toFixed([digits]) expects 0 or 1 argument."); return false; }
+        int digits = 0;
+        if (argCount == 1) {
+            if (!args[0].isInt()) { runtimeError("digits must be an integer."); return false; }
+            digits = static_cast<int>(*args[0].asInt());
+        }
+        if (digits < 0) digits = 0;
+        if (digits > 20) digits = 20;
+        std::ostringstream ss;
+        ss << std::fixed << std::setprecision(digits) << *num.asNumber();
+        return finish(Value(heap.allocateString(ss.str())));
+    }
+    if (name == "toHex") {
+        if (argCount != 0) { runtimeError("toHex() expects 0 arguments."); return false; }
+        int64_t v = num.isInt() ? *num.asInt() : static_cast<int64_t>(*num.asDouble());
+        std::ostringstream ss;
+        ss << std::hex << v;
+        return finish(Value(heap.allocateString(ss.str())));
+    }
+    if (name == "toBin") {
+        if (argCount != 0) { runtimeError("toBin() expects 0 arguments."); return false; }
+        int64_t v = num.isInt() ? *num.asInt() : static_cast<int64_t>(*num.asDouble());
+        if (v == 0) return finish(Value(heap.allocateString("0")));
+        std::string s;
+        uint64_t uv = static_cast<uint64_t>(v < 0 ? -v : v);
+        while (uv > 0) {
+            s.push_back((uv & 1) ? '1' : '0');
+            uv >>= 1;
+        }
+        if (v < 0) s.push_back('-');
+        std::reverse(s.begin(), s.end());
+        return finish(Value(heap.allocateString(std::move(s))));
+    }
+    if (name == "isEven") {
+        if (argCount != 0) { runtimeError("isEven() expects 0 arguments."); return false; }
+        return finish(Value(num.isInt() ? (*num.asInt() % 2 == 0) : false));
+    }
+    if (name == "isOdd") {
+        if (argCount != 0) { runtimeError("isOdd() expects 0 arguments."); return false; }
+        return finish(Value(num.isInt() ? (*num.asInt() % 2 != 0) : false));
+    }
+    if (name == "times") {
+        if (argCount != 1) { runtimeError("times(callback) expects 1 argument."); return false; }
+        int64_t count = num.isInt() ? *num.asInt() : static_cast<int64_t>(*num.asDouble());
+        Value cb = args[0];
+        for (int64_t i = 0; i < count; ++i) {
+            auto r = callCallback(cb, {Value(i)});
+            if (!r.has_value()) return false;
+        }
+        return finish(Value());
+    }
+    if (name == "upTo") {
+        if (argCount < 1 || argCount > 2 || !args[0].isNumber()) {
+            runtimeError("upTo(limit, [callback]) expects limit as a number.");
+            return false;
+        }
+        int64_t from = num.isInt() ? *num.asInt() : static_cast<int64_t>(*num.asDouble());
+        int64_t to = args[0].isInt() ? *args[0].asInt() : static_cast<int64_t>(*args[0].asDouble());
+        if (argCount == 2) {
+            Value cb = args[1];
+            for (int64_t i = from; i <= to; ++i) {
+                auto r = callCallback(cb, {Value(i)});
+                if (!r.has_value()) return false;
+            }
+            return finish(Value());
+        }
+        std::vector<Value> elems;
+        if (to >= from) {
+            elems.reserve(to - from + 1);
+            for (int64_t i = from; i <= to; ++i) elems.push_back(Value(i));
+        }
+        return finish(Value(heap.allocateArray(std::move(elems))));
+    }
+    if (name == "downTo") {
+        if (argCount < 1 || argCount > 2 || !args[0].isNumber()) {
+            runtimeError("downTo(limit, [callback]) expects limit as a number.");
+            return false;
+        }
+        int64_t from = num.isInt() ? *num.asInt() : static_cast<int64_t>(*num.asDouble());
+        int64_t to = args[0].isInt() ? *args[0].asInt() : static_cast<int64_t>(*args[0].asDouble());
+        if (argCount == 2) {
+            Value cb = args[1];
+            for (int64_t i = from; i >= to; --i) {
+                auto r = callCallback(cb, {Value(i)});
+                if (!r.has_value()) return false;
+            }
+            return finish(Value());
+        }
+        std::vector<Value> elems;
+        if (from >= to) {
+            elems.reserve(from - to + 1);
+            for (int64_t i = from; i >= to; --i) elems.push_back(Value(i));
+        }
+        return finish(Value(heap.allocateArray(std::move(elems))));
+    }
+    if (name == "isFinite") {
+        if (argCount != 0) { runtimeError("isFinite() expects 0 arguments."); return false; }
+        return finish(Value(num.isInt() ? true : std::isfinite(*num.asDouble())));
+    }
+    if (name == "isInfinite") {
+        if (argCount != 0) { runtimeError("isInfinite() expects 0 arguments."); return false; }
+        return finish(Value(num.isInt() ? false : std::isinf(*num.asDouble())));
+    }
+    if (name == "isNaN") {
+        if (argCount != 0) { runtimeError("isNaN() expects 0 arguments."); return false; }
+        return finish(Value(num.isInt() ? false : std::isnan(*num.asDouble())));
+    }
+
+    runtimeError("Number has no method '%s'.", name.c_str());
+    return false;
+}
+
+bool VM::invokeBoolMethod(Value b, const std::string& name, uint8_t argCount) {
+    auto finish = [this, argCount](Value result) {
+        stack.resize(stack.size() - argCount - 1);
+        push(result);
+        return true;
+    };
+
+    if (name == "toString") {
+        if (argCount != 0) { runtimeError("toString() expects 0 arguments."); return false; }
+        return finish(Value(heap.allocateString(*b.asBool() ? "true" : "false")));
+    }
+    if (name == "toInt") {
+        if (argCount != 0) { runtimeError("toInt() expects 0 arguments."); return false; }
+        return finish(Value(int64_t(*b.asBool() ? 1 : 0)));
+    }
+    if (name == "not") {
+        if (argCount != 0) { runtimeError("not() expects 0 arguments."); return false; }
+        return finish(Value(!*b.asBool()));
+    }
+
+    runtimeError("Bool has no method '%s'.", name.c_str());
+    return false;
+}
+
+bool VM::invokeNilMethod(const std::string& name, uint8_t argCount) {
+    Value* args = argCount > 0 ? &stack[stack.size() - argCount] : nullptr;
+
+    auto finish = [this, argCount](Value result) {
+        stack.resize(stack.size() - argCount - 1);
+        push(result);
+        return true;
+    };
+
+    if (name == "toString") {
+        if (argCount != 0) { runtimeError("toString() expects 0 arguments."); return false; }
+        return finish(Value(heap.allocateString("nil")));
+    }
+    if (name == "isNil") {
+        if (argCount != 0) { runtimeError("isNil() expects 0 arguments."); return false; }
+        return finish(Value(true));
+    }
+    if (name == "orDefault") {
+        if (argCount != 1) { runtimeError("orDefault(fallback) expects 1 argument."); return false; }
+        return finish(args[0]);
+    }
+
+    runtimeError("Nil has no method '%s'.", name.c_str());
     return false;
 }
 
@@ -1892,6 +2595,15 @@ InterpretResult VM::run(size_t stopDepth) {
 
                 Value target = pop();
                 if (!target.isObject()) {
+                    if (target.isInt()) {
+                        if (strObj->text == "isEven") { push(Value(*target.asInt() % 2 == 0)); break; }
+                        if (strObj->text == "isOdd")  { push(Value(*target.asInt() % 2 != 0)); break; }
+                        if (strObj->text == "sign")   { int64_t v = *target.asInt(); push(Value(int64_t(v > 0 ? 1 : (v < 0 ? -1 : 0)))); break; }
+                    } else if (target.isDouble()) {
+                        if (strObj->text == "sign")   { double d = *target.asDouble(); push(Value(int64_t(d > 0.0 ? 1 : (d < 0.0 ? -1 : 0)))); break; }
+                        if (strObj->text == "isNaN")  { push(Value(std::isnan(*target.asDouble()))); break; }
+                        if (strObj->text == "isFinite"){ push(Value(std::isfinite(*target.asDouble()))); break; }
+                    }
                     runtimeError("Only instances, modules, and collections have properties.");
                     return InterpretResult::RUNTIME_ERROR;
                 }
@@ -1956,6 +2668,18 @@ InterpretResult VM::run(size_t stopDepth) {
                         push(Value(static_cast<int64_t>(arr->elements.size())));
                         break;
                     }
+                    if (strObj->text == "isEmpty") {
+                        push(Value(arr->elements.empty()));
+                        break;
+                    }
+                    if (strObj->text == "first") {
+                        push(arr->elements.empty() ? Value() : arr->elements.front());
+                        break;
+                    }
+                    if (strObj->text == "last") {
+                        push(arr->elements.empty() ? Value() : arr->elements.back());
+                        break;
+                    }
                     runtimeError("Undefined array property '%s'.", strObj->text.c_str());
                     return InterpretResult::RUNTIME_ERROR;
                 }
@@ -1964,12 +2688,20 @@ InterpretResult VM::run(size_t stopDepth) {
                         push(Value(static_cast<int64_t>(str->text.size())));
                         break;
                     }
+                    if (strObj->text == "isEmpty") {
+                        push(Value(str->text.empty()));
+                        break;
+                    }
                     runtimeError("Undefined string property '%s'.", strObj->text.c_str());
                     return InterpretResult::RUNTIME_ERROR;
                 }
                 if (auto* map = gcObj->as<ObjMap>()) {
                     if (strObj->text == "length" || strObj->text == "size") {
                         push(Value(static_cast<int64_t>(map->table.size())));
+                        break;
+                    }
+                    if (strObj->text == "isEmpty") {
+                        push(Value(map->table.empty()));
                         break;
                     }
                     runtimeError("Undefined map property '%s'.", strObj->text.c_str());
@@ -2089,6 +2821,27 @@ InterpretResult VM::run(size_t stopDepth) {
                 uint8_t argCount = readByte();
 
                 Value receiver = peek(argCount);
+                if (receiver.isNumber()) {
+                    if (!invokeNumberMethod(receiver, strObj->text, argCount)) {
+                        return InterpretResult::RUNTIME_ERROR;
+                    }
+                    frame = &frames.back();
+                    break;
+                }
+                if (receiver.isBool()) {
+                    if (!invokeBoolMethod(receiver, strObj->text, argCount)) {
+                        return InterpretResult::RUNTIME_ERROR;
+                    }
+                    frame = &frames.back();
+                    break;
+                }
+                if (receiver.isNull()) {
+                    if (!invokeNilMethod(strObj->text, argCount)) {
+                        return InterpretResult::RUNTIME_ERROR;
+                    }
+                    frame = &frames.back();
+                    break;
+                }
                 if (!receiver.isObject()) {
                     runtimeError("Only instances, modules, and collections have methods.");
                     return InterpretResult::RUNTIME_ERROR;
@@ -2158,12 +2911,14 @@ InterpretResult VM::run(size_t stopDepth) {
                     if (!invokeArrayMethod(arr, strObj->text, argCount, receiver)) {
                         return InterpretResult::RUNTIME_ERROR;
                     }
+                    frame = &frames.back();
                     break;
                 }
                 if (auto* str = gcObj->as<ObjString>()) {
                     if (!invokeStringMethod(str, strObj->text, argCount, receiver)) {
                         return InterpretResult::RUNTIME_ERROR;
                     }
+                    frame = &frames.back();
                     break;
                 }
                 if (auto* map = gcObj->as<ObjMap>()) {
