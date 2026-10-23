@@ -2,7 +2,7 @@
   "module": "std/io",
   "version": "1.0.0",
   "doc": "Standard I/O, terminal control, colors, and interactive prompts standard library.",
-  "globalAlias": ["io", "Terminal", "Color", "Prompt"],
+  "globalAlias": ["io", "Terminal", "Color", "Prompt", "Scanner"],
   "symbols": [
     {
       "name": "write",
@@ -176,6 +176,36 @@
         { "name": "confirm", "kind": "method", "signature": "confirm(question: string, defaultVal = false): bool", "doc": "Displays interactive [y/N] prompt and returns true if confirmed.", "parameters": [{"name": "question", "type": "string"}, {"name": "defaultVal", "type": "bool", "optional": true, "default": "false"}] },
         { "name": "password", "kind": "method", "signature": "password(question: string, maskChar = '*'): string", "doc": "Prompts for password with keystroke masking.", "parameters": [{"name": "question", "type": "string"}, {"name": "maskChar", "type": "string", "optional": true, "default": "'*'"}] },
         { "name": "choose", "kind": "method", "signature": "choose(question: string, options: Array<string>): int", "doc": "Presents numbered options list and returns selected 0-based index.", "parameters": [{"name": "question", "type": "string"}, {"name": "options", "type": "Array<string>"}] }
+      ]
+    },
+    {
+      "name": "Scanner",
+      "kind": "class",
+      "signature": "class Scanner",
+      "doc": "Stream token and line scanner for string parsing and standard input reading.",
+      "members": [
+        { "name": "fromString", "kind": "method", "signature": "fromString(text: string): Scanner", "doc": "Creates a Scanner reading from the provided string.", "parameters": [{"name": "text", "type": "string"}] },
+        { "name": "fromStdin", "kind": "method", "signature": "fromStdin(): Scanner", "doc": "Creates a Scanner reading from standard input.", "parameters": [] },
+        { "name": "scanInt", "kind": "method", "signature": "scanInt(prompt = ''): int", "doc": "Convenience method to prompt and read a single integer from stdin.", "parameters": [{"name": "prompt", "type": "string", "optional": true, "default": "''"}] },
+        { "name": "scanDouble", "kind": "method", "signature": "scanDouble(prompt = ''): double", "doc": "Convenience method to prompt and read a single float/double from stdin.", "parameters": [{"name": "prompt", "type": "string", "optional": true, "default": "''"}] },
+        { "name": "scanLine", "kind": "method", "signature": "scanLine(prompt = ''): string", "doc": "Convenience method to prompt and read a single line from stdin.", "parameters": [{"name": "prompt", "type": "string", "optional": true, "default": "''"}] },
+        { "name": "scanWord", "kind": "method", "signature": "scanWord(prompt = ''): string", "doc": "Convenience method to prompt and read a single whitespace-delimited word from stdin.", "parameters": [{"name": "prompt", "type": "string", "optional": true, "default": "''"}] },
+        { "name": "next", "kind": "method", "signature": "next(): string", "doc": "Finds and returns the next complete token according to the delimiter pattern." },
+        { "name": "nextLine", "kind": "method", "signature": "nextLine(): string", "doc": "Advances this scanner past the current line and returns the line that was skipped." },
+        { "name": "nextInt", "kind": "method", "signature": "nextInt(radix = 10): int", "doc": "Scans the next token as an integer (default base 10, or 2, 8, 16).", "parameters": [{"name": "radix", "type": "int", "optional": true, "default": "10"}] },
+        { "name": "nextDouble", "kind": "method", "signature": "nextDouble(): double", "doc": "Scans the next token as a floating-point number." },
+        { "name": "nextBool", "kind": "method", "signature": "nextBool(): bool", "doc": "Scans the next token as a boolean ('true' or 'false', case-insensitive)." },
+        { "name": "hasNext", "kind": "method", "signature": "hasNext(): bool", "doc": "Returns true if this scanner has another token in its input." },
+        { "name": "hasNextLine", "kind": "method", "signature": "hasNextLine(): bool", "doc": "Returns true if there is another line in the input of this scanner." },
+        { "name": "hasNextInt", "kind": "method", "signature": "hasNextInt(radix = 10): bool", "doc": "Returns true if the next token in this scanner's input can be interpreted as an int.", "parameters": [{"name": "radix", "type": "int", "optional": true, "default": "10"}] },
+        { "name": "hasNextDouble", "kind": "method", "signature": "hasNextDouble(): bool", "doc": "Returns true if the next token in this scanner's input can be interpreted as a double." },
+        { "name": "hasNextBool", "kind": "method", "signature": "hasNextBool(): bool", "doc": "Returns true if the next token in this scanner's input can be interpreted as a bool." },
+        { "name": "useDelimiter", "kind": "method", "signature": "useDelimiter(pattern: string): Scanner", "doc": "Sets this scanner's delimiting pattern (e.g. ',', '\\t', '|'). Returns this scanner for chaining.", "parameters": [{"name": "pattern", "type": "string"}] },
+        { "name": "getDelimiter", "kind": "method", "signature": "getDelimiter(): string", "doc": "Returns the delimiter string currently used by this scanner." },
+        { "name": "reset", "kind": "method", "signature": "reset(): void", "doc": "Resets the scanner position back to the beginning of input (string mode only)." },
+        { "name": "allTokens", "kind": "method", "signature": "allTokens(): Array<string>", "doc": "Scans and collects all remaining tokens into an array." },
+        { "name": "allLines", "kind": "method", "signature": "allLines(): Array<string>", "doc": "Scans and collects all remaining lines into an array." },
+        { "name": "close", "kind": "method", "signature": "close(): void", "doc": "Closes this scanner and releases associated resources." }
       ]
     }
   ]

@@ -1,4 +1,7 @@
 #include "easyscript_plugin.hpp"
+#include "objects/obj_class.hpp"
+#include "objects/obj_instance.hpp"
+#include "objects/obj_array.hpp"
 #include <iostream>
 #include <string>
 #include <sstream>
@@ -123,6 +126,16 @@ static void defineClassNative(ObjClass* klass, const std::string& name, NativeFn
     if (!klass || !s_vm) return;
     GcHandle handle = s_vm->getHeap().allocate<ObjNativeFn>(fn, klass->name + "." + name, arity);
     klass->staticFields[name] = Value(handle);
+}
+
+static void defineInstanceNative(ObjClass* klass, const std::string& name, NativeFn fn, int arity = -1) {
+    if (!klass || !s_vm) return;
+    GcHandle handle = s_vm->getHeap().allocate<ObjNativeFn>(fn, klass->name + "." + name, arity);
+    Value val(handle);
+    klass->methods[name] = val;
+    uint32_t slot = static_cast<uint32_t>(klass->vtable.size());
+    klass->vtable.push_back(val);
+    klass->methodSlots[name] = slot;
 }
 
 static void defineClassValue(ObjClass* klass, const std::string& name, Value val) {
@@ -638,6 +651,442 @@ static Value prompt_choose(int argCount, Value* args) {
 // 外掛初始化進入點 (Module Init Entrypoint)
 // -----------------------------------------------------------------------------
 
+// -----------------------------------------------------------------------------
+// 5. 串流文字掃描器 (Scanner)
+// -----------------------------------------------------------------------------
+
+static GcHandle s_scannerClassHandle;
+
+static ObjInstance* getScannerInstance(int argCount) {
+    if (!s_vm) return nullptr;
+    Value receiver = s_vm->peek(argCount);
+    if (!receiver.isObject()) return nullptr;
+    return s_vm->getHeap().getAs<ObjInstance>(*receiver.asObject());
+}
+
+static bool isDelimiterChar(char c, const std::string& delim) {
+    return delim.find(c) != std::string::npos;
+}
+
+static void ensureScannerFields(ObjInstance* inst, bool fromStdin, std::string sourceText = "") {
+    inst->fields.resize(6);
+    if (fromStdin) {
+        inst->fields[0] = Value(); // source nil
+    } else {
+        GcHandle h = s_vm->getHeap().allocateString(std::move(sourceText));
+        inst->fields[0] = Value(h);
+    }
+    inst->fields[1] = Value(int64_t(0)); // pos
+    GcHandle dHandle = s_vm->getHeap().allocateString(" \t\r\n");
+    inst->fields[2] = Value(dHandle); // delim
+    inst->fields[3] = Value(fromStdin); // fromStdin
+    inst->fields[4] = Value(false); // closed
+    GcHandle bufHandle = s_vm->getHeap().allocateString("");
+    inst->fields[5] = Value(bufHandle); // stdinBuffer
+}
+
+static Value scanner_init(int argCount, Value* args) {
+    auto* inst = getScannerInstance(argCount);
+    if (!inst) return Value();
+
+    bool fromStdin = true;
+    std::string text;
+    if (argCount >= 1 && !args[0].isNull()) {
+        fromStdin = false;
+        text = valToStr(args[0]);
+    }
+    ensureScannerFields(inst, fromStdin, std::move(text));
+    return s_vm->peek(argCount);
+}
+
+static bool fetchNextToken(ObjInstance* inst, bool consume, std::string& outToken) {
+    if (!inst || inst->fields.size() < 6 || inst->fields[4].asBool().value_or(false)) return false;
+
+    bool fromStdin = inst->fields[3].asBool().value_or(false);
+    std::string delim = " \t\r\n";
+    if (inst->fields[2].isObject()) {
+        if (auto* dStr = s_vm->getHeap().getAs<ObjString>(*inst->fields[2].asObject())) {
+            delim = dStr->text;
+        }
+    }
+
+    int64_t pos = *inst->fields[1].asInt();
+
+    if (!fromStdin) {
+        if (!inst->fields[0].isObject()) return false;
+        auto* srcStr = s_vm->getHeap().getAs<ObjString>(*inst->fields[0].asObject());
+        if (!srcStr) return false;
+        const std::string& text = srcStr->text;
+
+        while (pos < static_cast<int64_t>(text.size()) && isDelimiterChar(text[pos], delim)) {
+            pos++;
+        }
+        if (pos >= static_cast<int64_t>(text.size())) return false;
+
+        int64_t start = pos;
+        while (pos < static_cast<int64_t>(text.size()) && !isDelimiterChar(text[pos], delim)) {
+            pos++;
+        }
+        outToken = text.substr(start, pos - start);
+        if (consume) {
+            inst->fields[1] = Value(pos);
+        }
+        return true;
+    } else {
+        std::string buffer;
+        if (inst->fields[5].isObject()) {
+            if (auto* bStr = s_vm->getHeap().getAs<ObjString>(*inst->fields[5].asObject())) {
+                buffer = bStr->text;
+            }
+        }
+
+        while (true) {
+            while (pos < static_cast<int64_t>(buffer.size()) && isDelimiterChar(buffer[pos], delim)) {
+                pos++;
+            }
+            if (pos < static_cast<int64_t>(buffer.size())) {
+                int64_t start = pos;
+                while (pos < static_cast<int64_t>(buffer.size()) && !isDelimiterChar(buffer[pos], delim)) {
+                    pos++;
+                }
+                outToken = buffer.substr(start, pos - start);
+                if (consume) {
+                    inst->fields[1] = Value(pos);
+                }
+                return true;
+            }
+            // Buffer exhausted, read from stdin
+            std::string line;
+            if (!std::getline(std::cin, line)) {
+                return false; // EOF
+            }
+            buffer = line + "\n";
+            pos = 0;
+            GcHandle bHandle = s_vm->getHeap().allocateString(buffer);
+            inst->fields[5] = Value(bHandle);
+            inst->fields[1] = Value(int64_t(0));
+        }
+    }
+}
+
+static bool fetchNextLine(ObjInstance* inst, bool consume, std::string& outLine) {
+    if (!inst || inst->fields.size() < 6 || inst->fields[4].asBool().value_or(false)) return false;
+
+    bool fromStdin = inst->fields[3].asBool().value_or(false);
+    int64_t pos = *inst->fields[1].asInt();
+
+    if (!fromStdin) {
+        if (!inst->fields[0].isObject()) return false;
+        auto* srcStr = s_vm->getHeap().getAs<ObjString>(*inst->fields[0].asObject());
+        if (!srcStr) return false;
+        const std::string& text = srcStr->text;
+
+        if (pos >= static_cast<int64_t>(text.size())) return false;
+
+        size_t nextN = text.find('\n', pos);
+        size_t end = (nextN == std::string::npos) ? text.size() : nextN;
+        outLine = text.substr(pos, end - pos);
+        if (!outLine.empty() && outLine.back() == '\r') outLine.pop_back();
+
+        if (consume) {
+            inst->fields[1] = Value(int64_t((nextN == std::string::npos) ? text.size() : nextN + 1));
+        }
+        return true;
+    } else {
+        std::string buffer;
+        if (inst->fields[5].isObject()) {
+            if (auto* bStr = s_vm->getHeap().getAs<ObjString>(*inst->fields[5].asObject())) {
+                buffer = bStr->text;
+            }
+        }
+
+        if (pos < static_cast<int64_t>(buffer.size())) {
+            size_t nextN = buffer.find('\n', pos);
+            size_t end = (nextN == std::string::npos) ? buffer.size() : nextN;
+            outLine = buffer.substr(pos, end - pos);
+            if (!outLine.empty() && outLine.back() == '\r') outLine.pop_back();
+            if (consume) {
+                inst->fields[1] = Value(int64_t((nextN == std::string::npos) ? buffer.size() : nextN + 1));
+            }
+            return true;
+        } else {
+            std::string line;
+            if (!std::getline(std::cin, line)) {
+                return false;
+            }
+            outLine = line;
+            if (consume) {
+                inst->fields[1] = Value(int64_t(0));
+                inst->fields[5] = Value(s_vm->getHeap().allocateString(""));
+            }
+            return true;
+        }
+    }
+}
+
+static Value scanner_next(int argCount, Value*) {
+    auto* inst = getScannerInstance(argCount);
+    std::string token;
+    if (!fetchNextToken(inst, true, token)) {
+        return Value(); // nil on EOF
+    }
+    return Value(s_vm->getHeap().allocateString(std::move(token)));
+}
+
+static Value scanner_nextLine(int argCount, Value*) {
+    auto* inst = getScannerInstance(argCount);
+    std::string line;
+    if (!fetchNextLine(inst, true, line)) {
+        return Value(); // nil on EOF
+    }
+    return Value(s_vm->getHeap().allocateString(std::move(line)));
+}
+
+static bool parseIntegerToken(const std::string& token, int radix, int64_t& outVal) {
+    if (token.empty()) return false;
+    const char* str = token.c_str();
+    bool neg = false;
+    if (*str == '-') { neg = true; str++; }
+    else if (*str == '+') { str++; }
+    if (*str == '\0') return false;
+
+    if ((radix == 0 || radix == 2) && str[0] == '0' && (str[1] == 'b' || str[1] == 'B')) {
+        str += 2;
+        radix = 2;
+    } else if ((radix == 0 || radix == 8) && str[0] == '0' && (str[1] == 'o' || str[1] == 'O')) {
+        str += 2;
+        radix = 8;
+    } else if ((radix == 0 || radix == 16) && str[0] == '0' && (str[1] == 'x' || str[1] == 'X')) {
+        str += 2;
+        radix = 16;
+    } else if (radix == 0) {
+        radix = 10;
+    }
+
+    if (*str == '\0') return false;
+    char* endPtr = nullptr;
+    errno = 0;
+    long long val = std::strtoll(str, &endPtr, radix);
+    if (!endPtr || *endPtr != '\0' || errno == ERANGE) return false;
+    outVal = neg ? -val : val;
+    return true;
+}
+
+static Value scanner_nextInt(int argCount, Value* args) {
+    auto* inst = getScannerInstance(argCount);
+    int radix = (argCount >= 1 && args[0].isInt()) ? static_cast<int>(*args[0].asInt()) : 10;
+    std::string token;
+    if (!fetchNextToken(inst, true, token)) {
+        s_vm->jitRuntimeError("Scanner.nextInt: No more tokens (EOF).");
+        return Value();
+    }
+    int64_t val = 0;
+    if (!parseIntegerToken(token, radix, val)) {
+        s_vm->jitRuntimeError("Scanner.nextInt: Token '" + token + "' cannot be parsed as an integer.");
+        return Value();
+    }
+    return Value(val);
+}
+
+static Value scanner_nextDouble(int argCount, Value*) {
+    auto* inst = getScannerInstance(argCount);
+    std::string token;
+    if (!fetchNextToken(inst, true, token)) {
+        s_vm->jitRuntimeError("Scanner.nextDouble: No more tokens (EOF).");
+        return Value();
+    }
+    char* endPtr = nullptr;
+    double val = std::strtod(token.c_str(), &endPtr);
+    if (!endPtr || endPtr == token.c_str() || *endPtr != '\0') {
+        s_vm->jitRuntimeError("Scanner.nextDouble: Token '" + token + "' cannot be parsed as a double.");
+        return Value();
+    }
+    return Value(val);
+}
+
+static Value scanner_nextBool(int argCount, Value*) {
+    auto* inst = getScannerInstance(argCount);
+    std::string token;
+    if (!fetchNextToken(inst, true, token)) {
+        s_vm->jitRuntimeError("Scanner.nextBool: No more tokens (EOF).");
+        return Value();
+    }
+    std::string lower = token;
+    for (char& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (lower == "true" || lower == "1" || lower == "yes" || lower == "y") return Value(true);
+    if (lower == "false" || lower == "0" || lower == "no" || lower == "n") return Value(false);
+    s_vm->jitRuntimeError("Scanner.nextBool: Token '" + token + "' cannot be parsed as a boolean.");
+    return Value();
+}
+
+static Value scanner_hasNext(int argCount, Value*) {
+    auto* inst = getScannerInstance(argCount);
+    std::string token;
+    bool has = fetchNextToken(inst, false, token);
+    return Value(has);
+}
+
+static Value scanner_hasNextLine(int argCount, Value*) {
+    auto* inst = getScannerInstance(argCount);
+    std::string line;
+    bool has = fetchNextLine(inst, false, line);
+    return Value(has);
+}
+
+static Value scanner_hasNextInt(int argCount, Value* args) {
+    auto* inst = getScannerInstance(argCount);
+    int radix = (argCount >= 1 && args[0].isInt()) ? static_cast<int>(*args[0].asInt()) : 10;
+    std::string token;
+    if (!fetchNextToken(inst, false, token)) return Value(false);
+    int64_t val = 0;
+    return Value(parseIntegerToken(token, radix, val));
+}
+
+static Value scanner_hasNextDouble(int argCount, Value*) {
+    auto* inst = getScannerInstance(argCount);
+    std::string token;
+    if (!fetchNextToken(inst, false, token)) return Value(false);
+    char* endPtr = nullptr;
+    std::strtod(token.c_str(), &endPtr);
+    return Value(bool(endPtr && endPtr != token.c_str() && *endPtr == '\0'));
+}
+
+static Value scanner_hasNextBool(int argCount, Value*) {
+    auto* inst = getScannerInstance(argCount);
+    std::string token;
+    if (!fetchNextToken(inst, false, token)) return Value(false);
+    std::string lower = token;
+    for (char& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    bool isB = (lower == "true" || lower == "false" || lower == "1" || lower == "0" || lower == "yes" || lower == "no" || lower == "y" || lower == "n");
+    return Value(isB);
+}
+
+static Value scanner_useDelimiter(int argCount, Value* args) {
+    auto* inst = getScannerInstance(argCount);
+    if (inst && argCount >= 1) {
+        std::string delim = valToStr(args[0]);
+        GcHandle dHandle = s_vm->getHeap().allocateString(std::move(delim));
+        inst->fields[2] = Value(dHandle);
+    }
+    return s_vm->peek(argCount); // return this
+}
+
+static Value scanner_getDelimiter(int argCount, Value*) {
+    auto* inst = getScannerInstance(argCount);
+    if (!inst || inst->fields.size() < 3) return Value();
+    return inst->fields[2];
+}
+
+static Value scanner_reset(int argCount, Value*) {
+    auto* inst = getScannerInstance(argCount);
+    if (inst && inst->fields.size() >= 2) {
+        inst->fields[1] = Value(int64_t(0));
+    }
+    return Value();
+}
+
+static Value scanner_allTokens(int argCount, Value*) {
+    auto* inst = getScannerInstance(argCount);
+    std::vector<Value> tokens;
+    std::string token;
+    while (fetchNextToken(inst, true, token)) {
+        GcHandle h = s_vm->getHeap().allocateString(token);
+        tokens.push_back(Value(h));
+    }
+    return Value(s_vm->getHeap().allocateArray(std::move(tokens)));
+}
+
+static Value scanner_allLines(int argCount, Value*) {
+    auto* inst = getScannerInstance(argCount);
+    std::vector<Value> lines;
+    std::string line;
+    while (fetchNextLine(inst, true, line)) {
+        GcHandle h = s_vm->getHeap().allocateString(line);
+        lines.push_back(Value(h));
+    }
+    return Value(s_vm->getHeap().allocateArray(std::move(lines)));
+}
+
+static Value scanner_close(int argCount, Value*) {
+    auto* inst = getScannerInstance(argCount);
+    if (inst && inst->fields.size() >= 5) {
+        inst->fields[4] = Value(true);
+    }
+    return Value();
+}
+
+// 靜態工廠與便利方法
+static Value scanner_static_fromString(int argCount, Value* args) {
+    if (argCount < 1 || !s_vm || s_scannerClassHandle.id == 0) return Value();
+    GcHandle instHandle = s_vm->getHeap().allocate<ObjInstance>(s_scannerClassHandle);
+    auto* inst = s_vm->getHeap().getAs<ObjInstance>(instHandle);
+    if (!inst) return Value();
+    ensureScannerFields(inst, false, valToStr(args[0]));
+    return Value(instHandle);
+}
+
+static Value scanner_static_fromStdin(int, Value*) {
+    if (!s_vm || s_scannerClassHandle.id == 0) return Value();
+    GcHandle instHandle = s_vm->getHeap().allocate<ObjInstance>(s_scannerClassHandle);
+    auto* inst = s_vm->getHeap().getAs<ObjInstance>(instHandle);
+    if (!inst) return Value();
+    ensureScannerFields(inst, true, "");
+    return Value(instHandle);
+}
+
+static Value scanner_static_scanInt(int argCount, Value* args) {
+    if (argCount >= 1 && !args[0].isNull()) {
+        std::cout << valToStr(args[0]);
+        std::cout.flush();
+    }
+    int64_t val = 0;
+    if (std::cin >> val) {
+        return Value(val);
+    }
+    std::cin.clear();
+    return Value();
+}
+
+static Value scanner_static_scanDouble(int argCount, Value* args) {
+    if (argCount >= 1 && !args[0].isNull()) {
+        std::cout << valToStr(args[0]);
+        std::cout.flush();
+    }
+    double val = 0.0;
+    if (std::cin >> val) {
+        return Value(val);
+    }
+    std::cin.clear();
+    return Value();
+}
+
+static Value scanner_static_scanWord(int argCount, Value* args) {
+    if (argCount >= 1 && !args[0].isNull()) {
+        std::cout << valToStr(args[0]);
+        std::cout.flush();
+    }
+    std::string word;
+    if (std::cin >> word) {
+        return Value(s_vm->getHeap().allocateString(std::move(word)));
+    }
+    std::cin.clear();
+    return Value();
+}
+
+static Value scanner_static_scanLine(int argCount, Value* args) {
+    if (argCount >= 1 && !args[0].isNull()) {
+        std::cout << valToStr(args[0]);
+        std::cout.flush();
+    }
+    std::string line;
+    if (std::getline(std::cin, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        return Value(s_vm->getHeap().allocateString(std::move(line)));
+    }
+    std::cin.clear();
+    return Value();
+}
+
 EASYSCRIPT_MODULE_INIT {
     s_vm = vm;
     enableVirtualTerminal();
@@ -745,6 +1194,38 @@ EASYSCRIPT_MODULE_INIT {
     defineClassNative(promptClass, "password", prompt_password, -1);
     defineClassNative(promptClass, "choose", prompt_choose, 2);
     vm->defineModuleValue(mod, "Prompt", Value(promptClassHandle));
+
+        // 5. 封裝 Scanner 類別
+    s_scannerClassHandle = vm->getHeap().allocate<ObjClass>("Scanner");
+    auto* scannerClass = vm->getHeap().getAs<ObjClass>(s_scannerClassHandle);
+
+    defineInstanceNative(scannerClass, "init", scanner_init, -1);
+    defineInstanceNative(scannerClass, "next", scanner_next, 0);
+    defineInstanceNative(scannerClass, "nextLine", scanner_nextLine, 0);
+    defineInstanceNative(scannerClass, "nextInt", scanner_nextInt, -1);
+    defineInstanceNative(scannerClass, "nextDouble", scanner_nextDouble, 0);
+    defineInstanceNative(scannerClass, "nextFloat", scanner_nextDouble, 0);
+    defineInstanceNative(scannerClass, "nextBool", scanner_nextBool, 0);
+    defineInstanceNative(scannerClass, "hasNext", scanner_hasNext, 0);
+    defineInstanceNative(scannerClass, "hasNextLine", scanner_hasNextLine, 0);
+    defineInstanceNative(scannerClass, "hasNextInt", scanner_hasNextInt, -1);
+    defineInstanceNative(scannerClass, "hasNextDouble", scanner_hasNextDouble, 0);
+    defineInstanceNative(scannerClass, "hasNextBool", scanner_hasNextBool, 0);
+    defineInstanceNative(scannerClass, "useDelimiter", scanner_useDelimiter, 1);
+    defineInstanceNative(scannerClass, "getDelimiter", scanner_getDelimiter, 0);
+    defineInstanceNative(scannerClass, "reset", scanner_reset, 0);
+    defineInstanceNative(scannerClass, "allTokens", scanner_allTokens, 0);
+    defineInstanceNative(scannerClass, "allLines", scanner_allLines, 0);
+    defineInstanceNative(scannerClass, "close", scanner_close, 0);
+
+    defineClassNative(scannerClass, "fromString", scanner_static_fromString, 1);
+    defineClassNative(scannerClass, "fromStdin", scanner_static_fromStdin, 0);
+    defineClassNative(scannerClass, "scanInt", scanner_static_scanInt, -1);
+    defineClassNative(scannerClass, "scanDouble", scanner_static_scanDouble, -1);
+    defineClassNative(scannerClass, "scanWord", scanner_static_scanWord, -1);
+    defineClassNative(scannerClass, "scanLine", scanner_static_scanLine, -1);
+
+    vm->defineModuleValue(mod, "Scanner", Value(s_scannerClassHandle));
 
     return true;
 }
