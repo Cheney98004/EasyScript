@@ -1,0 +1,182 @@
+{
+  "module": "std/io",
+  "version": "1.0.0",
+  "doc": "Standard I/O, terminal control, colors, and interactive prompts standard library.",
+  "globalAlias": ["io", "Terminal", "Color", "Prompt"],
+  "symbols": [
+    {
+      "name": "write",
+      "kind": "function",
+      "signature": "write(...args: any): void",
+      "doc": "Prints arguments to stdout without automatic newline.",
+      "parameters": [
+        { "name": "...args", "type": "any", "doc": "Values to print" }
+      ],
+      "returnType": "void"
+    },
+    {
+      "name": "writeln",
+      "kind": "function",
+      "signature": "writeln(...args: any): void",
+      "doc": "Prints arguments to stdout followed by newline.",
+      "parameters": [
+        { "name": "...args", "type": "any", "doc": "Values to print" }
+      ],
+      "returnType": "void"
+    },
+    {
+      "name": "writeError",
+      "kind": "function",
+      "signature": "writeError(...args: any): void",
+      "doc": "Prints arguments to stderr without newline.",
+      "parameters": [
+        { "name": "...args", "type": "any", "doc": "Values to print to standard error" }
+      ],
+      "returnType": "void"
+    },
+    {
+      "name": "writeErrorln",
+      "kind": "function",
+      "signature": "writeErrorln(...args: any): void",
+      "doc": "Prints arguments to stderr followed by newline.",
+      "parameters": [
+        { "name": "...args", "type": "any", "doc": "Values to print to standard error" }
+      ],
+      "returnType": "void"
+    },
+    {
+      "name": "readLine",
+      "kind": "function",
+      "signature": "readLine(): string",
+      "doc": "Reads a line from stdin (stripping trailing \\r\\n).",
+      "parameters": [],
+      "returnType": "string"
+    },
+    {
+      "name": "readAll",
+      "kind": "function",
+      "signature": "readAll(): string",
+      "doc": "Reads entire standard input until EOF.",
+      "parameters": [],
+      "returnType": "string"
+    },
+    {
+      "name": "readChar",
+      "kind": "function",
+      "signature": "readChar(): string",
+      "doc": "Reads a single unbuffered keystroke immediately.",
+      "parameters": [],
+      "returnType": "string"
+    },
+    {
+      "name": "flush",
+      "kind": "function",
+      "signature": "flush(): void",
+      "doc": "Flushes stdout buffer.",
+      "parameters": [],
+      "returnType": "void"
+    },
+    {
+      "name": "flushError",
+      "kind": "function",
+      "signature": "flushError(): void",
+      "doc": "Flushes stderr buffer.",
+      "parameters": [],
+      "returnType": "void"
+    },
+    {
+      "name": "setEncoding",
+      "kind": "function",
+      "signature": "setEncoding(encoding: string, setInput = true): bool",
+      "doc": "Sets console output and input character encoding (e.g. 'utf-8', 'big5', 'gbk').",
+      "parameters": [
+        { "name": "encoding", "type": "string", "doc": "Encoding name or codepage" },
+        { "name": "setInput", "type": "bool", "doc": "Whether to also configure stdin encoding", "optional": true, "default": "true" }
+      ],
+      "returnType": "bool"
+    },
+    {
+      "name": "getEncoding",
+      "kind": "function",
+      "signature": "getEncoding(): string",
+      "doc": "Gets current console output character encoding name.",
+      "parameters": [],
+      "returnType": "string"
+    },
+    {
+      "name": "Terminal",
+      "kind": "class",
+      "signature": "class Terminal",
+      "doc": "Terminal screen and cursor manipulation class.",
+      "members": [
+        { "name": "clear", "kind": "method", "signature": "clear(): void", "doc": "Clears terminal screen and moves cursor to home (1,1)." },
+        { "name": "clearLine", "kind": "method", "signature": "clearLine(): void", "doc": "Clears the entire current terminal line." },
+        { "name": "clearToEnd", "kind": "method", "signature": "clearToEnd(): void", "doc": "Clears from cursor position to end of screen." },
+        { "name": "setCursor", "kind": "method", "signature": "setCursor(x: int, y: int): void", "doc": "Sets cursor position (1-based column x, row y).", "parameters": [{"name": "x", "type": "int"}, {"name": "y", "type": "int"}] },
+        { "name": "getCursor", "kind": "method", "signature": "getCursor(): Map", "doc": "Gets cursor position {x, y}." },
+        { "name": "moveUp", "kind": "method", "signature": "moveUp(n = 1): void", "doc": "Moves cursor up n lines.", "parameters": [{"name": "n", "type": "int", "optional": true, "default": "1"}] },
+        { "name": "moveDown", "kind": "method", "signature": "moveDown(n = 1): void", "doc": "Moves cursor down n lines.", "parameters": [{"name": "n", "type": "int", "optional": true, "default": "1"}] },
+        { "name": "moveLeft", "kind": "method", "signature": "moveLeft(n = 1): void", "doc": "Moves cursor left n columns.", "parameters": [{"name": "n", "type": "int", "optional": true, "default": "1"}] },
+        { "name": "moveRight", "kind": "method", "signature": "moveRight(n = 1): void", "doc": "Moves cursor right n columns.", "parameters": [{"name": "n", "type": "int", "optional": true, "default": "1"}] },
+        { "name": "hideCursor", "kind": "method", "signature": "hideCursor(): void", "doc": "Hides the terminal cursor." },
+        { "name": "showCursor", "kind": "method", "signature": "showCursor(): void", "doc": "Shows the terminal cursor." },
+        { "name": "getWidth", "kind": "method", "signature": "getWidth(): int", "doc": "Gets the current terminal width in characters." },
+        { "name": "getHeight", "kind": "method", "signature": "getHeight(): int", "doc": "Gets the current terminal height in characters." },
+        { "name": "getSize", "kind": "method", "signature": "getSize(): Map", "doc": "Gets terminal dimensions {width, height}." },
+        { "name": "isTerminal", "kind": "method", "signature": "isTerminal(): bool", "doc": "Checks whether stdout is attached to an interactive terminal." },
+        { "name": "beep", "kind": "method", "signature": "beep(): void", "doc": "Emits standard console bell alert sound." },
+        { "name": "setEncoding", "kind": "method", "signature": "setEncoding(encoding: string, setInput = true): bool", "doc": "Sets terminal character encoding.", "parameters": [{"name": "encoding", "type": "string"}, {"name": "setInput", "type": "bool", "optional": true}] },
+        { "name": "getEncoding", "kind": "method", "signature": "getEncoding(): string", "doc": "Gets terminal character encoding name." },
+        { "name": "setCodePage", "kind": "method", "signature": "setCodePage(cp: int, setInput = true): bool", "doc": "Sets Windows console CodePage.", "parameters": [{"name": "cp", "type": "int"}, {"name": "setInput", "type": "bool", "optional": true}] },
+        { "name": "getCodePage", "kind": "method", "signature": "getCodePage(): int", "doc": "Gets Windows console CodePage." }
+      ]
+    },
+    {
+      "name": "Color",
+      "kind": "class",
+      "signature": "class Color",
+      "doc": "ANSI terminal text styling and color formatting class.",
+      "members": [
+        { "name": "red", "kind": "method", "signature": "red(text: string): string", "doc": "Wraps text in ANSI red." },
+        { "name": "green", "kind": "method", "signature": "green(text: string): string", "doc": "Wraps text in ANSI green." },
+        { "name": "yellow", "kind": "method", "signature": "yellow(text: string): string", "doc": "Wraps text in ANSI yellow." },
+        { "name": "blue", "kind": "method", "signature": "blue(text: string): string", "doc": "Wraps text in ANSI blue." },
+        { "name": "magenta", "kind": "method", "signature": "magenta(text: string): string", "doc": "Wraps text in ANSI magenta." },
+        { "name": "cyan", "kind": "method", "signature": "cyan(text: string): string", "doc": "Wraps text in ANSI cyan." },
+        { "name": "white", "kind": "method", "signature": "white(text: string): string", "doc": "Wraps text in ANSI white." },
+        { "name": "gray", "kind": "method", "signature": "gray(text: string): string", "doc": "Wraps text in ANSI gray." },
+        { "name": "bgRed", "kind": "method", "signature": "bgRed(text: string): string", "doc": "Wraps text in ANSI background red." },
+        { "name": "bgGreen", "kind": "method", "signature": "bgGreen(text: string): string", "doc": "Wraps text in ANSI background green." },
+        { "name": "bgYellow", "kind": "method", "signature": "bgYellow(text: string): string", "doc": "Wraps text in ANSI background yellow." },
+        { "name": "bgBlue", "kind": "method", "signature": "bgBlue(text: string): string", "doc": "Wraps text in ANSI background blue." },
+        { "name": "bgMagenta", "kind": "method", "signature": "bgMagenta(text: string): string", "doc": "Wraps text in ANSI background magenta." },
+        { "name": "bgCyan", "kind": "method", "signature": "bgCyan(text: string): string", "doc": "Wraps text in ANSI background cyan." },
+        { "name": "bgWhite", "kind": "method", "signature": "bgWhite(text: string): string", "doc": "Wraps text in ANSI background white." },
+        { "name": "bgGray", "kind": "method", "signature": "bgGray(text: string): string", "doc": "Wraps text in ANSI background gray." },
+        { "name": "bold", "kind": "method", "signature": "bold(text: string): string", "doc": "Wraps text in bold style." },
+        { "name": "dim", "kind": "method", "signature": "dim(text: string): string", "doc": "Wraps text in dim style." },
+        { "name": "italic", "kind": "method", "signature": "italic(text: string): string", "doc": "Wraps text in italic style." },
+        { "name": "underline", "kind": "method", "signature": "underline(text: string): string", "doc": "Wraps text in underline style." },
+        { "name": "inverse", "kind": "method", "signature": "inverse(text: string): string", "doc": "Inverts foreground and background colors." },
+        { "name": "rgb", "kind": "method", "signature": "rgb(r: int, g: int, b: int, text: string): string", "doc": "24-bit TrueColor foreground text color." },
+        { "name": "bgRgb", "kind": "method", "signature": "bgRgb(r: int, g: int, b: int, text: string): string", "doc": "24-bit TrueColor background text color." },
+        { "name": "strip", "kind": "method", "signature": "strip(text: string): string", "doc": "Strips all ANSI escape sequences from text." },
+        { "name": "RED", "kind": "constant", "signature": "const RED: string", "doc": "ANSI red escape code." },
+        { "name": "GREEN", "kind": "constant", "signature": "const GREEN: string", "doc": "ANSI green escape code." },
+        { "name": "RESET", "kind": "constant", "signature": "const RESET: string", "doc": "ANSI reset escape code." }
+      ]
+    },
+    {
+      "name": "Prompt",
+      "kind": "class",
+      "signature": "class Prompt",
+      "doc": "Interactive command-line dialog and prompt input class.",
+      "members": [
+        { "name": "ask", "kind": "method", "signature": "ask(question: string, defaultVal = ''): string", "doc": "Prompts user for single line input with optional default value.", "parameters": [{"name": "question", "type": "string"}, {"name": "defaultVal", "type": "string", "optional": true, "default": "''"}] },
+        { "name": "confirm", "kind": "method", "signature": "confirm(question: string, defaultVal = false): bool", "doc": "Displays interactive [y/N] prompt and returns true if confirmed.", "parameters": [{"name": "question", "type": "string"}, {"name": "defaultVal", "type": "bool", "optional": true, "default": "false"}] },
+        { "name": "password", "kind": "method", "signature": "password(question: string, maskChar = '*'): string", "doc": "Prompts for password with keystroke masking.", "parameters": [{"name": "question", "type": "string"}, {"name": "maskChar", "type": "string", "optional": true, "default": "'*'"}] },
+        { "name": "choose", "kind": "method", "signature": "choose(question: string, options: Array<string>): int", "doc": "Presents numbered options list and returns selected 0-based index.", "parameters": [{"name": "question", "type": "string"}, {"name": "options", "type": "Array<string>"}] }
+      ]
+    }
+  ]
+}

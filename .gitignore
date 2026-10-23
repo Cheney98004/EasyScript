@@ -3,6 +3,7 @@
 /*.esc
 /*.ecs
 *.dll
-/plugins
+/plugins/*
+!/plugins/*.d.json
 /tests
 /*.py

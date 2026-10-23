@@ -17,12 +17,15 @@ struct ExportedSymbol {
     std::string doc;
     std::string sourceUri;
     std::vector<ExportedSymbol> members{};
+    std::vector<std::string> parameters{};
 };
 
 struct ResolvedModule {
     std::string path;
     std::string targetUri;
     bool isStandard{false};
+    std::string doc;
+    std::vector<std::string> globalAliases{};
     std::vector<ExportedSymbol> symbols;
 };
 
@@ -62,6 +65,17 @@ private:
 
     std::vector<ImportInfo> parseDocumentImports(const std::string& text);
     ResolvedModule resolveModule(const std::string& currentDocUri, const std::string& importPath);
+
+    // .d.json 動態宣告庫支援與全域別名 (globalAlias)
+    std::string workspaceRoot;
+    std::unordered_map<std::string, ResolvedModule> djsonModules;
+    std::unordered_map<std::string, std::string> globalAliasModuleMap;
+    std::unordered_map<std::string, ExportedSymbol> globalAliasSymbolMap;
+    std::unordered_map<std::string, int64_t> djsonFileMtimes;
+
+    void scanDjsonModules();
+    bool loadDjsonFile(const std::string& filePath);
+    void checkDjsonReload();
 };
 
 } // namespace lsp

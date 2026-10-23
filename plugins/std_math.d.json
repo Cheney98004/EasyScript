@@ -1,0 +1,182 @@
+{
+  "module": "std/math",
+  "version": "1.0.0",
+  "doc": "Mathematical constants, trigonometry, logarithms, and utility functions standard library.",
+  "globalAlias": ["Math", "math"],
+  "symbols": [
+    {
+      "name": "PI",
+      "kind": "constant",
+      "signature": "const PI: double = 3.141592653589793",
+      "doc": "Mathematical constant Pi.",
+      "returnType": "double"
+    },
+    {
+      "name": "E",
+      "kind": "constant",
+      "signature": "const E: double = 2.718281828459045",
+      "doc": "Mathematical constant E (Euler's number).",
+      "returnType": "double"
+    },
+    {
+      "name": "sqrt",
+      "kind": "function",
+      "signature": "sqrt(x: double): double",
+      "doc": "Returns the square root of x.",
+      "parameters": [{ "name": "x", "type": "double" }],
+      "returnType": "double"
+    },
+    {
+      "name": "pow",
+      "kind": "function",
+      "signature": "pow(base: double, exp: double): double",
+      "doc": "Returns base raised to the power of exp.",
+      "parameters": [{ "name": "base", "type": "double" }, { "name": "exp", "type": "double" }],
+      "returnType": "double"
+    },
+    {
+      "name": "abs",
+      "kind": "function",
+      "signature": "abs(x: number): number",
+      "doc": "Returns the absolute value of x.",
+      "parameters": [{ "name": "x", "type": "number" }],
+      "returnType": "number"
+    },
+    {
+      "name": "floor",
+      "kind": "function",
+      "signature": "floor(x: double): int",
+      "doc": "Returns greatest integer less than or equal to x.",
+      "parameters": [{ "name": "x", "type": "double" }],
+      "returnType": "int"
+    },
+    {
+      "name": "ceil",
+      "kind": "function",
+      "signature": "ceil(x: double): int",
+      "doc": "Returns smallest integer greater than or equal to x.",
+      "parameters": [{ "name": "x", "type": "double" }],
+      "returnType": "int"
+    },
+    {
+      "name": "round",
+      "kind": "function",
+      "signature": "round(x: double): int",
+      "doc": "Returns x rounded to nearest integer.",
+      "parameters": [{ "name": "x", "type": "double" }],
+      "returnType": "int"
+    },
+    {
+      "name": "sin",
+      "kind": "function",
+      "signature": "sin(x: double): double",
+      "doc": "Returns sine of angle in radians.",
+      "parameters": [{ "name": "x", "type": "double" }],
+      "returnType": "double"
+    },
+    {
+      "name": "cos",
+      "kind": "function",
+      "signature": "cos(x: double): double",
+      "doc": "Returns cosine of angle in radians.",
+      "parameters": [{ "name": "x", "type": "double" }],
+      "returnType": "double"
+    },
+    {
+      "name": "tan",
+      "kind": "function",
+      "signature": "tan(x: double): double",
+      "doc": "Returns tangent of angle in radians.",
+      "parameters": [{ "name": "x", "type": "double" }],
+      "returnType": "double"
+    },
+    {
+      "name": "asin",
+      "kind": "function",
+      "signature": "asin(x: double): double",
+      "doc": "Returns arc sine in radians.",
+      "parameters": [{ "name": "x", "type": "double" }],
+      "returnType": "double"
+    },
+    {
+      "name": "acos",
+      "kind": "function",
+      "signature": "acos(x: double): double",
+      "doc": "Returns arc cosine in radians.",
+      "parameters": [{ "name": "x", "type": "double" }],
+      "returnType": "double"
+    },
+    {
+      "name": "atan",
+      "kind": "function",
+      "signature": "atan(x: double): double",
+      "doc": "Returns arc tangent in radians.",
+      "parameters": [{ "name": "x", "type": "double" }],
+      "returnType": "double"
+    },
+    {
+      "name": "atan2",
+      "kind": "function",
+      "signature": "atan2(y: double, x: double): double",
+      "doc": "Returns angle whose tangent is y/x.",
+      "parameters": [{ "name": "y", "type": "double" }, { "name": "x", "type": "double" }],
+      "returnType": "double"
+    },
+    {
+      "name": "log",
+      "kind": "function",
+      "signature": "log(x: double): double",
+      "doc": "Returns natural logarithm (base e) of x.",
+      "parameters": [{ "name": "x", "type": "double" }],
+      "returnType": "double"
+    },
+    {
+      "name": "exp",
+      "kind": "function",
+      "signature": "exp(x: double): double",
+      "doc": "Returns e raised to power of x.",
+      "parameters": [{ "name": "x", "type": "double" }],
+      "returnType": "double"
+    },
+    {
+      "name": "min",
+      "kind": "function",
+      "signature": "min(a: number, b: number): number",
+      "doc": "Returns the smaller of two numbers.",
+      "parameters": [{ "name": "a", "type": "number" }, { "name": "b", "type": "number" }],
+      "returnType": "number"
+    },
+    {
+      "name": "max",
+      "kind": "function",
+      "signature": "max(a: number, b: number): number",
+      "doc": "Returns the larger of two numbers.",
+      "parameters": [{ "name": "a", "type": "number" }, { "name": "b", "type": "number" }],
+      "returnType": "number"
+    },
+    {
+      "name": "clamp",
+      "kind": "function",
+      "signature": "clamp(val: number, min: number, max: number): number",
+      "doc": "Clamps value within range [min, max].",
+      "parameters": [{ "name": "val", "type": "number" }, { "name": "min", "type": "number" }, { "name": "max", "type": "number" }],
+      "returnType": "number"
+    },
+    {
+      "name": "random",
+      "kind": "function",
+      "signature": "random(): double",
+      "doc": "Returns pseudorandom double in range [0, 1).",
+      "parameters": [],
+      "returnType": "double"
+    },
+    {
+      "name": "randomInt",
+      "kind": "function",
+      "signature": "randomInt(min: int, max: int): int",
+      "doc": "Returns pseudorandom integer between min and max (inclusive).",
+      "parameters": [{ "name": "min", "type": "int" }, { "name": "max", "type": "int" }],
+      "returnType": "int"
+    }
+  ]
+}

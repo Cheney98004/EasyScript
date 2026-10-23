@@ -1,0 +1,46 @@
+{
+  "module": "sample_plugin",
+  "version": "1.0.0",
+  "doc": "Sample dynamic C++ native extension plugin demonstration.",
+  "symbols": [
+    {
+      "name": "add",
+      "kind": "function",
+      "signature": "add(a: int, b: int): int",
+      "doc": "Adds two integers together.",
+      "parameters": [
+        { "name": "a", "type": "int", "doc": "First integer" },
+        { "name": "b", "type": "int", "doc": "Second integer" }
+      ],
+      "returnType": "int"
+    },
+    {
+      "name": "multiply",
+      "kind": "function",
+      "signature": "multiply(a: int, b: int): int",
+      "doc": "Multiplies two integers together.",
+      "parameters": [
+        { "name": "a", "type": "int", "doc": "First integer" },
+        { "name": "b", "type": "int", "doc": "Second integer" }
+      ],
+      "returnType": "int"
+    },
+    {
+      "name": "greet",
+      "kind": "function",
+      "signature": "greet(name: string): string",
+      "doc": "Generates a greeting message from native C++ code.",
+      "parameters": [
+        { "name": "name", "type": "string", "doc": "Recipient name" }
+      ],
+      "returnType": "string"
+    },
+    {
+      "name": "PLUGIN_VERSION",
+      "kind": "constant",
+      "signature": "const PLUGIN_VERSION: int = 100",
+      "doc": "Plugin API version.",
+      "returnType": "int"
+    }
+  ]
+}

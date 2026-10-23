@@ -18,11 +18,35 @@ namespace fs = std::filesystem;
 
 namespace lsp {
 
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#ifdef CONST
+#undef CONST
+#endif
+static std::string getExecutableDir() {
+    wchar_t buf[MAX_PATH];
+    DWORD len = GetModuleFileNameW(NULL, buf, MAX_PATH);
+    if (len > 0) {
+        return fs::path(buf).parent_path().string();
+    }
+    return "";
+}
+#else
+static std::string getExecutableDir() {
+    return "";
+}
+#endif
+
+static std::string uriToPath(const std::string& uri);
+static std::string pathToUri(const std::string& path);
+
 LspServer::LspServer() {
 #if defined(_WIN32)
     _setmode(_fileno(stdin), _O_BINARY);
     _setmode(_fileno(stdout), _O_BINARY);
 #endif
+    scanDjsonModules();
 }
 
 void LspServer::run() {
@@ -101,6 +125,12 @@ void LspServer::handleRequest(const Json& msg) {
     const Json& params = msg["params"];
 
     if (method == "initialize") {
+        if (params.contains("rootUri") && params["rootUri"].type == JsonType::String) {
+            workspaceRoot = uriToPath(params["rootUri"].asString());
+        } else if (params.contains("rootPath") && params["rootPath"].type == JsonType::String) {
+            workspaceRoot = params["rootPath"].asString();
+        }
+        scanDjsonModules();
         Json result = Json::object();
         Json caps = Json::object();
 
@@ -906,11 +936,251 @@ std::vector<ImportInfo> LspServer::parseDocumentImports(const std::string& text)
     return imports;
 }
 
+bool LspServer::loadDjsonFile(const std::string& filePath) {
+    try {
+        std::error_code ec;
+        if (!fs::exists(filePath, ec) || fs::is_directory(filePath, ec)) return false;
+
+        auto ftime = fs::last_write_time(filePath, ec);
+        int64_t mtime = 0;
+        if (!ec) {
+            mtime = std::chrono::duration_cast<std::chrono::milliseconds>(ftime.time_since_epoch()).count();
+        }
+        djsonFileMtimes[filePath] = mtime;
+
+        std::ifstream file(filePath, std::ios::in | std::ios::binary);
+        if (!file.is_open()) return false;
+        std::stringstream ss;
+        ss << file.rdbuf();
+        std::string fileContent = ss.str();
+
+        Json root = JsonParser::parse(fileContent);
+        if (root.type != JsonType::Object) return false;
+
+        std::string modPath = root.contains("module") ? root["module"].asString() : "";
+        if (modPath.empty()) {
+            fs::path p(filePath);
+            std::string stem = p.filename().string();
+            if (stem.ends_with(".d.json")) stem = stem.substr(0, stem.size() - 7);
+            modPath = stem;
+        }
+
+        ResolvedModule mod;
+        mod.path = modPath;
+        mod.isStandard = modPath.starts_with("std/");
+        if (root.contains("doc")) mod.doc = root["doc"].asString();
+
+        if (root.contains("globalAlias")) {
+            const Json& ga = root["globalAlias"];
+            if (ga.type == JsonType::String) {
+                mod.globalAliases.push_back(ga.asString());
+            } else if (ga.type == JsonType::Array) {
+                for (const auto& item : ga.arrVal) {
+                    if (item.type == JsonType::String) {
+                        mod.globalAliases.push_back(item.asString());
+                    }
+                }
+            }
+        }
+
+        auto parseSymbol = [](const Json& sJson) -> ExportedSymbol {
+            ExportedSymbol s;
+            s.name = sJson.contains("name") ? sJson["name"].asString() : "";
+            std::string kindStr = sJson.contains("kind") ? sJson["kind"].asString() : "function";
+            if (kindStr == "function") s.kind = 3;
+            else if (kindStr == "method") s.kind = 2;
+            else if (kindStr == "class") s.kind = 7;
+            else if (kindStr == "constant") s.kind = 21;
+            else if (kindStr == "variable") s.kind = 6;
+            else if (kindStr == "property") s.kind = 10;
+            else if (kindStr == "module") s.kind = 9;
+            else s.kind = 3;
+
+            if (sJson.contains("signature")) s.signature = sJson["signature"].asString();
+            else s.signature = s.name;
+            if (sJson.contains("doc")) s.doc = sJson["doc"].asString();
+
+            if (sJson.contains("parameters") && sJson["parameters"].type == JsonType::Array) {
+                for (const auto& p : sJson["parameters"].arrVal) {
+                    if (p.type == JsonType::String) s.parameters.push_back(p.asString());
+                    else if (p.type == JsonType::Object && p.contains("name")) s.parameters.push_back(p["name"].asString());
+                }
+            }
+
+            if (sJson.contains("members") && sJson["members"].type == JsonType::Array) {
+                for (const auto& mJson : sJson["members"].arrVal) {
+                    ExportedSymbol m;
+                    m.name = mJson.contains("name") ? mJson["name"].asString() : "";
+                    std::string mKind = mJson.contains("kind") ? mJson["kind"].asString() : "method";
+                    if (mKind == "method") m.kind = 2;
+                    else if (mKind == "property") m.kind = 10;
+                    else if (mKind == "constant") m.kind = 21;
+                    else m.kind = 2;
+
+                    m.signature = mJson.contains("signature") ? mJson["signature"].asString() : m.name;
+                    if (mJson.contains("doc")) m.doc = mJson["doc"].asString();
+                    if (mJson.contains("parameters") && mJson["parameters"].type == JsonType::Array) {
+                        for (const auto& p : mJson["parameters"].arrVal) {
+                            if (p.type == JsonType::String) m.parameters.push_back(p.asString());
+                            else if (p.type == JsonType::Object && p.contains("name")) m.parameters.push_back(p["name"].asString());
+                        }
+                    }
+                    s.members.push_back(std::move(m));
+                }
+            }
+            return s;
+        };
+
+        if (root.contains("symbols") && root["symbols"].type == JsonType::Array) {
+            for (const auto& sJson : root["symbols"].arrVal) {
+                mod.symbols.push_back(parseSymbol(sJson));
+            }
+        }
+
+        djsonModules[modPath] = mod;
+        std::string alt = modPath;
+        std::replace(alt.begin(), alt.end(), '/', '_');
+        if (alt != modPath) {
+            djsonModules[alt] = mod;
+        }
+
+        for (const auto& alias : mod.globalAliases) {
+            bool isSymbol = false;
+            for (const auto& s : mod.symbols) {
+                if (s.name == alias) {
+                    globalAliasSymbolMap[alias] = s;
+                    isSymbol = true;
+                    break;
+                }
+            }
+            if (!isSymbol) {
+                globalAliasModuleMap[alias] = modPath;
+            }
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+void LspServer::scanDjsonModules() {
+    std::vector<fs::path> dirs;
+    if (!workspaceRoot.empty()) {
+        dirs.push_back(fs::path(workspaceRoot) / "plugins");
+        dirs.push_back(fs::path(workspaceRoot) / "lib");
+        dirs.push_back(fs::path(workspaceRoot));
+    }
+    dirs.push_back(fs::path("./plugins"));
+    dirs.push_back(fs::path("./lib"));
+
+    std::string exeDir = getExecutableDir();
+    if (!exeDir.empty()) {
+        dirs.push_back(fs::path(exeDir) / "plugins");
+        dirs.push_back(fs::path(exeDir) / "lib");
+        dirs.push_back(fs::path(exeDir) / ".." / "plugins");
+    }
+
+    const char* envPath = std::getenv("EASYSCRIPT_PATH");
+    if (envPath && *envPath) {
+        std::stringstream ss(envPath);
+        std::string item;
+#ifdef _WIN32
+        char delim = ';';
+#else
+        char delim = ':';
+#endif
+        while (std::getline(ss, item, delim)) {
+            if (!item.empty()) dirs.push_back(fs::path(item));
+        }
+    }
+
+    std::unordered_set<std::string> scannedDirs;
+    for (const auto& d : dirs) {
+        try {
+            std::error_code ec;
+            if (!fs::exists(d, ec) || !fs::is_directory(d, ec)) continue;
+            std::string canonicalDir = fs::canonical(d, ec).string();
+            if (scannedDirs.count(canonicalDir)) continue;
+            scannedDirs.insert(canonicalDir);
+
+            for (const auto& entry : fs::directory_iterator(d, ec)) {
+                if (ec) break;
+                if (entry.is_regular_file()) {
+                    std::string filename = entry.path().filename().string();
+                    if (filename.ends_with(".d.json")) {
+                        loadDjsonFile(entry.path().string());
+                    }
+                }
+            }
+        } catch (...) {}
+    }
+}
+
+void LspServer::checkDjsonReload() {
+    for (const auto& [filePath, oldMtime] : djsonFileMtimes) {
+        std::error_code ec;
+        if (fs::exists(filePath, ec)) {
+            auto ftime = fs::last_write_time(filePath, ec);
+            if (!ec) {
+                int64_t newMtime = std::chrono::duration_cast<std::chrono::milliseconds>(ftime.time_since_epoch()).count();
+                if (newMtime > oldMtime) {
+                    loadDjsonFile(filePath);
+                }
+            }
+        }
+    }
+}
+
 ResolvedModule LspServer::resolveModule(const std::string& currentDocUri, const std::string& importPath) {
     ResolvedModule mod;
     mod.path = importPath;
 
-    // 1. 標準庫模組判定
+    checkDjsonReload();
+
+    // 1. 優先查 .d.json 模組快取
+    auto it = djsonModules.find(importPath);
+    if (it != djsonModules.end()) {
+        return it->second;
+    }
+    std::string alt = importPath;
+    std::replace(alt.begin(), alt.end(), '/', '_');
+    it = djsonModules.find(alt);
+    if (it != djsonModules.end()) {
+        return it->second;
+    }
+
+    // 嘗試動態搜尋該模組的 .d.json 檔案
+    std::vector<std::string> candidateNames = {
+        importPath + ".d.json",
+        alt + ".d.json"
+    };
+    std::vector<fs::path> searchDirs;
+    if (!workspaceRoot.empty()) {
+        searchDirs.push_back(fs::path(workspaceRoot) / "plugins");
+        searchDirs.push_back(fs::path(workspaceRoot) / "lib");
+        searchDirs.push_back(fs::path(workspaceRoot));
+    }
+    searchDirs.push_back(fs::path("./plugins"));
+    searchDirs.push_back(fs::path("./lib"));
+    std::string exeDir = getExecutableDir();
+    if (!exeDir.empty()) {
+        searchDirs.push_back(fs::path(exeDir) / "plugins");
+        searchDirs.push_back(fs::path(exeDir) / ".." / "plugins");
+    }
+    for (const auto& d : searchDirs) {
+        for (const auto& name : candidateNames) {
+            fs::path p = d / name;
+            std::error_code ec;
+            if (fs::exists(p, ec) && !fs::is_directory(p, ec)) {
+                if (loadDjsonFile(p.string())) {
+                    if (djsonModules.count(importPath)) return djsonModules[importPath];
+                    if (djsonModules.count(alt)) return djsonModules[alt];
+                }
+            }
+        }
+    }
+
+    // 備用相容硬編碼:
     if (importPath == "std/io") {
         mod.isStandard = true;
         mod.symbols.push_back({"write", 3, 0, 0, 5, "write(...args): void", "Prints arguments to stdout without automatic newline."});
@@ -1322,11 +1592,13 @@ Json LspServer::handleCompletion(const std::string& uri, int line, int character
     // 1. 模組路徑補全 (import "..." 或 from "...")
     if (prefix.find("import \"") != std::string::npos || prefix.find("from \"") != std::string::npos ||
         prefix.find("import '") != std::string::npos || prefix.find("from '") != std::string::npos) {
-        addCompletion(items, "std/io", 9, "module std/io", "Standard I/O, terminal colors, and cursor control.");
-        addCompletion(items, "std/fs", 9, "module std/fs", "Filesystem reading, writing, and directory operations.");
-        addCompletion(items, "std/path", 9, "module std/path", "Path manipulation, normalization, and joining.");
-        addCompletion(items, "std/os", 9, "module std/os", "Operating system environment, platform, and processes.");
-        addCompletion(items, "std/math", 9, "module std/math", "Mathematical functions, trigonometry, and constants.");
+        checkDjsonReload();
+        std::unordered_set<std::string> seenMods;
+        for (const auto& [modId, m] : djsonModules) {
+            if (seenMods.insert(m.path).second) {
+                addCompletion(items, m.path, 9, "module " + m.path, m.doc.empty() ? ("Module " + m.path) : m.doc);
+            }
+        }
 
         // 搜尋當前檔案同層目錄下的 .easy 與 .esc 模組
         std::string currentPath = uriToPath(uri);
@@ -1397,25 +1669,22 @@ Json LspServer::handleCompletion(const std::string& uri, int line, int character
             }
         }
 
+        // A. 優先檢查 root 是否為全域別名類別 (例如 Terminal, Color, Prompt)
+        if (globalAliasSymbolMap.count(root)) {
+            const auto& sym = globalAliasSymbolMap[root];
+            if (!sym.members.empty()) {
+                addSymbols(sym.members);
+                return items;
+            }
+        }
+
         ResolvedModule mod;
         bool foundMod = false;
         if (matchedImp) {
             mod = resolveModule(uri, matchedImp->modulePath);
             foundMod = true;
-        } else if (root == "io") {
-            mod = resolveModule(uri, "std/io");
-            foundMod = true;
-        } else if (root == "fs") {
-            mod = resolveModule(uri, "std/fs");
-            foundMod = true;
-        } else if (root == "path") {
-            mod = resolveModule(uri, "std/path");
-            foundMod = true;
-        } else if (root == "os") {
-            mod = resolveModule(uri, "std/os");
-            foundMod = true;
-        } else if (root == "Math" || root == "math") {
-            mod = resolveModule(uri, "std/math");
+        } else if (globalAliasModuleMap.count(root)) {
+            mod = resolveModule(uri, globalAliasModuleMap[root]);
             foundMod = true;
         }
 
@@ -1436,10 +1705,10 @@ Json LspServer::handleCompletion(const std::string& uri, int line, int character
             }
         }
 
-        // B. 檢查 root 是否為直接全域類別 (例如 Terminal, Color, Prompt)
-        ResolvedModule ioMod = resolveModule(uri, "std/io");
-        for (const auto& sym : ioMod.symbols) {
-            if (sym.name == root && !sym.members.empty()) {
+        // B. 檢查 root 是否為全域別名類別 (例如 Terminal, Color, Prompt)
+        if (globalAliasSymbolMap.count(root)) {
+            const auto& sym = globalAliasSymbolMap[root];
+            if (!sym.members.empty()) {
                 addSymbols(sym.members);
                 return items;
             }
@@ -1485,14 +1754,21 @@ Json LspServer::handleCompletion(const std::string& uri, int line, int character
     addCompletion(items, "print", 3, "print(value: any): void", "Prints value to stdout with newline.");
     addCompletion(items, "println", 3, "println(value: any): void", "Prints value to stdout with newline.");
     addCompletion(items, "assert", 3, "assert(condition: bool, message = ''): void", "Asserts condition is true.");
-    addCompletion(items, "io", 9, "module std/io", "Standard I/O, terminal colors, and cursor control.");
-    addCompletion(items, "fs", 9, "module std/fs", "Filesystem reading, writing, and directory operations.");
-    addCompletion(items, "path", 9, "module std/path", "Path manipulation, normalization, and joining.");
-    addCompletion(items, "os", 9, "module std/os", "Operating system environment, platform, and processes.");
-    addCompletion(items, "Math", 7, "module Math", "Standard math module.");
-    addCompletion(items, "Terminal", 7, "class Terminal", "Standard terminal manipulation class.");
-    addCompletion(items, "Color", 7, "class Color", "Standard ANSI terminal color class.");
-    addCompletion(items, "Prompt", 7, "class Prompt", "Standard CLI prompt dialog class.");
+    std::unordered_set<std::string> seenGlobalAliases;
+    for (const auto& [alias, sym] : globalAliasSymbolMap) {
+        if (seenGlobalAliases.insert(alias).second) {
+            addCompletion(items, alias, sym.kind, sym.signature, sym.doc);
+        }
+    }
+    for (const auto& [alias, modPath] : globalAliasModuleMap) {
+        if (seenGlobalAliases.insert(alias).second) {
+            std::string doc = "module " + modPath;
+            if (djsonModules.count(modPath) && !djsonModules[modPath].doc.empty()) {
+                doc = djsonModules[modPath].doc;
+            }
+            addCompletion(items, alias, 9, "module " + modPath, doc);
+        }
+    }
 
     // 6. 加入所有已匯入的別名與具名符號
     for (const auto& imp : docImports) {
@@ -1578,20 +1854,27 @@ Json LspServer::handleHover(const std::string& uri, int line, int character) {
             }
         }
 
-        // 檢查未顯式 import 的標準命名空間 (io, fs, path, os, Math)
-        std::string stdPath;
-        if (ctx.parentObject == "io") stdPath = "std/io";
-        else if (ctx.parentObject == "fs") stdPath = "std/fs";
-        else if (ctx.parentObject == "path") stdPath = "std/path";
-        else if (ctx.parentObject == "os") stdPath = "std/os";
-        else if (ctx.parentObject == "Math" || ctx.parentObject == "math") stdPath = "std/math";
+        // 檢查模組成員 (包含 globalAlias 與 import 模組，例如 fs.readText, sample_plugin.greet)
+        std::string modPath;
+        if (globalAliasModuleMap.count(ctx.parentObject)) {
+            modPath = globalAliasModuleMap[ctx.parentObject];
+        } else if (djsonModules.count(ctx.parentObject)) {
+            modPath = ctx.parentObject;
+        } else {
+            for (const auto& imp : docImports) {
+                if (imp.alias == ctx.parentObject || imp.modulePath == ctx.parentObject) {
+                    modPath = imp.modulePath;
+                    break;
+                }
+            }
+        }
 
-        if (!stdPath.empty()) {
-            ResolvedModule mod = resolveModule(uri, stdPath);
+        if (!modPath.empty()) {
+            ResolvedModule mod = resolveModule(uri, modPath);
             for (const auto& s : mod.symbols) {
                 if (s.name == ctx.word) {
                     std::string doc = "```easyscript\n" + s.signature + "\n```\n\n";
-                    doc += "*From standard library `" + stdPath + "`*\n\n";
+                    doc += "*From `" + modPath + "`*\n\n";
                     if (!s.doc.empty()) doc += s.doc + "\n";
                     Json result = Json::object();
                     Json contents = Json::object();
@@ -1603,22 +1886,20 @@ Json LspServer::handleHover(const std::string& uri, int line, int character) {
             }
         }
 
-        // 檢查 parentObject 是否為標準類別 (例如 Terminal.clear, Color.red, Prompt.ask)
-        ResolvedModule ioMod = resolveModule(uri, "std/io");
-        for (const auto& sym : ioMod.symbols) {
-            if (sym.name == ctx.parentObject) {
-                for (const auto& m : sym.members) {
-                    if (m.name == ctx.word) {
-                        std::string doc = "```easyscript\n" + m.signature + "\n```\n\n";
-                        doc += "*From `" + sym.name + "` (`std/io`)*\n\n";
-                        if (!m.doc.empty()) doc += m.doc + "\n";
-                        Json result = Json::object();
-                        Json contents = Json::object();
-                        contents["kind"] = "markdown";
-                        contents["value"] = doc;
-                        result["contents"] = contents;
-                        return result;
-                    }
+        // 檢查 parentObject 是否為全域別名類別 (例如 Terminal.clear, Color.red, Prompt.ask)
+        if (globalAliasSymbolMap.count(ctx.parentObject)) {
+            const auto& sym = globalAliasSymbolMap[ctx.parentObject];
+            for (const auto& m : sym.members) {
+                if (m.name == ctx.word) {
+                    std::string doc = "```easyscript\n" + m.signature + "\n```\n\n";
+                    doc += "*From `" + sym.name + "`*\n\n";
+                    if (!m.doc.empty()) doc += m.doc + "\n";
+                    Json result = Json::object();
+                    Json contents = Json::object();
+                    contents["kind"] = "markdown";
+                    contents["value"] = doc;
+                    result["contents"] = contents;
+                    return result;
                 }
             }
         }
@@ -1680,14 +1961,15 @@ Json LspServer::handleHover(const std::string& uri, int line, int character) {
         doc = "**print(value: any): void**\n\nBuilt-in function to print formatted string to standard output.";
     } else if (ctx.word == "assert") {
         doc = "**assert(condition: bool, message = ''): void**\n\nAsserts condition is true, throwing error otherwise.";
-    } else if (ctx.word == "Terminal") {
-        doc = "**class Terminal** (`std/io`)\n\nProvides cursor position control, screen clearing, and terminal metrics.";
-    } else if (ctx.word == "Color") {
-        doc = "**class Color** (`std/io`)\n\nProvides ANSI text styling, foreground/background colors, and RGB formatting.";
-    } else if (ctx.word == "Prompt") {
-        doc = "**class Prompt** (`std/io`)\n\nInteractive CLI prompt utilities for user input, confirmation, and password masking.";
-    } else if (ctx.word == "Math") {
-        doc = "**module Math** (`std/math`)\n\nStandard mathematical functions and constants (`PI`, `E`, `sqrt`, `pow`, `random`).";
+    } else if (globalAliasSymbolMap.count(ctx.word)) {
+        const auto& sym = globalAliasSymbolMap[ctx.word];
+        doc = "**" + sym.signature + "**\n\n" + sym.doc;
+    } else if (globalAliasModuleMap.count(ctx.word)) {
+        std::string modPath = globalAliasModuleMap[ctx.word];
+        if (djsonModules.count(modPath)) {
+            const auto& m = djsonModules[modPath];
+            doc = "**module " + m.path + "**\n\n" + m.doc;
+        }
     }
 
     if (doc.empty()) {
@@ -1759,36 +2041,115 @@ Json LspServer::handleSignatureHelp(const std::string& uri, int line, int charac
     if (wordEnd <= wordStart) return Json();
     std::string fnName = lineStr.substr(wordStart, wordEnd - wordStart);
 
-    const auto& allMembers = getBuiltinMembers();
-    std::vector<const BuiltinMemberInfo*> matches;
-    for (const auto& bm : allMembers) {
-        if (bm.isMethod && bm.name == fnName) {
-            matches.push_back(&bm);
+    // 檢查是否有 parentObject (例如 fs.readText( 或 Terminal.setCursor()
+    std::string parentObj;
+    int parentP = wordStart - 1;
+    while (parentP >= 0 && (lineStr[parentP] == ' ' || lineStr[parentP] == '\t')) parentP--;
+    if (parentP >= 0 && lineStr[parentP] == '.') {
+        parentP--;
+        while (parentP >= 0 && (lineStr[parentP] == ' ' || lineStr[parentP] == '\t')) parentP--;
+        int pEnd = parentP + 1;
+        while (parentP >= 0 && (std::isalnum(static_cast<unsigned char>(lineStr[parentP])) || lineStr[parentP] == '_' || lineStr[parentP] == '$')) parentP--;
+        int pStart = parentP + 1;
+        if (pEnd > pStart) {
+            parentObj = lineStr.substr(pStart, pEnd - pStart);
         }
     }
-
-    if (matches.empty()) return Json();
 
     Json result = Json::object();
     Json signatures = Json::array();
-    for (const auto* m : matches) {
-        Json sig = Json::object();
-        sig["label"] = m->signature;
-        if (!m->doc.empty()) {
-            Json doc = Json::object();
-            doc["kind"] = "markdown";
-            doc["value"] = m->doc;
-            sig["documentation"] = doc;
+
+    // 1. 檢查模組函式 (包含 globalAlias 與 import 模組)
+    std::string modPath;
+    if (!parentObj.empty()) {
+        if (globalAliasModuleMap.count(parentObj)) {
+            modPath = globalAliasModuleMap[parentObj];
+        } else if (djsonModules.count(parentObj)) {
+            modPath = parentObj;
+        } else {
+            std::vector<ImportInfo> docImports = parseDocumentImports(text);
+            for (const auto& imp : docImports) {
+                if (imp.alias == parentObj || imp.modulePath == parentObj) {
+                    modPath = imp.modulePath;
+                    break;
+                }
+            }
         }
-        Json params = Json::array();
-        for (const auto& pName : m->paramNames) {
-            Json paramObj = Json::object();
-            paramObj["label"] = pName;
-            params.push_back(paramObj);
-        }
-        sig["parameters"] = params;
-        signatures.push_back(sig);
     }
+
+    if (!modPath.empty()) {
+        ResolvedModule mod = resolveModule(uri, modPath);
+        for (const auto& sym : mod.symbols) {
+            if (sym.name == fnName) {
+                Json sig = Json::object();
+                sig["label"] = sym.signature;
+                if (!sym.doc.empty()) {
+                    Json d = Json::object();
+                    d["kind"] = "markdown";
+                    d["value"] = sym.doc;
+                    sig["documentation"] = d;
+                }
+                Json pars = Json::array();
+                for (const auto& pName : sym.parameters) {
+                    Json pObj = Json::object();
+                    pObj["label"] = pName;
+                    pars.push_back(pObj);
+                }
+                sig["parameters"] = pars;
+                signatures.push_back(sig);
+            }
+        }
+    }
+
+    // 2. 檢查 globalAlias 類別方法
+    if (!parentObj.empty() && globalAliasSymbolMap.count(parentObj)) {
+        const auto& clsSym = globalAliasSymbolMap[parentObj];
+        for (const auto& mem : clsSym.members) {
+            if (mem.name == fnName) {
+                Json sig = Json::object();
+                sig["label"] = mem.signature;
+                if (!mem.doc.empty()) {
+                    Json d = Json::object();
+                    d["kind"] = "markdown";
+                    d["value"] = mem.doc;
+                    sig["documentation"] = d;
+                }
+                Json pars = Json::array();
+                for (const auto& pName : mem.parameters) {
+                    Json pObj = Json::object();
+                    pObj["label"] = pName;
+                    pars.push_back(pObj);
+                }
+                sig["parameters"] = pars;
+                signatures.push_back(sig);
+            }
+        }
+    }
+
+    // 3. 檢查基礎型別內建方法
+    const auto& allMembers = getBuiltinMembers();
+    for (const auto& bm : allMembers) {
+        if (bm.isMethod && bm.name == fnName) {
+            Json sig = Json::object();
+            sig["label"] = bm.signature;
+            if (!bm.doc.empty()) {
+                Json doc = Json::object();
+                doc["kind"] = "markdown";
+                doc["value"] = bm.doc;
+                sig["documentation"] = doc;
+            }
+            Json params = Json::array();
+            for (const auto& pName : bm.paramNames) {
+                Json paramObj = Json::object();
+                paramObj["label"] = pName;
+                params.push_back(paramObj);
+            }
+            sig["parameters"] = params;
+            signatures.push_back(sig);
+        }
+    }
+
+    if (signatures.arrVal.empty()) return Json();
 
     result["signatures"] = signatures;
     result["activeSignature"] = 0;

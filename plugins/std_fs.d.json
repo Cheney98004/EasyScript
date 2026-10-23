@@ -1,0 +1,134 @@
+{
+  "module": "std/fs",
+  "version": "1.0.0",
+  "doc": "Filesystem operations standard library for reading, writing, and directory management.",
+  "globalAlias": ["fs"],
+  "symbols": [
+    {
+      "name": "readText",
+      "kind": "function",
+      "signature": "readText(path: string): string",
+      "doc": "Reads entire file as UTF-8 text.",
+      "parameters": [
+        { "name": "path", "type": "string", "doc": "File path" }
+      ],
+      "returnType": "string"
+    },
+    {
+      "name": "writeText",
+      "kind": "function",
+      "signature": "writeText(path: string, content: string): bool",
+      "doc": "Overwrites file with text content. Returns true on success.",
+      "parameters": [
+        { "name": "path", "type": "string", "doc": "File path" },
+        { "name": "content", "type": "string", "doc": "Content to write" }
+      ],
+      "returnType": "bool"
+    },
+    {
+      "name": "appendText",
+      "kind": "function",
+      "signature": "appendText(path: string, content: string): bool",
+      "doc": "Appends text content to file. Returns true on success.",
+      "parameters": [
+        { "name": "path", "type": "string", "doc": "File path" },
+        { "name": "content", "type": "string", "doc": "Content to append" }
+      ],
+      "returnType": "bool"
+    },
+    {
+      "name": "exists",
+      "kind": "function",
+      "signature": "exists(path: string): bool",
+      "doc": "Checks whether the specified file or directory exists.",
+      "parameters": [
+        { "name": "path", "type": "string", "doc": "File or directory path" }
+      ],
+      "returnType": "bool"
+    },
+    {
+      "name": "remove",
+      "kind": "function",
+      "signature": "remove(path: string): bool",
+      "doc": "Deletes a single file or empty directory.",
+      "parameters": [
+        { "name": "path", "type": "string", "doc": "Path to delete" }
+      ],
+      "returnType": "bool"
+    },
+    {
+      "name": "removeTree",
+      "kind": "function",
+      "signature": "removeTree(path: string): int",
+      "doc": "Recursively deletes a directory and all of its contents. Returns number of files removed.",
+      "parameters": [
+        { "name": "path", "type": "string", "doc": "Directory path" }
+      ],
+      "returnType": "int"
+    },
+    {
+      "name": "makeDir",
+      "kind": "function",
+      "signature": "makeDir(path: string): bool",
+      "doc": "Creates all missing directories along the specified path.",
+      "parameters": [
+        { "name": "path", "type": "string", "doc": "Directory path to create" }
+      ],
+      "returnType": "bool"
+    },
+    {
+      "name": "listDir",
+      "kind": "function",
+      "signature": "listDir(path: string): Array<string>",
+      "doc": "Lists filenames within the directory.",
+      "parameters": [
+        { "name": "path", "type": "string", "doc": "Directory path" }
+      ],
+      "returnType": "Array<string>"
+    },
+    {
+      "name": "stat",
+      "kind": "function",
+      "signature": "stat(path: string): Map",
+      "doc": "Retrieves file metadata map containing isDir, isFile, and size.",
+      "parameters": [
+        { "name": "path", "type": "string", "doc": "File path" }
+      ],
+      "returnType": "Map"
+    },
+    {
+      "name": "readFile",
+      "kind": "function",
+      "signature": "readFile(path: string): string",
+      "doc": "Reads entire file as UTF-8 string.",
+      "parameters": [
+        { "name": "path", "type": "string", "doc": "File path" }
+      ],
+      "returnType": "string"
+    },
+    {
+      "name": "File",
+      "kind": "class",
+      "signature": "class File",
+      "doc": "File stream manipulation class.",
+      "members": [
+        {
+          "name": "write",
+          "kind": "method",
+          "signature": "write(content: string): bool",
+          "doc": "Writes data to file.",
+          "parameters": [
+            { "name": "content", "type": "string", "doc": "Content to write" }
+          ],
+          "returnType": "bool"
+        },
+        {
+          "name": "size",
+          "kind": "property",
+          "signature": "size: int",
+          "doc": "File size in bytes."
+        }
+      ]
+    }
+  ]
+}

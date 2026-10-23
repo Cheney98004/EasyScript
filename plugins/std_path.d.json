@@ -1,0 +1,78 @@
+{
+  "module": "std/path",
+  "version": "1.0.0",
+  "doc": "Filesystem path manipulation, normalization, and joining standard library.",
+  "globalAlias": ["path"],
+  "symbols": [
+    {
+      "name": "join",
+      "kind": "function",
+      "signature": "join(...parts: string): string",
+      "doc": "Joins path segments with normalized separators.",
+      "parameters": [
+        { "name": "...parts", "type": "string", "doc": "Path components" }
+      ],
+      "returnType": "string"
+    },
+    {
+      "name": "dirname",
+      "kind": "function",
+      "signature": "dirname(path: string): string",
+      "doc": "Gets directory name portion of path.",
+      "parameters": [
+        { "name": "path", "type": "string", "doc": "Path string" }
+      ],
+      "returnType": "string"
+    },
+    {
+      "name": "basename",
+      "kind": "function",
+      "signature": "basename(path: string): string",
+      "doc": "Gets filename or last component of path.",
+      "parameters": [
+        { "name": "path", "type": "string", "doc": "Path string" }
+      ],
+      "returnType": "string"
+    },
+    {
+      "name": "extname",
+      "kind": "function",
+      "signature": "extname(path: string): string",
+      "doc": "Gets file extension of path including leading dot.",
+      "parameters": [
+        { "name": "path", "type": "string", "doc": "Path string" }
+      ],
+      "returnType": "string"
+    },
+    {
+      "name": "isAbsolute",
+      "kind": "function",
+      "signature": "isAbsolute(path: string): bool",
+      "doc": "Checks whether the path is absolute.",
+      "parameters": [
+        { "name": "path", "type": "string", "doc": "Path string" }
+      ],
+      "returnType": "bool"
+    },
+    {
+      "name": "resolve",
+      "kind": "function",
+      "signature": "resolve(...paths: string): string",
+      "doc": "Resolves sequence of paths into an absolute canonical path.",
+      "parameters": [
+        { "name": "...paths", "type": "string", "doc": "Paths to resolve" }
+      ],
+      "returnType": "string"
+    },
+    {
+      "name": "normalize",
+      "kind": "function",
+      "signature": "normalize(path: string): string",
+      "doc": "Normalizes path separators (replaces backslashes with forward slashes).",
+      "parameters": [
+        { "name": "path", "type": "string", "doc": "Path string" }
+      ],
+      "returnType": "string"
+    }
+  ]
+}

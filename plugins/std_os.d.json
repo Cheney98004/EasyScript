@@ -1,0 +1,91 @@
+{
+  "module": "std/os",
+  "version": "1.0.0",
+  "doc": "Operating system environment, process, and hardware info standard library.",
+  "globalAlias": ["os"],
+  "symbols": [
+    {
+      "name": "platform",
+      "kind": "function",
+      "signature": "platform(): string",
+      "doc": "Returns host operating system ('windows', 'linux', or 'macos').",
+      "parameters": [],
+      "returnType": "string"
+    },
+    {
+      "name": "arch",
+      "kind": "function",
+      "signature": "arch(): string",
+      "doc": "Returns host architecture ('x86_64', 'arm64', or 'x86').",
+      "parameters": [],
+      "returnType": "string"
+    },
+    {
+      "name": "getEnv",
+      "kind": "function",
+      "signature": "getEnv(name: string): string | nil",
+      "doc": "Gets value of environment variable, or nil if not set.",
+      "parameters": [
+        { "name": "name", "type": "string", "doc": "Environment variable name" }
+      ],
+      "returnType": "string"
+    },
+    {
+      "name": "setEnv",
+      "kind": "function",
+      "signature": "setEnv(name: string, val: string): bool",
+      "doc": "Sets value of environment variable. Returns true on success.",
+      "parameters": [
+        { "name": "name", "type": "string", "doc": "Environment variable name" },
+        { "name": "val", "type": "string", "doc": "Value to set" }
+      ],
+      "returnType": "bool"
+    },
+    {
+      "name": "cwd",
+      "kind": "function",
+      "signature": "cwd(): string",
+      "doc": "Gets current working directory.",
+      "parameters": [],
+      "returnType": "string"
+    },
+    {
+      "name": "chdir",
+      "kind": "function",
+      "signature": "chdir(path: string): bool",
+      "doc": "Changes current working directory.",
+      "parameters": [
+        { "name": "path", "type": "string", "doc": "Directory path" }
+      ],
+      "returnType": "bool"
+    },
+    {
+      "name": "exec",
+      "kind": "function",
+      "signature": "exec(command: string): int",
+      "doc": "Executes shell command synchronously and returns process exit code.",
+      "parameters": [
+        { "name": "command", "type": "string", "doc": "Command line string" }
+      ],
+      "returnType": "int"
+    },
+    {
+      "name": "cpuCount",
+      "kind": "function",
+      "signature": "cpuCount(): int",
+      "doc": "Returns hardware concurrency CPU core count.",
+      "parameters": [],
+      "returnType": "int"
+    },
+    {
+      "name": "exit",
+      "kind": "function",
+      "signature": "exit(code: int = 0): void",
+      "doc": "Terminates current process with status code.",
+      "parameters": [
+        { "name": "code", "type": "int", "doc": "Exit status code", "optional": true, "default": "0" }
+      ],
+      "returnType": "void"
+    }
+  ]
+}
