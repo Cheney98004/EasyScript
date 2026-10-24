@@ -11,6 +11,8 @@
 #include <algorithm>
 #include <cctype>
 #include <iomanip>
+#include <filesystem>
+#include "lsp/mini_json.hpp"
 
 // -----------------------------------------------------------------------------
 // 原生函式預設實作
@@ -1840,6 +1842,56 @@ ObjModule* VM::loadModule(const std::string& path) {
     bool isRelativeOrAbsolute = path.starts_with("./") || path.starts_with("../") || 
                                 (path.size() >= 2 && path[1] == ':') || path.starts_with("/");
     if (!isRelativeOrAbsolute) {
+        // 1. EasyScript 模組套件解析 (easy_modules/)
+        // 支援從目前目錄向上查找最多 5 層目錄中的 easy_modules/<path>
+        std::error_code ec;
+        std::filesystem::path currentDir = std::filesystem::current_path(ec);
+        if (!ec) {
+            std::filesystem::path checkDir = currentDir;
+            for (int depth = 0; depth < 5; ++depth) {
+                std::filesystem::path modPkgDir = checkDir / "easy_modules" / path;
+                if (std::filesystem::is_directory(modPkgDir, ec)) {
+                    // 若存在 easy.json 或 package.json，讀取 main 進入點
+                    std::filesystem::path easyJson = modPkgDir / "easy.json";
+                    if (!std::filesystem::exists(easyJson, ec)) {
+                        easyJson = modPkgDir / "package.json";
+                    }
+                    bool foundMain = false;
+                    if (std::filesystem::exists(easyJson, ec)) {
+                        std::ifstream jf(easyJson);
+                        if (jf.is_open()) {
+                            std::stringstream ss;
+                            ss << jf.rdbuf();
+                            try {
+                                lsp::Json root = lsp::JsonParser::parse(ss.str());
+                                if (root.isObject() && root.contains("main") && root["main"].isString()) {
+                                    std::string mainFile = root["main"].asString();
+                                    std::filesystem::path mainPath = modPkgDir / mainFile;
+                                    searchBases.push_back(mainPath.generic_string());
+                                    foundMain = true;
+                                }
+                            } catch (...) {}
+                        }
+                    }
+                    if (!foundMain) {
+                        searchBases.push_back((modPkgDir / "index.easy").generic_string());
+                        searchBases.push_back((modPkgDir / "index.esc").generic_string());
+                        searchBases.push_back((modPkgDir / "index.ecs").generic_string());
+                        searchBases.push_back((modPkgDir / (path + ".easy")).generic_string());
+                        searchBases.push_back((modPkgDir / (path + ".esc")).generic_string());
+                        searchBases.push_back((modPkgDir / path).generic_string());
+                    }
+                    break;
+                } else if (std::filesystem::exists(modPkgDir, ec)) {
+                    searchBases.push_back(modPkgDir.generic_string());
+                    break;
+                }
+                if (!checkDir.has_parent_path() || checkDir.parent_path() == checkDir) break;
+                checkDir = checkDir.parent_path();
+            }
+        }
+
+        searchBases.push_back("./easy_modules/" + path);
         searchBases.push_back("./" + path);
         searchBases.push_back("./lib/" + path);
         searchBases.push_back("./plugins/" + path);

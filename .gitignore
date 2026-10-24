@@ -7,3 +7,6 @@
 !/plugins/*.d.json
 /tests
 /*.py
+/examples
+/easy_modules
+easy_modules/

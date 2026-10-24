@@ -59,6 +59,13 @@ add_executable(easyscript src/main.cpp)
 target_link_libraries(easyscript PRIVATE easyscript_core)
 set_target_properties(easyscript PROPERTIES ENABLE_EXPORTS ON)
 
+# 模組管理工具 (EasyScript Package Manager CLI)
+add_executable(epm src/epm/main.cpp)
+target_include_directories(epm PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/epm
+)
+
 # -----------------------------------------------------------------------------
 # 標準庫與外掛動態鏈結庫 (Standard Library & Extension Plugins)
 # -----------------------------------------------------------------------------
@@ -84,4 +91,27 @@ add_easyscript_plugin(std_math src/stdlib/std_math.cpp std_math)
 add_easyscript_plugin(std_io src/stdlib/std_io.cpp std_io)
 
 # 測試可執行檔 alias
-add_custom_target(easyscript_test DEPENDS easyscript sample_plugin std_fs std_path std_os std_math std_io)
+add_custom_target(easyscript_test DEPENDS easyscript epm sample_plugin std_fs std_path std_os std_math std_io)
+
+# -----------------------------------------------------------------------------
+# 安裝配置 (Installation Rules)
+# -----------------------------------------------------------------------------
+include(GNUInstallDirs)
+
+install(TARGETS easyscript epm
+    RUNTIME DESTINATION bin
+)
+
+install(TARGETS sample_plugin std_fs std_path std_os std_math std_io
+    LIBRARY DESTINATION plugins
+    RUNTIME DESTINATION plugins
+)
+
+install(DIRECTORY plugins/
+    DESTINATION plugins
+    FILES_MATCHING PATTERN "*.d.json"
+)
+
+install(DIRECTORY include/
+    DESTINATION include/easyscript
+)
