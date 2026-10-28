@@ -33,6 +33,7 @@ std::string_view opCodeName(OpCode op) noexcept {
         case OpCode::OP_BUILD_RANGE:   return "OP_BUILD_RANGE";
         case OpCode::OP_GET_INDEX:     return "OP_GET_INDEX";
         case OpCode::OP_SET_INDEX:     return "OP_SET_INDEX";
+        case OpCode::OP_SLICE:         return "OP_SLICE";
         case OpCode::OP_CALL:          return "OP_CALL";
         case OpCode::OP_RETURN:        return "OP_RETURN";
         case OpCode::OP_CLOSURE:       return "OP_CLOSURE";

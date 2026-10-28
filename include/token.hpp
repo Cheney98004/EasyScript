@@ -30,6 +30,7 @@ enum class TokenType : uint16_t {
     // 一或二字元符號
     // -------------------------------------------------------------------------
     ARROW,              // ->
+    FAT_ARROW,          // =>
     DOT_DOT,            // .. (Range 區間運算子)
     BANG,               // !
     BANG_EQUAL,         // !=

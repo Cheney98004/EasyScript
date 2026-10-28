@@ -142,6 +142,7 @@ private:
     void consume(TokenType type, std::string_view message);
     bool check(TokenType type) const noexcept;
     bool match(TokenType type) noexcept;
+    bool isArrowFunctionAhead();
     void errorAt(const Token& token, std::string_view message);
     void error(std::string_view message);
     void errorAtCurrent(std::string_view message);
@@ -223,6 +224,7 @@ private:
     void this_(bool canAssign);
     void super_(bool canAssign);
     void lambda(bool canAssign);
+    void arrowFunction(bool canAssign);
     void arrayLiteral(bool canAssign);
     void mapLiteral(bool canAssign);
     void interpolation(bool canAssign);

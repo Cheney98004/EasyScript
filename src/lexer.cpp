@@ -311,6 +311,7 @@ Token Lexer::nextToken() {
 
         case '=':
             if (match('=')) return makeToken(TokenType::EQUAL_EQUAL);
+            if (match('>')) return makeToken(TokenType::FAT_ARROW);
             return makeToken(TokenType::EQUAL);
 
         case '<':

@@ -804,11 +804,31 @@ bool VM::invokeArrayMethod(ObjArray* arr, const std::string& name, uint8_t argCo
         return finish(Value(strH));
     }
     if (name == "slice") {
-        if (argCount < 1 || argCount > 2 || !args[0].isInt()) {
-            runtimeError("slice(start: int, [end: int]) expects 1 or 2 integer arguments.");
+        if (argCount < 1 || argCount > 2) {
+            runtimeError("slice(start, [end]) expects 1 or 2 arguments.");
             return false;
         }
         int64_t len = static_cast<int64_t>(arr->elements.size());
+        if (argCount == 1 && args[0].isObject()) {
+            if (auto* rng = heap.getAs<ObjRange>(*args[0].asObject())) {
+                int64_t start = rng->start;
+                int64_t end = rng->end;
+                if (start < 0) start += len;
+                if (end < 0) end += len;
+                if (start < 0) start = 0;
+                if (end > len) end = len;
+                std::vector<Value> sub;
+                if (start < end) {
+                    sub.assign(arr->elements.begin() + start, arr->elements.begin() + end);
+                }
+                GcHandle newArr = heap.allocateArray(std::move(sub));
+                return finish(Value(newArr));
+            }
+        }
+        if (!args[0].isInt()) {
+            runtimeError("slice expects integer index or range.");
+            return false;
+        }
         int64_t start = *args[0].asInt();
         if (start < 0) start += len;
         if (start < 0) start = 0;
@@ -924,6 +944,34 @@ bool VM::invokeArrayMethod(ObjArray* arr, const std::string& name, uint8_t argCo
             acc = *res;
         }
         return finish(acc);
+    }
+    if (name == "each") {
+        if (argCount != 1) {
+            runtimeError("each(callback) expects 1 argument.");
+            return false;
+        }
+        Value callback = args[0];
+        for (size_t i = 0; i < arr->elements.size(); ++i) {
+            auto res = callCallback(callback, {arr->elements[i], Value(static_cast<int64_t>(i))});
+            if (!res.has_value()) {
+                return false;
+            }
+        }
+        return finish(receiver);
+    }
+    if (name == "each_with_index") {
+        if (argCount != 1) {
+            runtimeError("each_with_index(callback) expects 1 argument.");
+            return false;
+        }
+        Value callback = args[0];
+        for (size_t i = 0; i < arr->elements.size(); ++i) {
+            auto res = callCallback(callback, {arr->elements[i], Value(static_cast<int64_t>(i))});
+            if (!res.has_value()) {
+                return false;
+            }
+        }
+        return finish(receiver);
     }
     if (name == "forEach") {
         if (argCount != 1) {
@@ -2382,16 +2430,70 @@ InterpretResult VM::run(size_t stopDepth) {
                 }
                 GcObject* obj = heap.get(*target.asObject());
                 if (auto* arr = obj->as<ObjArray>()) {
-                    if (!index.isInt()) {
-                        runtimeError("Array index must be an integer.");
+                    int64_t size = static_cast<int64_t>(arr->elements.size());
+                    if (index.isInt()) {
+                        int64_t idx = *index.asInt();
+                        if (idx < 0) idx += size;
+                        if (idx < 0 || idx >= size) {
+                            runtimeError("Array index out of bounds: %lld.", idx);
+                            return InterpretResult::RUNTIME_ERROR;
+                        }
+                        push(arr->elements[idx]);
+                    } else if (index.isObject()) {
+                        if (auto* rng = heap.getAs<ObjRange>(*index.asObject())) {
+                            int64_t start = rng->start;
+                            int64_t end = rng->end;
+                            if (start < 0) start += size;
+                            if (end < 0) end += size;
+                            if (start < 0) start = 0;
+                            if (end > size) end = size;
+                            std::vector<Value> sliced;
+                            if (start < end) {
+                                sliced.reserve(end - start);
+                                for (int64_t i = start; i < end; ++i) {
+                                    sliced.push_back(arr->elements[i]);
+                                }
+                            }
+                            GcHandle newArrH = heap.allocateArray(std::move(sliced));
+                            push(Value(newArrH));
+                        } else {
+                            runtimeError("Array index must be an integer or range.");
+                            return InterpretResult::RUNTIME_ERROR;
+                        }
+                    } else {
+                        runtimeError("Array index must be an integer or range.");
                         return InterpretResult::RUNTIME_ERROR;
                     }
-                    int64_t idx = *index.asInt();
-                    if (idx < 0 || static_cast<size_t>(idx) >= arr->elements.size()) {
-                        runtimeError("Array index out of bounds: %lld.", idx);
+                } else if (auto* str = obj->as<ObjString>()) {
+                    int64_t size = static_cast<int64_t>(str->text.size());
+                    if (index.isInt()) {
+                        int64_t idx = *index.asInt();
+                        if (idx < 0) idx += size;
+                        if (idx < 0 || idx >= size) {
+                            runtimeError("String index out of bounds: %lld.", idx);
+                            return InterpretResult::RUNTIME_ERROR;
+                        }
+                        GcHandle chH = heap.allocateString(std::string(1, str->text[idx]));
+                        push(Value(chH));
+                    } else if (index.isObject()) {
+                        if (auto* rng = heap.getAs<ObjRange>(*index.asObject())) {
+                            int64_t start = rng->start;
+                            int64_t end = rng->end;
+                            if (start < 0) start += size;
+                            if (end < 0) end += size;
+                            if (start < 0) start = 0;
+                            if (end > size) end = size;
+                            std::string sub = (start < end) ? str->text.substr(start, end - start) : "";
+                            GcHandle subH = heap.allocateString(std::move(sub));
+                            push(Value(subH));
+                        } else {
+                            runtimeError("String index must be an integer or range.");
+                            return InterpretResult::RUNTIME_ERROR;
+                        }
+                    } else {
+                        runtimeError("String index must be an integer or range.");
                         return InterpretResult::RUNTIME_ERROR;
                     }
-                    push(arr->elements[idx]);
                 } else if (auto* map = obj->as<ObjMap>()) {
                     auto it = map->table.find(index);
                     if (it != map->table.end()) {
@@ -2419,9 +2521,11 @@ InterpretResult VM::run(size_t stopDepth) {
                         runtimeError("Array index must be an integer.");
                         return InterpretResult::RUNTIME_ERROR;
                     }
+                    int64_t size = static_cast<int64_t>(arr->elements.size());
                     int64_t idx = *index.asInt();
-                    if (idx < 0 || static_cast<size_t>(idx) >= arr->elements.size()) {
-                        runtimeError("Array index out of bounds.");
+                    if (idx < 0) idx += size;
+                    if (idx < 0 || idx >= size) {
+                        runtimeError("Array index out of bounds: %lld.", idx);
                         return InterpretResult::RUNTIME_ERROR;
                     }
                     arr->elements[idx] = val;
@@ -2431,6 +2535,67 @@ InterpretResult VM::run(size_t stopDepth) {
                     push(val);
                 } else {
                     runtimeError("Target does not support index assignment.");
+                    return InterpretResult::RUNTIME_ERROR;
+                }
+                break;
+            }
+            case OpCode::OP_SLICE: {
+                Value lenVal = pop();
+                Value startVal = pop();
+                Value target = pop();
+                if (!startVal.isInt() || !lenVal.isInt()) {
+                    runtimeError("Slice bounds must be integers.");
+                    return InterpretResult::RUNTIME_ERROR;
+                }
+                if (!target.isObject()) {
+                    runtimeError("Only objects can be sliced.");
+                    return InterpretResult::RUNTIME_ERROR;
+                }
+                int64_t start = *startVal.asInt();
+                int64_t length = *lenVal.asInt();
+                GcObject* obj = heap.get(*target.asObject());
+                if (auto* arr = obj->as<ObjArray>()) {
+                    int64_t size = static_cast<int64_t>(arr->elements.size());
+                    if (length < 0) {
+                        push(Value());
+                    } else {
+                        if (start < 0) start += size;
+                        if (start == size) {
+                            push(Value(heap.allocateArray()));
+                        } else if (start > size || start < 0) {
+                            push(Value());
+                        } else {
+                            int64_t end = std::min(size, start + length);
+                            std::vector<Value> sliced;
+                            if (start < end) {
+                                sliced.reserve(end - start);
+                                for (int64_t i = start; i < end; ++i) {
+                                    sliced.push_back(arr->elements[i]);
+                                }
+                            }
+                            GcHandle newArrH = heap.allocateArray(std::move(sliced));
+                            push(Value(newArrH));
+                        }
+                    }
+                } else if (auto* str = obj->as<ObjString>()) {
+                    int64_t size = static_cast<int64_t>(str->text.size());
+                    if (length < 0) {
+                        push(Value());
+                    } else {
+                        if (start < 0) start += size;
+                        if (start == size) {
+                            push(Value(heap.allocateString("")));
+                        } else if (start > size || start < 0) {
+                            push(Value());
+                        } else {
+                            int64_t count = std::min(size - start, length);
+                            std::string sub = (count > 0) ? str->text.substr(start, count) : "";
+                            GcHandle newStrH = heap.allocateString(std::move(sub));
+                            push(Value(newStrH));
+                        }
+                    }
+                } else {
+                    runtimeError("Target does not support slicing.");
                     return InterpretResult::RUNTIME_ERROR;
                 }
                 break;

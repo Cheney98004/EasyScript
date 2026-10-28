@@ -51,6 +51,7 @@ enum class OpCode : uint8_t {
     // 容器存取與賦值 (索引運算子 a[i])
     OP_GET_INDEX,       // 彈出 (obj, index)，推入 obj[index]
     OP_SET_INDEX,       // 彈出 (obj, index, value)，執行 obj[index] = value
+    OP_SLICE,           // 彈出 (obj, start, length)，推入切片結果
 
     // 函式與呼叫
     OP_CALL,            // [arg: uint8_t argCount] 呼叫函式

@@ -19,6 +19,7 @@ std::string_view tokenTypeName(TokenType type) noexcept {
         case TokenType::SLASH:              return "/";
         case TokenType::PERCENT:            return "%";
         case TokenType::ARROW:              return "->";
+        case TokenType::FAT_ARROW:          return "=>";
         case TokenType::DOT_DOT:            return "..";
         case TokenType::BANG:               return "!";
         case TokenType::BANG_EQUAL:         return "!=";

@@ -1371,7 +1371,45 @@ void Compiler::literal(bool) {
     }
 }
 
-void Compiler::grouping(bool) {
+bool Compiler::isArrowFunctionAhead() {
+    Lexer probe = lexer;
+    Token tok = current;
+    int parenDepth = 1;
+
+    while (tok.type != TokenType::TOKEN_EOF && tok.type != TokenType::SEMICOLON) {
+        if (tok.type == TokenType::LEFT_PAREN) {
+            parenDepth++;
+        } else if (tok.type == TokenType::RIGHT_PAREN) {
+            parenDepth--;
+            if (parenDepth == 0) {
+                Token afterParen = probe.nextToken();
+                if (afterParen.type == TokenType::FAT_ARROW) {
+                    return true;
+                }
+                if (afterParen.type == TokenType::ARROW || afterParen.type == TokenType::COLON) {
+                    Token afterType = probe.nextToken();
+                    while (afterType.type != TokenType::TOKEN_EOF &&
+                           afterType.type != TokenType::SEMICOLON &&
+                           afterType.type != TokenType::LEFT_BRACE) {
+                        if (afterType.type == TokenType::FAT_ARROW) {
+                            return true;
+                        }
+                        afterType = probe.nextToken();
+                    }
+                }
+                return false;
+            }
+        }
+        tok = probe.nextToken();
+    }
+    return false;
+}
+
+void Compiler::grouping(bool canAssign) {
+    if (isArrowFunctionAhead()) {
+        arrowFunction(canAssign);
+        return;
+    }
     lastExpressionType = expression();
     consume(TokenType::RIGHT_PAREN, "Expect ')' after expression.");
 }
@@ -1434,6 +1472,66 @@ void Compiler::lambda(bool) {
     block();
 
     emitReturn();
+
+    FunctionState finished = std::move(functionStack.back());
+    functionStack.pop_back();
+
+    emitClosure(finished);
+    lastExpressionType = Type::Function(paramTypes, retType);
+}
+
+void Compiler::arrowFunction(bool) {
+    GcHandle fnHandle = heap.allocate<ObjFunction>("<anonymous>");
+    ObjFunction* fnObj = heap.getAs<ObjFunction>(fnHandle);
+
+    FunctionState subState;
+    subState.function = fnObj;
+    subState.functionHandle = fnHandle;
+    subState.type = FunctionType::FUNCTION;
+    subState.locals.push_back(Local{Token(), 0, false});
+
+    functionStack.push_back(std::move(subState));
+
+    beginScope();
+
+    std::vector<Type> paramTypes;
+    if (!check(TokenType::RIGHT_PAREN)) {
+        do {
+            currentFunction().function->arity++;
+            uint8_t paramConstant = parseVariable("Expect parameter name.");
+            Type pType = parseTypeAnnotation();
+            currentFunction().locals.back().type = pType;
+            paramTypes.push_back(pType);
+            if (match(TokenType::EQUAL)) {
+                Type defType = expression(); // 預設參數
+                if (pType.kind != TypeKind::ANY && !isAssignable(pType, defType, classHierarchy)) {
+                    error("Default parameter type does not match parameter type.");
+                }
+            }
+            defineVariable(paramConstant);
+        } while (match(TokenType::COMMA) && !check(TokenType::RIGHT_PAREN));
+    }
+    consume(TokenType::RIGHT_PAREN, "Expect ')' after parameters.");
+
+    Type retType = parseTypeAnnotation();
+    currentFunction().returnType = retType;
+
+    consume(TokenType::FAT_ARROW, "Expect '=>' after parameters.");
+
+    if (match(TokenType::LEFT_BRACE)) {
+        block();
+        emitReturn();
+    } else {
+        Type bodyType = expression();
+        if (retType.kind != TypeKind::ANY && !isAssignable(retType, bodyType, classHierarchy)) {
+            error("Return type mismatch: expected '" + retType.toString() +
+                  "', got '" + bodyType.toString() + "'.");
+        }
+        emitOp(OpCode::OP_RETURN);
+        if (retType.kind == TypeKind::ANY) {
+            retType = bodyType;
+        }
+    }
 
     FunctionState finished = std::move(functionStack.back());
     functionStack.pop_back();
@@ -1809,6 +1907,16 @@ void Compiler::dot(bool canAssign) {
 void Compiler::subscript(bool canAssign) {
     Type receiverType = lastExpressionType;
     Type indexType = expression();
+
+    if (match(TokenType::COMMA)) {
+        // 雙參數切片 arr[start, length]
+        Type lengthType = expression();
+        consume(TokenType::RIGHT_BRACKET, "Expect ']' after slice length.");
+        emitOp(OpCode::OP_SLICE);
+        lastExpressionType = receiverType;
+        return;
+    }
+
     consume(TokenType::RIGHT_BRACKET, "Expect ']' after index.");
 
     if (canAssign && match(TokenType::EQUAL)) {
@@ -1817,8 +1925,14 @@ void Compiler::subscript(bool canAssign) {
         lastExpressionType = valType;
     } else {
         emitOp(OpCode::OP_GET_INDEX);
-        if (receiverType.kind == TypeKind::ARRAY && receiverType.elementType) {
-            lastExpressionType = *receiverType.elementType;
+        if (receiverType.kind == TypeKind::ARRAY) {
+            if (indexType.kind == TypeKind::ARRAY && receiverType.elementType) {
+                lastExpressionType = receiverType;
+            } else if (receiverType.elementType) {
+                lastExpressionType = *receiverType.elementType;
+            } else {
+                lastExpressionType = Type::Any();
+            }
         } else if (receiverType.kind == TypeKind::MAP && receiverType.valueType) {
             lastExpressionType = *receiverType.valueType;
         } else if (receiverType.kind == TypeKind::STRING) {
