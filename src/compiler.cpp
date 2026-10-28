@@ -1324,7 +1324,9 @@ void Compiler::parsePrecedence(Precedence precedence) {
         (this->*infixRule)(canAssign);
     }
 
-    if (canAssign && match(TokenType::EQUAL)) {
+    if (canAssign && (match(TokenType::EQUAL) ||
+                      match(TokenType::PLUS_EQUAL) || match(TokenType::MINUS_EQUAL) ||
+                      match(TokenType::STAR_EQUAL) || match(TokenType::SLASH_EQUAL) || match(TokenType::PERCENT_EQUAL))) {
         error("Invalid assignment target.");
     }
 }
@@ -1536,6 +1538,24 @@ void Compiler::namedVariable(Token name, bool canAssign) {
         emitBytes(getOp, static_cast<uint8_t>(arg));
         Type valType = expression();
         emitOp(OpCode::OP_SUB);
+        emitBytes(setOp, static_cast<uint8_t>(arg));
+        lastExpressionType = varType;
+    } else if (canAssign && match(TokenType::STAR_EQUAL)) {
+        emitBytes(getOp, static_cast<uint8_t>(arg));
+        Type valType = expression();
+        emitOp(OpCode::OP_MUL);
+        emitBytes(setOp, static_cast<uint8_t>(arg));
+        lastExpressionType = varType;
+    } else if (canAssign && match(TokenType::SLASH_EQUAL)) {
+        emitBytes(getOp, static_cast<uint8_t>(arg));
+        Type valType = expression();
+        emitOp(OpCode::OP_DIV);
+        emitBytes(setOp, static_cast<uint8_t>(arg));
+        lastExpressionType = varType;
+    } else if (canAssign && match(TokenType::PERCENT_EQUAL)) {
+        emitBytes(getOp, static_cast<uint8_t>(arg));
+        Type valType = expression();
+        emitOp(OpCode::OP_MOD);
         emitBytes(setOp, static_cast<uint8_t>(arg));
         lastExpressionType = varType;
     } else {

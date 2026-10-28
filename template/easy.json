@@ -1,0 +1,20 @@
+{
+  "name": "my_module",
+  "version": "1.0.0",
+  "description": "EasyScript C++ Native Extension Module Template",
+  "main": "test.easy",
+  "scripts": {
+    "build": "cmake -B build && cmake --build build --config Release",
+    "test": "easyscript test.easy"
+  },
+  "keywords": [
+    "easyscript",
+    "native",
+    "cpp",
+    "c++",
+    "plugin",
+    "module"
+  ],
+  "author": "",
+  "license": "MIT"
+}

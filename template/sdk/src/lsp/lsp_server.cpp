@@ -1,0 +1,2433 @@
+#include "lsp/lsp_server.hpp"
+#include "compiler.hpp"
+#include "lexer.hpp"
+#include <iostream>
+#include <sstream>
+#include <fstream>
+#include <filesystem>
+#include <algorithm>
+#include <cctype>
+#include <unordered_set>
+
+namespace fs = std::filesystem;
+
+#if defined(_WIN32)
+#include <io.h>
+#include <fcntl.h>
+#endif
+
+namespace lsp {
+
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#ifdef CONST
+#undef CONST
+#endif
+static std::string getExecutableDir() {
+    wchar_t buf[MAX_PATH];
+    DWORD len = GetModuleFileNameW(NULL, buf, MAX_PATH);
+    if (len > 0) {
+        return fs::path(buf).parent_path().string();
+    }
+    return "";
+}
+#else
+static std::string getExecutableDir() {
+    return "";
+}
+#endif
+
+static std::string uriToPath(const std::string& uri);
+static std::string pathToUri(const std::string& path);
+
+LspServer::LspServer() {
+#if defined(_WIN32)
+    _setmode(_fileno(stdin), _O_BINARY);
+    _setmode(_fileno(stdout), _O_BINARY);
+#endif
+    scanDjsonModules();
+}
+
+void LspServer::run() {
+    std::string headerLine;
+    while (isRunning && std::cin.good()) {
+        int contentLength = 0;
+        while (std::getline(std::cin, headerLine)) {
+            if (!headerLine.empty() && headerLine.back() == '\r') {
+                headerLine.pop_back();
+            }
+            if (headerLine.empty()) {
+                break;
+            }
+            if (headerLine.rfind("Content-Length:", 0) == 0) {
+                try {
+                    contentLength = std::stoi(headerLine.substr(15));
+                } catch (...) {
+                    contentLength = 0;
+                }
+            }
+        }
+
+        if (contentLength <= 0) {
+            continue;
+        }
+
+        std::string body(contentLength, '\0');
+        std::cin.read(&body[0], contentLength);
+        if (!std::cin.good()) {
+            break;
+        }
+
+        processMessage(body);
+    }
+}
+
+void LspServer::sendJson(const Json& json) {
+    std::string body = json.dump();
+    std::cout << "Content-Length: " << body.size() << "\r\n\r\n" << body;
+    std::cout.flush();
+}
+
+void LspServer::sendResponse(const Json& id, const Json& result) {
+    Json res = Json::object();
+    res["jsonrpc"] = "2.0";
+    res["id"] = id;
+    res["result"] = result;
+    sendJson(res);
+}
+
+void LspServer::sendError(const Json& id, int code, const std::string& message) {
+    Json res = Json::object();
+    res["jsonrpc"] = "2.0";
+    res["id"] = id;
+    Json err = Json::object();
+    err["code"] = code;
+    err["message"] = message;
+    res["error"] = err;
+    sendJson(res);
+}
+
+void LspServer::processMessage(const std::string& rawJson) {
+    Json msg = JsonParser::parse(rawJson);
+    if (!msg.isObject()) return;
+
+    if (msg.contains("id")) {
+        handleRequest(msg);
+    } else {
+        handleNotification(msg);
+    }
+}
+
+void LspServer::handleRequest(const Json& msg) {
+    const Json& id = msg["id"];
+    std::string method = msg["method"].asString();
+    const Json& params = msg["params"];
+
+    if (method == "initialize") {
+        if (params.contains("rootUri") && params["rootUri"].type == JsonType::String) {
+            workspaceRoot = uriToPath(params["rootUri"].asString());
+        } else if (params.contains("rootPath") && params["rootPath"].type == JsonType::String) {
+            workspaceRoot = params["rootPath"].asString();
+        }
+        scanDjsonModules();
+        Json result = Json::object();
+        Json caps = Json::object();
+
+        // 1 = Full sync
+        caps["textDocumentSync"] = 1;
+
+        // Completion
+        Json comp = Json::object();
+        comp["resolveProvider"] = false;
+        Json trig = Json::array();
+        trig.push_back(".");
+        trig.push_back("\"");
+        trig.push_back("'");
+        comp["triggerCharacters"] = trig;
+        caps["completionProvider"] = comp;
+
+        // Hover, DocumentSymbol, Definition
+        caps["hoverProvider"] = true;
+        caps["documentSymbolProvider"] = true;
+        caps["definitionProvider"] = true;
+
+        // Signature Help (參數提示)
+        Json sig = Json::object();
+        Json sigTrig = Json::array();
+        sigTrig.push_back("(");
+        sigTrig.push_back(",");
+        sig["triggerCharacters"] = sigTrig;
+        caps["signatureHelpProvider"] = sig;
+
+        // Semantic Tokens (語意上色)
+        Json semTokens = Json::object();
+        Json legend = Json::object();
+        Json tokenTypes = Json::array();
+        tokenTypes.push_back("type");       // 0
+        tokenTypes.push_back("class");      // 1
+        tokenTypes.push_back("function");   // 2
+        tokenTypes.push_back("variable");   // 3
+        tokenTypes.push_back("parameter");  // 4
+        tokenTypes.push_back("property");   // 5
+        legend["tokenTypes"] = tokenTypes;
+
+        Json tokenModifiers = Json::array();
+        tokenModifiers.push_back("declaration");    // 1 << 0 = 1
+        tokenModifiers.push_back("readonly");       // 1 << 1 = 2
+        tokenModifiers.push_back("defaultLibrary"); // 1 << 2 = 4
+        legend["tokenModifiers"] = tokenModifiers;
+
+        semTokens["legend"] = legend;
+        semTokens["full"] = true;
+        caps["semanticTokensProvider"] = semTokens;
+
+        result["capabilities"] = caps;
+
+        Json serverInfo = Json::object();
+        serverInfo["name"] = "easyscript-lsp";
+        serverInfo["version"] = "0.1.0";
+        result["serverInfo"] = serverInfo;
+
+        sendResponse(id, result);
+    } else if (method == "shutdown") {
+        sendResponse(id, Json());
+    } else if (method == "textDocument/completion") {
+        std::string uri = params["textDocument"]["uri"].asString();
+        int line = static_cast<int>(params["position"]["line"].asInt());
+        int character = static_cast<int>(params["position"]["character"].asInt());
+        sendResponse(id, handleCompletion(uri, line, character));
+    } else if (method == "textDocument/hover") {
+        std::string uri = params["textDocument"]["uri"].asString();
+        int line = static_cast<int>(params["position"]["line"].asInt());
+        int character = static_cast<int>(params["position"]["character"].asInt());
+        sendResponse(id, handleHover(uri, line, character));
+    } else if (method == "textDocument/signatureHelp") {
+        std::string uri = params["textDocument"]["uri"].asString();
+        int line = static_cast<int>(params["position"]["line"].asInt());
+        int character = static_cast<int>(params["position"]["character"].asInt());
+        sendResponse(id, handleSignatureHelp(uri, line, character));
+    } else if (method == "textDocument/documentSymbol") {
+        std::string uri = params["textDocument"]["uri"].asString();
+        sendResponse(id, handleDocumentSymbol(uri));
+    } else if (method == "textDocument/definition") {
+        std::string uri = params["textDocument"]["uri"].asString();
+        int line = static_cast<int>(params["position"]["line"].asInt());
+        int character = static_cast<int>(params["position"]["character"].asInt());
+        sendResponse(id, handleDefinition(uri, line, character));
+    } else if (method == "textDocument/semanticTokens/full") {
+        std::string uri = params["textDocument"]["uri"].asString();
+        sendResponse(id, handleSemanticTokens(uri));
+    } else {
+        sendError(id, -32601, "Method not found: " + method);
+    }
+}
+
+void LspServer::handleNotification(const Json& msg) {
+    std::string method = msg["method"].asString();
+    const Json& params = msg["params"];
+
+    if (method == "exit") {
+        isRunning = false;
+    } else if (method == "textDocument/didOpen") {
+        std::string uri = params["textDocument"]["uri"].asString();
+        std::string text = params["textDocument"]["text"].asString();
+        documents[uri] = text;
+        validateDocument(uri, text);
+    } else if (method == "textDocument/didChange") {
+        std::string uri = params["textDocument"]["uri"].asString();
+        const Json& changes = params["contentChanges"];
+        if (changes.isArray() && !changes.arrVal.empty()) {
+            std::string text = changes[0]["text"].asString();
+            documents[uri] = text;
+            validateDocument(uri, text);
+        }
+    } else if (method == "textDocument/didClose") {
+        std::string uri = params["textDocument"]["uri"].asString();
+        documents.erase(uri);
+
+        // 清除該文件的診斷
+        Json notification = Json::object();
+        notification["jsonrpc"] = "2.0";
+        notification["method"] = "textDocument/publishDiagnostics";
+        Json p = Json::object();
+        p["uri"] = uri;
+        p["diagnostics"] = Json::array();
+        notification["params"] = p;
+        sendJson(notification);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// 即時語法診斷 (Diagnostics)
+// -----------------------------------------------------------------------------
+
+void LspServer::validateDocument(const std::string& uri, const std::string& text) {
+    Heap heap;
+    Compiler compiler(heap, text);
+    std::vector<CompilerDiagnostic> diagnostics;
+    compiler.setDiagnosticSink(&diagnostics);
+    compiler.compile();
+
+    Json diagList = Json::array();
+    for (const auto& d : diagnostics) {
+        Json diag = Json::object();
+        Json range = Json::object();
+        Json start = Json::object();
+        start["line"] = std::max(0, d.line - 1);
+        start["character"] = std::max(0, d.column - 1);
+        Json end = Json::object();
+        end["line"] = std::max(0, d.line - 1);
+        end["character"] = std::max(0, d.column - 1 + std::max(1, d.length));
+        range["start"] = start;
+        range["end"] = end;
+
+        diag["range"] = range;
+        diag["severity"] = d.severity;
+        diag["source"] = "easyscript";
+        diag["message"] = d.message;
+        diagList.push_back(diag);
+    }
+
+    Json notification = Json::object();
+    notification["jsonrpc"] = "2.0";
+    notification["method"] = "textDocument/publishDiagnostics";
+    Json params = Json::object();
+    params["uri"] = uri;
+    params["diagnostics"] = diagList;
+    notification["params"] = params;
+
+    sendJson(notification);
+}
+
+// -----------------------------------------------------------------------------
+// URI 與路徑轉換輔助
+// -----------------------------------------------------------------------------
+
+static std::string uriToPath(const std::string& uri) {
+    std::string path = uri;
+    if (path.starts_with("file:///")) {
+        path = path.substr(8);
+    } else if (path.starts_with("file://")) {
+        path = path.substr(7);
+    }
+    size_t colonPos = path.find("%3A");
+    if (colonPos != std::string::npos) path.replace(colonPos, 3, ":");
+    colonPos = path.find("%3a");
+    if (colonPos != std::string::npos) path.replace(colonPos, 3, ":");
+    size_t spacePos = 0;
+    while ((spacePos = path.find("%20", spacePos)) != std::string::npos) {
+        path.replace(spacePos, 3, " ");
+        spacePos += 1;
+    }
+    return path;
+}
+
+static std::string pathToUri(const std::string& path) {
+    std::string normal = path;
+    std::replace(normal.begin(), normal.end(), '\\', '/');
+    if (!normal.empty() && normal[0] != '/') {
+        return "file:///" + normal;
+    }
+    return "file://" + normal;
+}
+
+// -----------------------------------------------------------------------------
+// 輔助函式：文字提取、註解解析與字詞內容分析
+// -----------------------------------------------------------------------------
+
+static std::string extractDocComment(const std::string& text, int targetLine0Based) {
+    std::istringstream stream(text);
+    std::string line;
+    std::vector<std::string> lines;
+    while (std::getline(stream, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        lines.push_back(line);
+    }
+    if (targetLine0Based <= 0 || targetLine0Based >= static_cast<int>(lines.size())) {
+        return "";
+    }
+    int cur = targetLine0Based - 1;
+    std::vector<std::string> commentLines;
+    while (cur >= 0) {
+        std::string l = lines[cur];
+        size_t firstNonBlank = l.find_first_not_of(" \t");
+        if (firstNonBlank == std::string::npos) break;
+        if (l.compare(firstNonBlank, 2, "//") == 0) {
+            std::string content = l.substr(firstNonBlank + 2);
+            if (!content.empty() && content.front() == ' ') content.erase(0, 1);
+            commentLines.push_back(content);
+            cur--;
+        } else if (l.compare(firstNonBlank, 2, "*/") == 0) {
+            commentLines.push_back(l.substr(firstNonBlank));
+            cur--;
+            while (cur >= 0) {
+                std::string ml = lines[cur];
+                size_t fb = ml.find_first_not_of(" \t");
+                if (fb != std::string::npos && ml.compare(fb, 2, "/*") == 0) {
+                    commentLines.push_back(ml.substr(fb));
+                    break;
+                }
+                commentLines.push_back(ml);
+                cur--;
+            }
+            break;
+        } else {
+            break;
+        }
+    }
+    if (commentLines.empty()) return "";
+    std::reverse(commentLines.begin(), commentLines.end());
+    std::string result;
+    for (const auto& cl : commentLines) {
+        if (!result.empty()) result += "\n";
+        result += cl;
+    }
+    return result;
+}
+
+static std::string getLineText(const std::string& text, int line) {
+    std::istringstream stream(text);
+    std::string curLine;
+    int cur = 0;
+    while (std::getline(stream, curLine)) {
+        if (!curLine.empty() && curLine.back() == '\r') curLine.pop_back();
+        if (cur == line) return curLine;
+        cur++;
+    }
+    return "";
+}
+
+static std::string getLinePrefix(const std::string& text, int line, int character) {
+    std::string curLine = getLineText(text, line);
+    if (character >= 0 && character <= static_cast<int>(curLine.size())) {
+        return curLine.substr(0, character);
+    }
+    return curLine;
+}
+
+struct WordContext {
+    std::string word;
+    int startCol{0};
+    int endCol{0};
+    std::string parentObject;
+};
+
+static WordContext getWordContext(const std::string& text, int line, int character) {
+    WordContext ctx;
+    std::string lineStr = getLineText(text, line);
+    if (lineStr.empty() || character < 0 || character > static_cast<int>(lineStr.size())) {
+        return ctx;
+    }
+
+    int start = character;
+    if (start > 0 && start == static_cast<int>(lineStr.size())) {
+        start--;
+    }
+    if (start > 0 && !(std::isalnum(static_cast<unsigned char>(lineStr[start])) || lineStr[start] == '_' || lineStr[start] == '$')) {
+        if (std::isalnum(static_cast<unsigned char>(lineStr[start - 1])) || lineStr[start - 1] == '_' || lineStr[start - 1] == '$') {
+            start--;
+        }
+    }
+
+    if (start < static_cast<int>(lineStr.size()) && (std::isalnum(static_cast<unsigned char>(lineStr[start])) || lineStr[start] == '_' || lineStr[start] == '$')) {
+        while (start > 0 && (std::isalnum(static_cast<unsigned char>(lineStr[start - 1])) || lineStr[start - 1] == '_' || lineStr[start - 1] == '$')) {
+            start--;
+        }
+        int end = start;
+        while (end < static_cast<int>(lineStr.size()) && (std::isalnum(static_cast<unsigned char>(lineStr[end])) || lineStr[end] == '_' || lineStr[end] == '$')) {
+            end++;
+        }
+        ctx.word = lineStr.substr(start, end - start);
+        ctx.startCol = start;
+        ctx.endCol = end;
+
+        int p = start - 1;
+        while (p >= 0 && (lineStr[p] == ' ' || lineStr[p] == '\t')) p--;
+        if (p >= 0 && lineStr[p] == '.') {
+            p--;
+            while (p >= 0 && (lineStr[p] == ' ' || lineStr[p] == '\t')) p--;
+            int objEnd = p + 1;
+            while (p >= 0 && (std::isalnum(static_cast<unsigned char>(lineStr[p])) || lineStr[p] == '_' || lineStr[p] == '$')) {
+                p--;
+            }
+            int objStart = p + 1;
+            if (objEnd > objStart) {
+                ctx.parentObject = lineStr.substr(objStart, objEnd - objStart);
+            } else if (p >= 0 && (lineStr[p] == ')' || lineStr[p] == '"' || lineStr[p] == '\'' || lineStr[p] == ']' || lineStr[p] == '}')) {
+                char closeCh = lineStr[p];
+                char openCh = (closeCh == ')') ? '(' : (closeCh == ']') ? '[' : (closeCh == '}') ? '{' : closeCh;
+                int depth = 1;
+                int exprEnd = p + 1;
+                p--;
+                while (p >= 0 && depth > 0) {
+                    if (closeCh == '"' || closeCh == '\'') {
+                        if (lineStr[p] == closeCh && (p == 0 || lineStr[p - 1] != '\\')) depth--;
+                    } else {
+                        if (lineStr[p] == closeCh) depth++;
+                        else if (lineStr[p] == openCh) depth--;
+                    }
+                    if (depth > 0) p--;
+                }
+                int exprStart = std::max(0, p);
+                ctx.parentObject = lineStr.substr(exprStart, exprEnd - exprStart);
+            }
+        }
+    }
+
+    return ctx;
+}
+
+struct AccessChain {
+    std::vector<std::string> chain;
+    std::string memberFilter;
+};
+
+static AccessChain parseAccessChain(const std::string& lineStr, int character) {
+    AccessChain ac;
+    int p = character - 1;
+    if (p < 0 || p >= static_cast<int>(lineStr.size())) {
+        if (p >= static_cast<int>(lineStr.size())) p = static_cast<int>(lineStr.size()) - 1;
+        else return ac;
+    }
+
+    // 1. 抓取游標左側正在輸入的成員前綴 (memberFilter)
+    int filterEnd = p + 1;
+    while (p >= 0 && (std::isalnum(static_cast<unsigned char>(lineStr[p])) || lineStr[p] == '_' || lineStr[p] == '$')) {
+        p--;
+    }
+    ac.memberFilter = lineStr.substr(p + 1, filterEnd - (p + 1));
+
+    // 2. 跳過空白字元
+    while (p >= 0 && (lineStr[p] == ' ' || lineStr[p] == '\t')) {
+        p--;
+    }
+
+    // 3. 必須有 '.' 才是成員存取
+    if (p >= 0 && lineStr[p] == '.') {
+        while (p >= 0 && lineStr[p] == '.') {
+            p--;
+            while (p >= 0 && (lineStr[p] == ' ' || lineStr[p] == '\t')) p--;
+            int idEnd = p + 1;
+            while (p >= 0 && (std::isalnum(static_cast<unsigned char>(lineStr[p])) || lineStr[p] == '_' || lineStr[p] == '$')) {
+                p--;
+            }
+            int idStart = p + 1;
+            if (idEnd > idStart) {
+                ac.chain.push_back(lineStr.substr(idStart, idEnd - idStart));
+            } else if (p >= 0 && (lineStr[p] == ')' || lineStr[p] == '"' || lineStr[p] == '\'' || lineStr[p] == ']' || lineStr[p] == '}')) {
+                char closeCh = lineStr[p];
+                char openCh = (closeCh == ')') ? '(' : (closeCh == ']') ? '[' : (closeCh == '}') ? '{' : closeCh;
+                int depth = 1;
+                int exprEnd = p + 1;
+                p--;
+                while (p >= 0 && depth > 0) {
+                    if (closeCh == '"' || closeCh == '\'') {
+                        if (lineStr[p] == closeCh && (p == 0 || lineStr[p - 1] != '\\')) depth--;
+                    } else {
+                        if (lineStr[p] == closeCh) depth++;
+                        else if (lineStr[p] == openCh) depth--;
+                    }
+                    if (depth > 0) p--;
+                }
+                int exprStart = std::max(0, p);
+                ac.chain.push_back(lineStr.substr(exprStart, exprEnd - exprStart));
+            } else {
+                break;
+            }
+            while (p >= 0 && (lineStr[p] == ' ' || lineStr[p] == '\t')) p--;
+        }
+    }
+    std::reverse(ac.chain.begin(), ac.chain.end());
+    return ac;
+}
+
+static std::string cleanStringLiteral(std::string_view lexeme) {
+    std::string s(lexeme);
+    if (s.size() >= 2 && ((s.front() == '"' && s.back() == '"') || (s.front() == '\'' && s.back() == '\''))) {
+        return s.substr(1, s.size() - 2);
+    }
+    return s;
+}
+
+// -----------------------------------------------------------------------------
+// 內建型別成員資料結構 (Built-in Types & Methods for Collections and Primitives)
+// -----------------------------------------------------------------------------
+
+struct BuiltinMemberInfo {
+    std::string typeName;     // "Array", "String", "Number", "Map", "Range", "Bool", "Nil"
+    std::string name;         // "map", "filter", "abs", etc.
+    bool isMethod{true};      // true for method (kind 2), false for property (kind 10)
+    std::string signature;    // e.g. "map(callback: fn(item, index?): any): Array"
+    std::string doc;          // Description of method/property
+    std::vector<std::string> paramNames; // For signature help parameter highlighting
+};
+
+enum class InferredType {
+    UNKNOWN,
+    STRING,
+    NUMBER,
+    ARRAY,
+    MAP,
+    RANGE,
+    BOOL,
+    NIL
+};
+
+static const std::vector<BuiltinMemberInfo>& getBuiltinMembers() {
+    static const std::vector<BuiltinMemberInfo> members = {
+        // === Array ===
+        {"Array", "length", false, "length: int", "Returns the number of elements in the array.", {}},
+        {"Array", "size", false, "size: int", "Returns the number of elements in the array (alias for length).", {}},
+        {"Array", "isEmpty", false, "isEmpty: bool", "Returns true if the array contains no elements.", {}},
+        {"Array", "first", false, "first: any", "Returns the first element of the array, or nil if empty.", {}},
+        {"Array", "last", false, "last: any", "Returns the last element of the array, or nil if empty.", {}},
+        {"Array", "push", true, "push(...items: any): int", "Appends elements to the end of the array and returns the new length.", {"...items"}},
+        {"Array", "pop", true, "pop(): any", "Removes and returns the last element of the array, or nil if empty.", {}},
+        {"Array", "insert", true, "insert(index: int, value: any): void", "Inserts an element at the specified index.", {"index", "value"}},
+        {"Array", "removeAt", true, "removeAt(index: int): any", "Removes and returns the element at the specified index.", {"index"}},
+        {"Array", "clear", true, "clear(): void", "Removes all elements from the array.", {}},
+        {"Array", "contains", true, "contains(value: any): bool", "Returns true if the array contains the specified element.", {"value"}},
+        {"Array", "indexOf", true, "indexOf(value: any): int", "Returns the index of the first occurrence of the specified value, or -1.", {"value"}},
+        {"Array", "join", true, "join(delimiter = ','): string", "Joins all elements of the array into a string separated by delimiter.", {"delimiter"}},
+        {"Array", "slice", true, "slice(start: int, end?: int): Array", "Returns a shallow copy of a portion of an array.", {"start", "end"}},
+        {"Array", "reverse", true, "reverse(): Array", "Reverses the array in place and returns it.", {}},
+        {"Array", "isEmpty", true, "isEmpty(): bool", "Returns true if the array contains no elements.", {}},
+        {"Array", "first", true, "first(): any", "Returns the first element of the array, or nil if empty.", {}},
+        {"Array", "last", true, "last(): any", "Returns the last element of the array, or nil if empty.", {}},
+        {"Array", "map", true, "map(callback: fn(item: any, index?: int): any): Array", "Calls a defined callback function on each element and returns an array of the results.", {"callback"}},
+        {"Array", "filter", true, "filter(callback: fn(item: any, index?: int): bool): Array", "Returns the elements of an array that meet the condition specified in a callback function.", {"callback"}},
+        {"Array", "reduce", true, "reduce(callback: fn(accumulator: any, item: any, index?: int): any, initial?: any): any", "Calls the callback function for all elements and accumulates the result into a single value.", {"callback", "initial"}},
+        {"Array", "forEach", true, "forEach(callback: fn(item: any, index?: int): void): void", "Performs the specified callback action for each element in the array.", {"callback"}},
+        {"Array", "find", true, "find(callback: fn(item: any, index?: int): bool): any", "Returns the first element in the array that satisfies the testing function, or nil.", {"callback"}},
+        {"Array", "findIndex", true, "findIndex(callback: fn(item: any, index?: int): bool): int", "Returns the index of the first element in the array that satisfies the testing function, or -1.", {"callback"}},
+        {"Array", "every", true, "every(callback: fn(item: any, index?: int): bool): bool", "Determines whether all elements of the array satisfy the specified test.", {"callback"}},
+        {"Array", "some", true, "some(callback: fn(item: any, index?: int): bool): bool", "Determines whether any element of the array satisfies the specified test.", {"callback"}},
+        {"Array", "sort", true, "sort(comparator?: fn(a: any, b: any): any): Array", "Sorts the elements of an array in place (using natural order or comparator) and returns it.", {"comparator"}},
+
+        // === String ===
+        {"String", "length", false, "length: int", "Returns the length of the string.", {}},
+        {"String", "size", false, "size: int", "Returns the length of the string (alias for length).", {}},
+        {"String", "isEmpty", false, "isEmpty: bool", "Returns true if the string is empty.", {}},
+        {"String", "isEmpty", true, "isEmpty(): bool", "Returns true if the string is empty.", {}},
+        {"String", "substring", true, "substring(start: int, end?: int): string", "Returns a substring between the specified indices.", {"start", "end"}},
+        {"String", "slice", true, "slice(start: int, end?: int): string", "Returns a slice between the specified indices.", {"start", "end"}},
+        {"String", "indexOf", true, "indexOf(target: string, start = 0): int", "Returns the index of the first occurrence of target, or -1.", {"target", "start"}},
+        {"String", "contains", true, "contains(target: string): bool", "Returns true if the string contains the target substring.", {"target"}},
+        {"String", "startsWith", true, "startsWith(prefix: string): bool", "Returns true if the string begins with prefix.", {"prefix"}},
+        {"String", "endsWith", true, "endsWith(suffix: string): bool", "Returns true if the string ends with suffix.", {"suffix"}},
+        {"String", "toUpper", true, "toUpper(): string", "Converts all characters in the string to uppercase.", {}},
+        {"String", "toLower", true, "toLower(): string", "Converts all characters in the string to lowercase.", {}},
+        {"String", "trim", true, "trim(): string", "Removes whitespace from both ends of the string.", {}},
+        {"String", "trimStart", true, "trimStart(): string", "Removes whitespace from the beginning of the string.", {}},
+        {"String", "trimEnd", true, "trimEnd(): string", "Removes whitespace from the end of the string.", {}},
+        {"String", "split", true, "split(delimiter = ' '): Array", "Splits a string into substrings using the specified delimiter.", {"delimiter"}},
+        {"String", "replace", true, "replace(from: string, to: string): string", "Replaces all occurrences of from with to.", {"from", "to"}},
+        {"String", "repeat", true, "repeat(count: int): string", "Returns a new string which contains count copies of this string.", {"count"}},
+        {"String", "lines", true, "lines(): Array", "Splits the string into lines separated by newline characters (\\n, \\r\\n).", {}},
+        {"String", "padStart", true, "padStart(targetLength: int, padString = ' '): string", "Pads the beginning of the string until targetLength is reached.", {"targetLength", "padString"}},
+        {"String", "padEnd", true, "padEnd(targetLength: int, padString = ' '): string", "Pads the end of the string until targetLength is reached.", {"targetLength", "padString"}},
+        {"String", "charAt", true, "charAt(index: int): string", "Returns the character at the specified index, or empty string.", {"index"}},
+        {"String", "charCodeAt", true, "charCodeAt(index: int): int", "Returns the character code at the specified index, or nil if out of bounds.", {"index"}},
+        {"String", "toInt", true, "toInt(radix = 10): int", "Parses an integer from the string with the specified radix, or nil if invalid.", {"radix"}},
+        {"String", "toDouble", true, "toDouble(): double", "Parses a double-precision float from the string, or nil if invalid.", {}},
+
+        // === Number ===
+        {"Number", "isEven", false, "isEven: bool", "Returns true if the integer is even.", {}},
+        {"Number", "isOdd", false, "isOdd: bool", "Returns true if the integer is odd.", {}},
+        {"Number", "sign", false, "sign: int", "Returns 1 for positive numbers, -1 for negative numbers, or 0.", {}},
+        {"Number", "isNaN", false, "isNaN: bool", "Returns true if the number is NaN.", {}},
+        {"Number", "isFinite", false, "isFinite: bool", "Returns true if the number is finite.", {}},
+        {"Number", "toString", true, "toString(): string", "Returns a string representing the number.", {}},
+        {"Number", "toInt", true, "toInt(): int", "Converts the number to a 64-bit integer.", {}},
+        {"Number", "toDouble", true, "toDouble(): double", "Converts the number to a 64-bit double.", {}},
+        {"Number", "abs", true, "abs(): number", "Returns the absolute value of the number.", {}},
+        {"Number", "clamp", true, "clamp(min: number, max: number): number", "Clamps the number within the [min, max] range.", {"min", "max"}},
+        {"Number", "min", true, "min(other: number): number", "Returns the smaller of this number and other.", {"other"}},
+        {"Number", "max", true, "max(other: number): number", "Returns the larger of this number and other.", {"other"}},
+        {"Number", "sign", true, "sign(): int", "Returns 1 for positive numbers, -1 for negative numbers, or 0.", {}},
+        {"Number", "floor", true, "floor(): number", "Returns the greatest integer less than or equal to the number.", {}},
+        {"Number", "ceil", true, "ceil(): number", "Returns the smallest integer greater than or equal to the number.", {}},
+        {"Number", "round", true, "round(): number", "Returns the value of the number rounded to the nearest integer.", {}},
+        {"Number", "toFixed", true, "toFixed(digits = 0): string", "Formats the number using fixed-point notation with specified decimal places.", {"digits"}},
+        {"Number", "toHex", true, "toHex(): string", "Converts the integer to its hexadecimal string representation.", {}},
+        {"Number", "toBin", true, "toBin(): string", "Converts the integer to its binary string representation.", {}},
+        {"Number", "isEven", true, "isEven(): bool", "Returns true if the integer is even.", {}},
+        {"Number", "isOdd", true, "isOdd(): bool", "Returns true if the integer is odd.", {}},
+        {"Number", "times", true, "times(callback: fn(index: int): void): void", "Executes callback n times, passing 0 to n - 1.", {"callback"}},
+        {"Number", "upTo", true, "upTo(limit: int, callback?: fn(index: int): void): Array|void", "Iterates from this number up to limit, or returns an array [this..limit].", {"limit", "callback"}},
+        {"Number", "downTo", true, "downTo(limit: int, callback?: fn(index: int): void): Array|void", "Iterates from this number down to limit, or returns an array [this..limit].", {"limit", "callback"}},
+        {"Number", "isFinite", true, "isFinite(): bool", "Returns true if the number is finite.", {}},
+        {"Number", "isInfinite", true, "isInfinite(): bool", "Returns true if the number is infinite.", {}},
+        {"Number", "isNaN", true, "isNaN(): bool", "Returns true if the number is NaN.", {}},
+
+        // === Map ===
+        {"Map", "length", false, "length: int", "Returns the number of key-value pairs in the map.", {}},
+        {"Map", "size", false, "size: int", "Returns the number of key-value pairs in the map (alias for length).", {}},
+        {"Map", "isEmpty", false, "isEmpty: bool", "Returns true if the map contains no key-value pairs.", {}},
+        {"Map", "isEmpty", true, "isEmpty(): bool", "Returns true if the map contains no key-value pairs.", {}},
+        {"Map", "has", true, "has(key: any): bool", "Returns true if the specified key exists in the map.", {"key"}},
+        {"Map", "contains", true, "contains(key: any): bool", "Returns true if the specified key exists in the map.", {"key"}},
+        {"Map", "get", true, "get(key: any): any", "Returns the value mapped to key, or nil if not found.", {"key"}},
+        {"Map", "getOrDefault", true, "getOrDefault(key: any, defaultVal: any): any", "Returns the value mapped to key, or defaultVal if not found.", {"key", "defaultVal"}},
+        {"Map", "remove", true, "remove(key: any): any", "Removes the entry for key and returns its value, or nil if not found.", {"key"}},
+        {"Map", "keys", true, "keys(): Array", "Returns an array containing all keys in the map.", {}},
+        {"Map", "values", true, "values(): Array", "Returns an array containing all values in the map.", {}},
+        {"Map", "entries", true, "entries(): Array", "Returns an array of 2-element [key, value] pairs.", {}},
+        {"Map", "merge", true, "merge(other: Map): Map", "Inserts all entries from other map into this map and returns this map.", {"other"}},
+        {"Map", "clear", true, "clear(): void", "Removes all key-value pairs from the map.", {}},
+
+        // === Range ===
+        {"Range", "start", false, "start: int", "Start of the range.", {}},
+        {"Range", "end", false, "end: int", "End of the range.", {}},
+        {"Range", "step", false, "step: int", "Step size of the range.", {}},
+        {"Range", "length", false, "length: int", "Number of values in the range.", {}},
+        {"Range", "size", false, "size: int", "Number of values in the range.", {}},
+        {"Range", "toArray", true, "toArray(): Array", "Converts the range to an array of integers.", {}},
+
+        // === Bool ===
+        {"Bool", "toString", true, "toString(): string", "Returns 'true' or 'false'.", {}},
+        {"Bool", "toInt", true, "toInt(): int", "Returns 1 for true, 0 for false.", {}},
+        {"Bool", "not", true, "not(): bool", "Returns the boolean negation.", {}},
+
+        // === Nil ===
+        {"Nil", "toString", true, "toString(): string", "Returns 'nil'.", {}},
+        {"Nil", "isNil", true, "isNil(): bool", "Returns true.", {}},
+        {"Nil", "orDefault", true, "orDefault(fallback: any): any", "Returns fallback value since receiver is nil.", {"fallback"}}
+    };
+    return members;
+}
+
+static InferredType inferTypeFromText(const std::string& text, const std::string& root) {
+    if (root.empty()) return InferredType::UNKNOWN;
+
+    // Direct literals or expressions
+    if (root.front() == '"' || root.front() == '\'') return InferredType::STRING;
+    if (root.front() == '[' || root.back() == ']') return InferredType::ARRAY;
+    if (root.front() == '{' || root.back() == '}') return InferredType::MAP;
+    if (root == "true" || root == "false") return InferredType::BOOL;
+    if (root == "nil" || root == "null") return InferredType::NIL;
+    if (root.find("..") != std::string::npos) return InferredType::RANGE;
+    if (std::all_of(root.begin(), root.end(), [](char c) { return std::isdigit(static_cast<unsigned char>(c)) || c == '.'; })) {
+        return InferredType::NUMBER;
+    }
+    if (root.front() == '(' && root.back() == ')' && root.size() > 2) {
+        std::string inner = root.substr(1, root.size() - 2);
+        return inferTypeFromText(text, inner);
+    }
+
+    // Heuristics based on variable name
+    std::string lowerRoot = root;
+    for (char& c : lowerRoot) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (lowerRoot == "str" || lowerRoot == "msg" || lowerRoot == "text" || lowerRoot == "s" ||
+        lowerRoot.ends_with("str") || lowerRoot.ends_with("string") || lowerRoot.ends_with("name") || lowerRoot.ends_with("path")) {
+        return InferredType::STRING;
+    }
+    if (lowerRoot == "arr" || lowerRoot == "list" || lowerRoot == "items" || lowerRoot == "elements" ||
+        lowerRoot.ends_with("arr") || lowerRoot.ends_with("array") || lowerRoot.ends_with("list") || (lowerRoot.ends_with("s") && lowerRoot.size() > 3)) {
+        return InferredType::ARRAY;
+    }
+    if (lowerRoot == "map" || lowerRoot == "dict" || lowerRoot == "table" || lowerRoot.ends_with("map") || lowerRoot.ends_with("dict")) {
+        return InferredType::MAP;
+    }
+    if (lowerRoot == "range" || lowerRoot == "rng" || lowerRoot == "r" || lowerRoot.ends_with("range")) {
+        return InferredType::RANGE;
+    }
+    if (lowerRoot == "num" || lowerRoot == "count" || lowerRoot == "idx" || lowerRoot == "index" ||
+        lowerRoot == "len" || lowerRoot == "i" || lowerRoot == "j" || lowerRoot == "x" || lowerRoot == "y" || lowerRoot == "pi") {
+        return InferredType::NUMBER;
+    }
+    if (lowerRoot == "b" || lowerRoot.starts_with("is") || lowerRoot.starts_with("has")) {
+        return InferredType::BOOL;
+    }
+
+    // Scan text for declaration: `let/const/var root: type` or `let/const/var root = ...`
+    size_t pos = 0;
+    while ((pos = text.find(root, pos)) != std::string::npos) {
+        bool leftBoundary = (pos == 0 || (!std::isalnum(static_cast<unsigned char>(text[pos - 1])) && text[pos - 1] != '_'));
+        bool rightBoundary = (pos + root.size() >= text.size() || (!std::isalnum(static_cast<unsigned char>(text[pos + root.size()])) && text[pos + root.size()] != '_'));
+        if (leftBoundary && rightBoundary) {
+            size_t after = pos + root.size();
+            while (after < text.size() && (text[after] == ' ' || text[after] == '\t')) after++;
+            if (after < text.size() && text[after] == ':') {
+                after++;
+                while (after < text.size() && (text[after] == ' ' || text[after] == '\t')) after++;
+                size_t tStart = after;
+                while (after < text.size() && (std::isalnum(static_cast<unsigned char>(text[after])) || text[after] == '_')) after++;
+                std::string tName = text.substr(tStart, after - tStart);
+                if (tName == "string") return InferredType::STRING;
+                if (tName == "int" || tName == "double" || tName == "number") return InferredType::NUMBER;
+                if (tName == "bool") return InferredType::BOOL;
+                if (tName == "Array") return InferredType::ARRAY;
+                if (tName == "Map") return InferredType::MAP;
+                if (tName == "Range") return InferredType::RANGE;
+            } else if (after < text.size() && text[after] == '=') {
+                after++;
+                while (after < text.size() && (text[after] == ' ' || text[after] == '\t')) after++;
+                if (after < text.size()) {
+                    if (text[after] == '"' || text[after] == '\'') return InferredType::STRING;
+                    if (text[after] == '[') return InferredType::ARRAY;
+                    if (text[after] == '{') return InferredType::MAP;
+                    if (text.substr(after, 4) == "true" || text.substr(after, 5) == "false") return InferredType::BOOL;
+                    if (std::isdigit(static_cast<unsigned char>(text[after])) || text[after] == '-') {
+                        size_t lineEnd = text.find_first_of("\r\n;", after);
+                        std::string expr = text.substr(after, lineEnd == std::string::npos ? 30 : lineEnd - after);
+                        if (expr.find("..") != std::string::npos) return InferredType::RANGE;
+                        return InferredType::NUMBER;
+                    }
+                }
+            }
+        }
+        pos += root.size();
+    }
+
+    return InferredType::UNKNOWN;
+}
+
+static std::vector<BuiltinMemberInfo> getMembersForType(InferredType type) {
+    const auto& all = getBuiltinMembers();
+    std::vector<BuiltinMemberInfo> res;
+    std::string targetType;
+    switch (type) {
+        case InferredType::ARRAY: targetType = "Array"; break;
+        case InferredType::STRING: targetType = "String"; break;
+        case InferredType::NUMBER: targetType = "Number"; break;
+        case InferredType::MAP: targetType = "Map"; break;
+        case InferredType::RANGE: targetType = "Range"; break;
+        case InferredType::BOOL: targetType = "Bool"; break;
+        case InferredType::NIL: targetType = "Nil"; break;
+        case InferredType::UNKNOWN: {
+            std::unordered_set<std::string> seen;
+            for (const auto& bm : all) {
+                if (seen.insert(bm.name + (bm.isMethod ? ":m" : ":p")).second) {
+                    res.push_back(bm);
+                }
+            }
+            return res;
+        }
+    }
+    for (const auto& bm : all) {
+        if (bm.typeName == targetType) {
+            res.push_back(bm);
+        }
+    }
+    return res;
+}
+
+static bool isBuiltinMethod(const std::string_view& name) {
+    const auto& all = getBuiltinMembers();
+    for (const auto& m : all) {
+        if (m.isMethod && m.name == name) return true;
+    }
+    return false;
+}
+
+static bool isBuiltinProperty(const std::string_view& name) {
+    const auto& all = getBuiltinMembers();
+    for (const auto& m : all) {
+        if (!m.isMethod && m.name == name) return true;
+    }
+    return false;
+}
+
+// -----------------------------------------------------------------------------
+// 模組解析與匯出符號提取 (Module Resolution & Symbol Extraction)
+// -----------------------------------------------------------------------------
+
+std::vector<ImportInfo> LspServer::parseDocumentImports(const std::string& text) {
+    std::vector<ImportInfo> imports;
+    Lexer lexer(text);
+    std::vector<Token> tokens;
+    while (true) {
+        Token tok = lexer.nextToken();
+        tokens.push_back(tok);
+        if (tok.type == TokenType::TOKEN_EOF) break;
+    }
+
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        if (tokens[i].type != TokenType::IMPORT) continue;
+
+        // 1. import "path" [as alias];
+        if (i + 1 < tokens.size() && tokens[i + 1].type == TokenType::STRING) {
+            const Token& pathTok = tokens[i + 1];
+            std::string pathStr = cleanStringLiteral(pathTok.lexeme);
+            std::string alias = pathStr;
+            size_t slash = alias.find_last_of("/\\");
+            if (slash != std::string::npos) alias = alias.substr(slash + 1);
+            if (alias.ends_with(".easy") || alias.ends_with(".esc")) {
+                alias = alias.substr(0, alias.find_last_of('.'));
+            }
+
+            if (i + 3 < tokens.size() && tokens[i + 2].type == TokenType::IDENTIFIER && tokens[i + 2].lexeme == "as" && tokens[i + 3].type == TokenType::IDENTIFIER) {
+                alias = std::string(tokens[i + 3].lexeme);
+                i += 3;
+            } else {
+                i += 1;
+            }
+
+            ImportInfo info;
+            info.modulePath = pathStr;
+            info.alias = alias;
+            info.line = pathTok.line - 1;
+            info.pathColStart = pathTok.column - 1;
+            info.pathColEnd = pathTok.column - 1 + static_cast<int>(pathTok.lexeme.size());
+            imports.push_back(std::move(info));
+        }
+        // 2. import { a, b, c } from "path";
+        else if (i + 1 < tokens.size() && tokens[i + 1].type == TokenType::LEFT_BRACE) {
+            size_t p = i + 2;
+            std::vector<std::string> symbols;
+            while (p < tokens.size() && tokens[p].type != TokenType::RIGHT_BRACE && tokens[p].type != TokenType::TOKEN_EOF) {
+                if (tokens[p].type == TokenType::IDENTIFIER) {
+                    symbols.push_back(std::string(tokens[p].lexeme));
+                }
+                p++;
+            }
+            if (p < tokens.size() && tokens[p].type == TokenType::RIGHT_BRACE) p++;
+            if (p + 1 < tokens.size() && tokens[p].type == TokenType::FROM && tokens[p + 1].type == TokenType::STRING) {
+                const Token& pathTok = tokens[p + 1];
+                std::string pathStr = cleanStringLiteral(pathTok.lexeme);
+                std::string alias = pathStr;
+                size_t slash = alias.find_last_of("/\\");
+                if (slash != std::string::npos) alias = alias.substr(slash + 1);
+                if (alias.ends_with(".easy") || alias.ends_with(".esc")) {
+                    alias = alias.substr(0, alias.find_last_of('.'));
+                }
+                ImportInfo info;
+                info.modulePath = pathStr;
+                info.alias = alias;
+                info.namedSymbols = std::move(symbols);
+                info.line = pathTok.line - 1;
+                info.pathColStart = pathTok.column - 1;
+                info.pathColEnd = pathTok.column - 1 + static_cast<int>(pathTok.lexeme.size());
+                imports.push_back(std::move(info));
+                i = p + 1;
+            }
+        }
+        // 3. import * as alias from "path";
+        else if (i + 5 < tokens.size() && tokens[i + 1].type == TokenType::STAR && tokens[i + 2].type == TokenType::IDENTIFIER && tokens[i + 2].lexeme == "as" && tokens[i + 3].type == TokenType::IDENTIFIER && tokens[i + 4].type == TokenType::FROM && tokens[i + 5].type == TokenType::STRING) {
+            std::string alias = std::string(tokens[i + 3].lexeme);
+            const Token& pathTok = tokens[i + 5];
+            std::string pathStr = cleanStringLiteral(pathTok.lexeme);
+            ImportInfo info;
+            info.modulePath = pathStr;
+            info.alias = alias;
+            info.line = pathTok.line - 1;
+            info.pathColStart = pathTok.column - 1;
+            info.pathColEnd = pathTok.column - 1 + static_cast<int>(pathTok.lexeme.size());
+            imports.push_back(std::move(info));
+            i += 5;
+        }
+        // 4. import alias from "path";
+        else if (i + 3 < tokens.size() && tokens[i + 1].type == TokenType::IDENTIFIER && tokens[i + 2].type == TokenType::FROM && tokens[i + 3].type == TokenType::STRING) {
+            std::string alias = std::string(tokens[i + 1].lexeme);
+            const Token& pathTok = tokens[i + 3];
+            std::string pathStr = cleanStringLiteral(pathTok.lexeme);
+            ImportInfo info;
+            info.modulePath = pathStr;
+            info.alias = alias;
+            info.line = pathTok.line - 1;
+            info.pathColStart = pathTok.column - 1;
+            info.pathColEnd = pathTok.column - 1 + static_cast<int>(pathTok.lexeme.size());
+            imports.push_back(std::move(info));
+            i += 3;
+        }
+    }
+    return imports;
+}
+
+bool LspServer::loadDjsonFile(const std::string& filePath) {
+    try {
+        std::error_code ec;
+        if (!fs::exists(filePath, ec) || fs::is_directory(filePath, ec)) return false;
+
+        auto ftime = fs::last_write_time(filePath, ec);
+        int64_t mtime = 0;
+        if (!ec) {
+            mtime = std::chrono::duration_cast<std::chrono::milliseconds>(ftime.time_since_epoch()).count();
+        }
+        djsonFileMtimes[filePath] = mtime;
+
+        std::ifstream file(filePath, std::ios::in | std::ios::binary);
+        if (!file.is_open()) return false;
+        std::stringstream ss;
+        ss << file.rdbuf();
+        std::string fileContent = ss.str();
+
+        Json root = JsonParser::parse(fileContent);
+        if (root.type != JsonType::Object) return false;
+
+        std::string modPath = root.contains("module") ? root["module"].asString() : "";
+        if (modPath.empty()) {
+            fs::path p(filePath);
+            std::string stem = p.filename().string();
+            if (stem.ends_with(".d.json")) stem = stem.substr(0, stem.size() - 7);
+            modPath = stem;
+        }
+
+        ResolvedModule mod;
+        mod.path = modPath;
+        mod.isStandard = modPath.starts_with("std/");
+        if (root.contains("doc")) mod.doc = root["doc"].asString();
+
+        if (root.contains("globalAlias")) {
+            const Json& ga = root["globalAlias"];
+            if (ga.type == JsonType::String) {
+                mod.globalAliases.push_back(ga.asString());
+            } else if (ga.type == JsonType::Array) {
+                for (const auto& item : ga.arrVal) {
+                    if (item.type == JsonType::String) {
+                        mod.globalAliases.push_back(item.asString());
+                    }
+                }
+            }
+        }
+
+        auto parseSymbol = [](const Json& sJson) -> ExportedSymbol {
+            ExportedSymbol s;
+            s.name = sJson.contains("name") ? sJson["name"].asString() : "";
+            std::string kindStr = sJson.contains("kind") ? sJson["kind"].asString() : "function";
+            if (kindStr == "function") s.kind = 3;
+            else if (kindStr == "method") s.kind = 2;
+            else if (kindStr == "class") s.kind = 7;
+            else if (kindStr == "constant") s.kind = 21;
+            else if (kindStr == "variable") s.kind = 6;
+            else if (kindStr == "property") s.kind = 10;
+            else if (kindStr == "module") s.kind = 9;
+            else s.kind = 3;
+
+            if (sJson.contains("signature")) s.signature = sJson["signature"].asString();
+            else s.signature = s.name;
+            if (sJson.contains("doc")) s.doc = sJson["doc"].asString();
+
+            if (sJson.contains("parameters") && sJson["parameters"].type == JsonType::Array) {
+                for (const auto& p : sJson["parameters"].arrVal) {
+                    if (p.type == JsonType::String) s.parameters.push_back(p.asString());
+                    else if (p.type == JsonType::Object && p.contains("name")) s.parameters.push_back(p["name"].asString());
+                }
+            }
+
+            if (sJson.contains("members") && sJson["members"].type == JsonType::Array) {
+                for (const auto& mJson : sJson["members"].arrVal) {
+                    ExportedSymbol m;
+                    m.name = mJson.contains("name") ? mJson["name"].asString() : "";
+                    std::string mKind = mJson.contains("kind") ? mJson["kind"].asString() : "method";
+                    if (mKind == "method") m.kind = 2;
+                    else if (mKind == "property") m.kind = 10;
+                    else if (mKind == "constant") m.kind = 21;
+                    else m.kind = 2;
+
+                    m.signature = mJson.contains("signature") ? mJson["signature"].asString() : m.name;
+                    if (mJson.contains("doc")) m.doc = mJson["doc"].asString();
+                    if (mJson.contains("parameters") && mJson["parameters"].type == JsonType::Array) {
+                        for (const auto& p : mJson["parameters"].arrVal) {
+                            if (p.type == JsonType::String) m.parameters.push_back(p.asString());
+                            else if (p.type == JsonType::Object && p.contains("name")) m.parameters.push_back(p["name"].asString());
+                        }
+                    }
+                    s.members.push_back(std::move(m));
+                }
+            }
+            return s;
+        };
+
+        if (root.contains("symbols") && root["symbols"].type == JsonType::Array) {
+            for (const auto& sJson : root["symbols"].arrVal) {
+                mod.symbols.push_back(parseSymbol(sJson));
+            }
+        }
+
+        djsonModules[modPath] = mod;
+        std::string alt = modPath;
+        std::replace(alt.begin(), alt.end(), '/', '_');
+        if (alt != modPath) {
+            djsonModules[alt] = mod;
+        }
+
+        for (const auto& alias : mod.globalAliases) {
+            bool isSymbol = false;
+            for (const auto& s : mod.symbols) {
+                if (s.name == alias) {
+                    globalAliasSymbolMap[alias] = s;
+                    isSymbol = true;
+                    break;
+                }
+            }
+            if (!isSymbol) {
+                globalAliasModuleMap[alias] = modPath;
+            }
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+void LspServer::scanDjsonModules() {
+    std::vector<fs::path> dirs;
+    if (!workspaceRoot.empty()) {
+        dirs.push_back(fs::path(workspaceRoot) / "plugins");
+        dirs.push_back(fs::path(workspaceRoot) / "lib");
+        dirs.push_back(fs::path(workspaceRoot));
+    }
+    dirs.push_back(fs::path("./plugins"));
+    dirs.push_back(fs::path("./lib"));
+
+    std::string exeDir = getExecutableDir();
+    if (!exeDir.empty()) {
+        dirs.push_back(fs::path(exeDir) / "plugins");
+        dirs.push_back(fs::path(exeDir) / "lib");
+        dirs.push_back(fs::path(exeDir) / ".." / "plugins");
+    }
+
+    const char* envPath = std::getenv("EASYSCRIPT_PATH");
+    if (envPath && *envPath) {
+        std::stringstream ss(envPath);
+        std::string item;
+#ifdef _WIN32
+        char delim = ';';
+#else
+        char delim = ':';
+#endif
+        while (std::getline(ss, item, delim)) {
+            if (!item.empty()) dirs.push_back(fs::path(item));
+        }
+    }
+
+    std::unordered_set<std::string> scannedDirs;
+    for (const auto& d : dirs) {
+        try {
+            std::error_code ec;
+            if (!fs::exists(d, ec) || !fs::is_directory(d, ec)) continue;
+            std::string canonicalDir = fs::canonical(d, ec).string();
+            if (scannedDirs.count(canonicalDir)) continue;
+            scannedDirs.insert(canonicalDir);
+
+            for (const auto& entry : fs::directory_iterator(d, ec)) {
+                if (ec) break;
+                if (entry.is_regular_file()) {
+                    std::string filename = entry.path().filename().string();
+                    if (filename.ends_with(".d.json")) {
+                        loadDjsonFile(entry.path().string());
+                    }
+                }
+            }
+        } catch (...) {}
+    }
+}
+
+void LspServer::checkDjsonReload() {
+    for (const auto& [filePath, oldMtime] : djsonFileMtimes) {
+        std::error_code ec;
+        if (fs::exists(filePath, ec)) {
+            auto ftime = fs::last_write_time(filePath, ec);
+            if (!ec) {
+                int64_t newMtime = std::chrono::duration_cast<std::chrono::milliseconds>(ftime.time_since_epoch()).count();
+                if (newMtime > oldMtime) {
+                    loadDjsonFile(filePath);
+                }
+            }
+        }
+    }
+}
+
+ResolvedModule LspServer::resolveModule(const std::string& currentDocUri, const std::string& importPath) {
+    ResolvedModule mod;
+    mod.path = importPath;
+
+    checkDjsonReload();
+
+    // 1. 優先查 .d.json 模組快取
+    auto it = djsonModules.find(importPath);
+    if (it != djsonModules.end()) {
+        return it->second;
+    }
+    std::string alt = importPath;
+    std::replace(alt.begin(), alt.end(), '/', '_');
+    it = djsonModules.find(alt);
+    if (it != djsonModules.end()) {
+        return it->second;
+    }
+
+    // 嘗試動態搜尋該模組的 .d.json 檔案
+    std::vector<std::string> candidateNames = {
+        importPath + ".d.json",
+        alt + ".d.json"
+    };
+    std::vector<fs::path> searchDirs;
+    if (!workspaceRoot.empty()) {
+        searchDirs.push_back(fs::path(workspaceRoot) / "plugins");
+        searchDirs.push_back(fs::path(workspaceRoot) / "lib");
+        searchDirs.push_back(fs::path(workspaceRoot));
+    }
+    searchDirs.push_back(fs::path("./plugins"));
+    searchDirs.push_back(fs::path("./lib"));
+    std::string exeDir = getExecutableDir();
+    if (!exeDir.empty()) {
+        searchDirs.push_back(fs::path(exeDir) / "plugins");
+        searchDirs.push_back(fs::path(exeDir) / ".." / "plugins");
+    }
+    for (const auto& d : searchDirs) {
+        for (const auto& name : candidateNames) {
+            fs::path p = d / name;
+            std::error_code ec;
+            if (fs::exists(p, ec) && !fs::is_directory(p, ec)) {
+                if (loadDjsonFile(p.string())) {
+                    if (djsonModules.count(importPath)) return djsonModules[importPath];
+                    if (djsonModules.count(alt)) return djsonModules[alt];
+                }
+            }
+        }
+    }
+
+    // 備用相容硬編碼:
+    if (importPath == "std/io") {
+        mod.isStandard = true;
+        mod.symbols.push_back({"write", 3, 0, 0, 5, "write(...args): void", "Prints arguments to stdout without automatic newline."});
+        mod.symbols.push_back({"writeln", 3, 0, 0, 7, "writeln(...args): void", "Prints arguments to stdout followed by newline."});
+        mod.symbols.push_back({"writeError", 3, 0, 0, 10, "writeError(...args): void", "Prints arguments to stderr without newline."});
+        mod.symbols.push_back({"writeErrorln", 3, 0, 0, 12, "writeErrorln(...args): void", "Prints arguments to stderr followed by newline."});
+        mod.symbols.push_back({"readLine", 3, 0, 0, 8, "readLine(): string", "Reads a line from stdin (stripping trailing \\r\\n)."});
+        mod.symbols.push_back({"readAll", 3, 0, 0, 7, "readAll(): string", "Reads entire standard input until EOF."});
+        mod.symbols.push_back({"readChar", 3, 0, 0, 8, "readChar(): string", "Reads a single unbuffered keystroke immediately."});
+        mod.symbols.push_back({"flush", 3, 0, 0, 5, "flush(): void", "Flushes stdout buffer."});
+        mod.symbols.push_back({"flushError", 3, 0, 0, 10, "flushError(): void", "Flushes stderr buffer."});
+        mod.symbols.push_back({"setEncoding", 3, 0, 0, 11, "setEncoding(encoding, setInput = true): bool", "Sets console output and input character encoding."});
+        mod.symbols.push_back({"getEncoding", 3, 0, 0, 11, "getEncoding(): string", "Gets current console output character encoding name."});
+
+        ExportedSymbol termSym{"Terminal", 7, 0, 0, 8, "class Terminal", "Terminal screen and cursor manipulation class."};
+        termSym.members.push_back({"clear", 3, 0, 0, 5, "clear(): void", "Clears terminal screen."});
+        termSym.members.push_back({"clearLine", 3, 0, 0, 9, "clearLine(): void", "Clears current line."});
+        termSym.members.push_back({"clearToEnd", 3, 0, 0, 10, "clearToEnd(): void", "Clears to end of screen."});
+        termSym.members.push_back({"setCursor", 3, 0, 0, 9, "setCursor(x, y): void", "Sets cursor position (1-based)."});
+        termSym.members.push_back({"getCursor", 3, 0, 0, 9, "getCursor(): Map {x, y}", "Gets cursor position."});
+        termSym.members.push_back({"moveUp", 3, 0, 0, 6, "moveUp(n = 1): void", "Moves cursor up."});
+        termSym.members.push_back({"moveDown", 3, 0, 0, 8, "moveDown(n = 1): void", "Moves cursor down."});
+        termSym.members.push_back({"moveLeft", 3, 0, 0, 8, "moveLeft(n = 1): void", "Moves cursor left."});
+        termSym.members.push_back({"moveRight", 3, 0, 0, 9, "moveRight(n = 1): void", "Moves cursor right."});
+        termSym.members.push_back({"hideCursor", 3, 0, 0, 10, "hideCursor(): void", "Hides cursor."});
+        termSym.members.push_back({"showCursor", 3, 0, 0, 10, "showCursor(): void", "Shows cursor."});
+        termSym.members.push_back({"getWidth", 3, 0, 0, 8, "getWidth(): int", "Gets terminal width."});
+        termSym.members.push_back({"getHeight", 3, 0, 0, 9, "getHeight(): int", "Gets terminal height."});
+        termSym.members.push_back({"getSize", 3, 0, 0, 7, "getSize(): Map {width, height}", "Gets terminal size."});
+        termSym.members.push_back({"isTerminal", 3, 0, 0, 10, "isTerminal(): bool", "Checks if interactive terminal."});
+        termSym.members.push_back({"beep", 3, 0, 0, 4, "beep(): void", "Emits console bell alert."});
+        termSym.members.push_back({"setEncoding", 3, 0, 0, 11, "setEncoding(encoding, setInput = true): bool", "Sets console encoding."});
+        termSym.members.push_back({"getEncoding", 3, 0, 0, 11, "getEncoding(): string", "Gets console encoding."});
+        termSym.members.push_back({"setCodePage", 3, 0, 0, 11, "setCodePage(cp, setInput = true): bool", "Sets Windows CodePage."});
+        termSym.members.push_back({"getCodePage", 3, 0, 0, 11, "getCodePage(): int", "Gets Windows CodePage."});
+        mod.symbols.push_back(std::move(termSym));
+
+        ExportedSymbol colorSym{"Color", 7, 0, 0, 5, "class Color", "ANSI terminal colors and text styles class."};
+        const char* colors[] = {"red", "green", "yellow", "blue", "magenta", "cyan", "white", "gray"};
+        for (const char* c : colors) colorSym.members.push_back({c, 3, 0, 0, static_cast<int>(strlen(c)), std::string(c) + "(text: string): string", "ANSI foreground color."});
+        const char* bgColors[] = {"bgRed", "bgGreen", "bgYellow", "bgBlue", "bgMagenta", "bgCyan", "bgWhite", "bgGray"};
+        for (const char* c : bgColors) colorSym.members.push_back({c, 3, 0, 0, static_cast<int>(strlen(c)), std::string(c) + "(text: string): string", "ANSI background color."});
+        const char* styles[] = {"bold", "dim", "italic", "underline", "inverse"};
+        for (const char* s : styles) colorSym.members.push_back({s, 3, 0, 0, static_cast<int>(strlen(s)), std::string(s) + "(text: string): string", "ANSI style."});
+        colorSym.members.push_back({"rgb", 3, 0, 0, 3, "rgb(r, g, b, text): string", "24-bit TrueColor foreground."});
+        colorSym.members.push_back({"bgRgb", 3, 0, 0, 5, "bgRgb(r, g, b, text): string", "24-bit TrueColor background."});
+        colorSym.members.push_back({"strip", 3, 0, 0, 5, "strip(text: string): string", "Removes ANSI sequences."});
+        colorSym.members.push_back({"RED", 21, 0, 0, 3, "const RED: string", "ANSI Red code."});
+        colorSym.members.push_back({"GREEN", 21, 0, 0, 5, "const GREEN: string", "ANSI Green code."});
+        colorSym.members.push_back({"RESET", 21, 0, 0, 5, "const RESET: string", "ANSI Reset code."});
+        mod.symbols.push_back(std::move(colorSym));
+
+        ExportedSymbol promptSym{"Prompt", 7, 0, 0, 6, "class Prompt", "Interactive CLI prompt dialog class."};
+        promptSym.members.push_back({"ask", 3, 0, 0, 3, "ask(question, defaultVal = ''): string", "Interactive user prompt."});
+        promptSym.members.push_back({"confirm", 3, 0, 0, 7, "confirm(question, defaultVal = false): bool", "Interactive [y/N] prompt."});
+        promptSym.members.push_back({"password", 3, 0, 0, 8, "password(question, maskChar = '*'): string", "Hidden password prompt."});
+        promptSym.members.push_back({"choose", 3, 0, 0, 6, "choose(question, options): int", "Option chooser dialog."});
+        mod.symbols.push_back(std::move(promptSym));
+
+        return mod;
+    } else if (importPath == "std/fs") {
+        mod.isStandard = true;
+        mod.symbols.push_back({"readText", 3, 0, 0, 8, "readText(path: string): string", "Reads entire file as UTF-8 text."});
+        mod.symbols.push_back({"writeText", 3, 0, 0, 9, "writeText(path, text): bool", "Overwrites file with text."});
+        mod.symbols.push_back({"appendText", 3, 0, 0, 10, "appendText(path, text): bool", "Appends text to file."});
+        mod.symbols.push_back({"exists", 3, 0, 0, 6, "exists(path: string): bool", "Checks whether file or directory exists."});
+        mod.symbols.push_back({"remove", 3, 0, 0, 6, "remove(path: string): bool", "Deletes single file or empty directory."});
+        mod.symbols.push_back({"removeTree", 3, 0, 0, 10, "removeTree(path: string): bool", "Recursively deletes directory and all contents."});
+        mod.symbols.push_back({"makeDir", 3, 0, 0, 7, "makeDir(path: string): bool", "Creates directories along path."});
+        mod.symbols.push_back({"listDir", 3, 0, 0, 7, "listDir(path: string): Array<string>", "Lists filenames in directory."});
+        mod.symbols.push_back({"stat", 3, 0, 0, 4, "stat(path: string): Map", "Retrieves file metadata map."});
+        return mod;
+    } else if (importPath == "std/path") {
+        mod.isStandard = true;
+        mod.symbols.push_back({"join", 3, 0, 0, 4, "join(...parts): string", "Joins path segments with normalized separators."});
+        mod.symbols.push_back({"dirname", 3, 0, 0, 7, "dirname(path): string", "Gets directory name of path."});
+        mod.symbols.push_back({"basename", 3, 0, 0, 8, "basename(path): string", "Gets filename or last segment of path."});
+        mod.symbols.push_back({"extname", 3, 0, 0, 7, "extname(path): string", "Gets extension of path including leading dot."});
+        mod.symbols.push_back({"isAbsolute", 3, 0, 0, 10, "isAbsolute(path): bool", "Checks if path is absolute."});
+        mod.symbols.push_back({"resolve", 3, 0, 0, 7, "resolve(...paths): string", "Resolves absolute canonical path."});
+        mod.symbols.push_back({"normalize", 3, 0, 0, 9, "normalize(path): string", "Normalizes path separators."});
+        return mod;
+    } else if (importPath == "std/os") {
+        mod.isStandard = true;
+        mod.symbols.push_back({"platform", 3, 0, 0, 8, "platform(): string", "Returns host OS ('windows', 'linux', 'macos')."});
+        mod.symbols.push_back({"arch", 3, 0, 0, 4, "arch(): string", "Returns architecture ('x86_64', 'arm64')."});
+        mod.symbols.push_back({"getEnv", 3, 0, 0, 6, "getEnv(name: string): string | nil", "Gets environment variable value."});
+        mod.symbols.push_back({"setEnv", 3, 0, 0, 6, "setEnv(name, val): bool", "Sets environment variable value."});
+        mod.symbols.push_back({"cwd", 3, 0, 0, 3, "cwd(): string", "Gets current working directory."});
+        mod.symbols.push_back({"chdir", 3, 0, 0, 5, "chdir(path): bool", "Changes current working directory."});
+        mod.symbols.push_back({"exec", 3, 0, 0, 4, "exec(command: string): int", "Executes shell command and returns exit code."});
+        mod.symbols.push_back({"cpuCount", 3, 0, 0, 8, "cpuCount(): int", "Returns hardware concurrency CPU core count."});
+        mod.symbols.push_back({"exit", 3, 0, 0, 4, "exit(code: int): void", "Terminates the process."});
+        return mod;
+    } else if (importPath == "std/math") {
+        mod.isStandard = true;
+        mod.symbols.push_back({"PI", 21, 0, 0, 2, "const PI: double = 3.14159...", "Mathematical constant Pi."});
+        mod.symbols.push_back({"E", 21, 0, 0, 1, "const E: double = 2.71828...", "Mathematical constant E."});
+        mod.symbols.push_back({"sqrt", 3, 0, 0, 4, "sqrt(x: double): double", "Square root."});
+        mod.symbols.push_back({"pow", 3, 0, 0, 3, "pow(base, exp): double", "Power function."});
+        mod.symbols.push_back({"abs", 3, 0, 0, 3, "abs(x): number", "Absolute value."});
+        mod.symbols.push_back({"floor", 3, 0, 0, 5, "floor(x: double): int", "Floor."});
+        mod.symbols.push_back({"ceil", 3, 0, 0, 4, "ceil(x: double): int", "Ceiling."});
+        mod.symbols.push_back({"round", 3, 0, 0, 5, "round(x: double): int", "Round."});
+        mod.symbols.push_back({"min", 3, 0, 0, 3, "min(a, b): number", "Minimum."});
+        mod.symbols.push_back({"max", 3, 0, 0, 3, "max(a, b): number", "Maximum."});
+        mod.symbols.push_back({"clamp", 3, 0, 0, 5, "clamp(val, min, max): number", "Clamp."});
+        mod.symbols.push_back({"random", 3, 0, 0, 6, "random(): double", "Random [0, 1)."});
+        mod.symbols.push_back({"randomInt", 3, 0, 0, 9, "randomInt(min, max): int", "Random integer."});
+        return mod;
+    }
+
+    // 2. 使用者腳本檔案解析 (.easy)
+    std::string currentPath = uriToPath(currentDocUri);
+    fs::path currentDir = fs::path(currentPath).parent_path();
+    fs::path targetPath = currentDir / importPath;
+
+    fs::path normPath = targetPath.lexically_normal();
+    fs::path normPathWithExt = (targetPath.string().ends_with(".easy") ? normPath : (targetPath.parent_path() / (targetPath.filename().string() + ".easy")).lexically_normal());
+
+    std::string candidateUri = pathToUri(normPath.string());
+    std::string candidateUriWithExt = pathToUri(normPathWithExt.string());
+
+    // 先檢查記憶體中開啟的文檔 (未存檔也能即時解析跨模組提示)
+    if (documents.find(candidateUri) != documents.end()) {
+        mod.targetUri = candidateUri;
+    } else if (documents.find(candidateUriWithExt) != documents.end()) {
+        mod.targetUri = candidateUriWithExt;
+    }
+
+    std::string resolvedFile;
+    try {
+        if (fs::exists(targetPath) && !fs::is_directory(targetPath)) {
+            resolvedFile = fs::canonical(targetPath).string();
+        } else if (fs::exists(targetPath.string() + ".easy")) {
+            resolvedFile = fs::canonical(targetPath.string() + ".easy").string();
+        } else {
+            // 嘗試相對工作目錄
+            fs::path cwdTarget = fs::current_path() / importPath;
+            if (fs::exists(cwdTarget) && !fs::is_directory(cwdTarget)) {
+                resolvedFile = fs::canonical(cwdTarget).string();
+            } else if (fs::exists(cwdTarget.string() + ".easy")) {
+                resolvedFile = fs::canonical(cwdTarget.string() + ".easy").string();
+            }
+        }
+    } catch (...) {}
+
+    if (mod.targetUri.empty() && !resolvedFile.empty()) {
+        mod.targetUri = pathToUri(resolvedFile);
+    }
+
+    if (mod.targetUri.empty()) {
+        return mod;
+    }
+
+    // 取得模組原始碼 (優先使用記憶體編輯器緩衝區，次之使用磁碟檔案)
+    std::string sourceCode;
+    auto docIt = documents.find(mod.targetUri);
+    if (docIt != documents.end()) {
+        sourceCode = docIt->second;
+    } else if (!resolvedFile.empty()) {
+        std::ifstream file(resolvedFile);
+        if (file.is_open()) {
+            std::stringstream ss;
+            ss << file.rdbuf();
+            sourceCode = ss.str();
+        }
+    }
+
+    if (sourceCode.empty()) {
+        return mod;
+    }
+
+    // 解析模組中的匯出與定義
+    Lexer lexer(sourceCode);
+    std::vector<Token> tokens;
+    while (true) {
+        Token tok = lexer.nextToken();
+        tokens.push_back(tok);
+        if (tok.type == TokenType::TOKEN_EOF) break;
+    }
+
+    bool hasExplicitExports = false;
+    for (const auto& tok : tokens) {
+        if (tok.type == TokenType::EXPORT) {
+            hasExplicitExports = true;
+            break;
+        }
+    }
+
+    int braceDepth = 0;
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        const Token& tok = tokens[i];
+        if (tok.type == TokenType::TOKEN_EOF) break;
+
+        if (tok.type == TokenType::LEFT_BRACE) {
+            braceDepth++;
+            continue;
+        }
+        if (tok.type == TokenType::RIGHT_BRACE) {
+            if (braceDepth > 0) braceDepth--;
+            continue;
+        }
+
+        bool isExported = false;
+        size_t declIdx = i;
+
+        if (hasExplicitExports) {
+            if (tok.type == TokenType::EXPORT && i + 1 < tokens.size()) {
+                isExported = true;
+                declIdx = i + 1;
+            }
+        } else {
+            // 沒有顯式 export 時，匯出所有頂層宣告 (braceDepth == 0)
+            if (braceDepth == 0 && (tok.type == TokenType::FN || tok.type == TokenType::CLASS ||
+                                     tok.type == TokenType::CONST || tok.type == TokenType::LET)) {
+                isExported = true;
+                declIdx = i;
+            }
+        }
+
+        if (!isExported) continue;
+
+        const Token& declTok = tokens[declIdx];
+        if (declTok.type == TokenType::FN && declIdx + 1 < tokens.size() && tokens[declIdx + 1].type == TokenType::IDENTIFIER) {
+            const Token& nameTok = tokens[declIdx + 1];
+            size_t p = declIdx + 2;
+            std::string sig = "fn " + std::string(nameTok.lexeme);
+            if (p < tokens.size() && tokens[p].type == TokenType::LEFT_PAREN) {
+                sig += "(";
+                p++;
+                while (p < tokens.size() && tokens[p].type != TokenType::RIGHT_PAREN && tokens[p].type != TokenType::TOKEN_EOF) {
+                    if (tokens[p].type == TokenType::COMMA) {
+                        sig += ", ";
+                    } else if (tokens[p].type == TokenType::COLON) {
+                        sig += ": ";
+                    } else if (tokens[p].type == TokenType::EQUAL) {
+                        sig += " = ";
+                    } else {
+                        if (!sig.empty() && sig.back() != '(' && sig.back() != ' ') {
+                            sig += " ";
+                        }
+                        sig += std::string(tokens[p].lexeme);
+                    }
+                    p++;
+                }
+                sig += ")";
+                if (p < tokens.size() && tokens[p].type == TokenType::RIGHT_PAREN) p++;
+                if (p < tokens.size() && tokens[p].type == TokenType::COLON) {
+                    sig += ": ";
+                    p++;
+                    while (p < tokens.size() && tokens[p].type != TokenType::LEFT_BRACE && tokens[p].type != TokenType::SEMICOLON && tokens[p].type != TokenType::TOKEN_EOF) {
+                        sig += std::string(tokens[p].lexeme);
+                        p++;
+                    }
+                }
+            }
+
+            ExportedSymbol sym;
+            sym.name = std::string(nameTok.lexeme);
+            sym.kind = 3; // Function
+            sym.line = nameTok.line - 1;
+            sym.column = nameTok.column - 1;
+            sym.length = static_cast<int>(nameTok.lexeme.size());
+            sym.signature = sig;
+            sym.doc = extractDocComment(sourceCode, tok.line - 1);
+            sym.sourceUri = mod.targetUri;
+            mod.symbols.push_back(std::move(sym));
+            i = declIdx;
+        } else if (declTok.type == TokenType::CLASS && declIdx + 1 < tokens.size() && tokens[declIdx + 1].type == TokenType::IDENTIFIER) {
+            const Token& nameTok = tokens[declIdx + 1];
+            ExportedSymbol sym;
+            sym.name = std::string(nameTok.lexeme);
+            sym.kind = 7; // Class
+            sym.line = nameTok.line - 1;
+            sym.column = nameTok.column - 1;
+            sym.length = static_cast<int>(nameTok.lexeme.size());
+            sym.signature = "class " + std::string(nameTok.lexeme);
+            sym.doc = extractDocComment(sourceCode, tok.line - 1);
+            sym.sourceUri = mod.targetUri;
+
+            // 尋找類別主體 { ... } 並收集成員方法與建構子
+            size_t bodyIdx = declIdx + 2;
+            while (bodyIdx < tokens.size() && tokens[bodyIdx].type != TokenType::LEFT_BRACE && tokens[bodyIdx].type != TokenType::TOKEN_EOF) {
+                bodyIdx++;
+            }
+            if (bodyIdx < tokens.size() && tokens[bodyIdx].type == TokenType::LEFT_BRACE) {
+                int cDepth = 1;
+                size_t mIdx = bodyIdx + 1;
+                while (mIdx < tokens.size() && cDepth > 0) {
+                    if (tokens[mIdx].type == TokenType::LEFT_BRACE) {
+                        cDepth++;
+                    } else if (tokens[mIdx].type == TokenType::RIGHT_BRACE) {
+                        cDepth--;
+                        if (cDepth == 0) break;
+                    } else if (cDepth == 1) {
+                        if (tokens[mIdx].type == TokenType::FN && mIdx + 1 < tokens.size() && tokens[mIdx + 1].type == TokenType::IDENTIFIER) {
+                            const Token& mName = tokens[mIdx + 1];
+                            ExportedSymbol mSym;
+                            mSym.name = std::string(mName.lexeme);
+                            mSym.kind = 2; // Method
+                            mSym.line = mName.line - 1;
+                            mSym.column = mName.column - 1;
+                            mSym.length = static_cast<int>(mName.lexeme.size());
+                            mSym.signature = "fn " + std::string(mName.lexeme) + "()";
+                            size_t mp = mIdx + 2;
+                            if (mp < tokens.size() && tokens[mp].type == TokenType::LEFT_PAREN) {
+                                std::string msig = "fn " + std::string(mName.lexeme) + "(";
+                                mp++;
+                                while (mp < tokens.size() && tokens[mp].type != TokenType::RIGHT_PAREN && tokens[mp].type != TokenType::TOKEN_EOF) {
+                                    if (tokens[mp].type == TokenType::COMMA) msig += ", ";
+                                    else if (tokens[mp].type == TokenType::COLON) msig += ": ";
+                                    else if (tokens[mp].type == TokenType::EQUAL) msig += " = ";
+                                    else {
+                                        if (!msig.empty() && msig.back() != '(' && msig.back() != ' ') msig += " ";
+                                        msig += std::string(tokens[mp].lexeme);
+                                    }
+                                    mp++;
+                                }
+                                msig += ")";
+                                mSym.signature = msig;
+                            }
+                            mSym.doc = extractDocComment(sourceCode, tokens[mIdx].line - 1);
+                            mSym.sourceUri = mod.targetUri;
+                            sym.members.push_back(std::move(mSym));
+                        } else if (tokens[mIdx].type == TokenType::INIT) {
+                            const Token& mName = tokens[mIdx];
+                            ExportedSymbol mSym;
+                            mSym.name = "init";
+                            mSym.kind = 4; // Constructor
+                            mSym.line = mName.line - 1;
+                            mSym.column = mName.column - 1;
+                            mSym.length = static_cast<int>(mName.lexeme.size());
+                            mSym.signature = "init()";
+                            size_t mp = mIdx + 1;
+                            if (mp < tokens.size() && tokens[mp].type == TokenType::LEFT_PAREN) {
+                                std::string msig = "init(";
+                                mp++;
+                                while (mp < tokens.size() && tokens[mp].type != TokenType::RIGHT_PAREN && tokens[mp].type != TokenType::TOKEN_EOF) {
+                                    if (tokens[mp].type == TokenType::COMMA) msig += ", ";
+                                    else if (tokens[mp].type == TokenType::COLON) msig += ": ";
+                                    else if (tokens[mp].type == TokenType::EQUAL) msig += " = ";
+                                    else {
+                                        if (!msig.empty() && msig.back() != '(' && msig.back() != ' ') msig += " ";
+                                        msig += std::string(tokens[mp].lexeme);
+                                    }
+                                    mp++;
+                                }
+                                msig += ")";
+                                mSym.signature = msig;
+                            }
+                            mSym.doc = extractDocComment(sourceCode, tokens[mIdx].line - 1);
+                            mSym.sourceUri = mod.targetUri;
+                            sym.members.push_back(std::move(mSym));
+                        }
+                    }
+                    mIdx++;
+                }
+            }
+
+            mod.symbols.push_back(std::move(sym));
+            i = declIdx;
+        } else if ((declTok.type == TokenType::LET || declTok.type == TokenType::CONST) && declIdx + 1 < tokens.size() && tokens[declIdx + 1].type == TokenType::IDENTIFIER) {
+            const Token& nameTok = tokens[declIdx + 1];
+            ExportedSymbol sym;
+            sym.name = std::string(nameTok.lexeme);
+            sym.kind = (declTok.type == TokenType::CONST) ? 21 : 6; // Constant / Variable
+            sym.line = nameTok.line - 1;
+            sym.column = nameTok.column - 1;
+            sym.length = static_cast<int>(nameTok.lexeme.size());
+            sym.signature = (declTok.type == TokenType::CONST ? "const " : "let ") + std::string(nameTok.lexeme);
+            sym.doc = extractDocComment(sourceCode, tok.line - 1);
+            sym.sourceUri = mod.targetUri;
+            mod.symbols.push_back(std::move(sym));
+            i = declIdx;
+        }
+    }
+
+    return mod;
+}
+
+// -----------------------------------------------------------------------------
+// 代碼自動補全 (Completion)
+// -----------------------------------------------------------------------------
+
+static void addCompletion(Json& list, const std::string& label, int kind, const std::string& detail, const std::string& doc = "") {
+    Json item = Json::object();
+    item["label"] = label;
+    item["kind"] = kind;
+    item["detail"] = detail;
+    if (!doc.empty()) {
+        Json d = Json::object();
+        d["kind"] = "markdown";
+        d["value"] = doc;
+        item["documentation"] = d;
+    }
+    list.push_back(item);
+}
+
+Json LspServer::handleCompletion(const std::string& uri, int line, int character) {
+    auto it = documents.find(uri);
+    std::string text = (it != documents.end()) ? it->second : "";
+    std::string prefix = getLinePrefix(text, line, character);
+    std::string lineStr = getLineText(text, line);
+
+    Json items = Json::array();
+    std::vector<ImportInfo> docImports = parseDocumentImports(text);
+
+    // 1. 模組路徑補全 (import "..." 或 from "...")
+    if (prefix.find("import \"") != std::string::npos || prefix.find("from \"") != std::string::npos ||
+        prefix.find("import '") != std::string::npos || prefix.find("from '") != std::string::npos) {
+        checkDjsonReload();
+        std::unordered_set<std::string> seenMods;
+        for (const auto& [modId, m] : djsonModules) {
+            if (seenMods.insert(m.path).second) {
+                addCompletion(items, m.path, 9, "module " + m.path, m.doc.empty() ? ("Module " + m.path) : m.doc);
+            }
+        }
+
+        // 搜尋當前檔案同層目錄下的 .easy 與 .esc 模組
+        std::string currentPath = uriToPath(uri);
+        fs::path currentDir = fs::path(currentPath).parent_path();
+        try {
+            if (fs::exists(currentDir) && fs::is_directory(currentDir)) {
+                for (const auto& entry : fs::directory_iterator(currentDir)) {
+                    if (entry.is_regular_file()) {
+                        std::string ext = entry.path().extension().string();
+                        if (ext == ".easy" || ext == ".esc") {
+                            std::string filename = entry.path().filename().string();
+                            std::string stem = entry.path().stem().string();
+                            if (entry.path() != fs::path(currentPath)) {
+                                addCompletion(items, "./" + filename, 17, "module " + filename, "Local EasyScript module file");
+                                addCompletion(items, "./" + stem, 17, "module " + stem, "Local EasyScript module");
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (...) {}
+
+        return items;
+    }
+
+    // 2. 解構匯入提示: import { | } from "module"
+    size_t importPos = lineStr.find("import");
+    size_t braceStart = lineStr.find('{');
+    size_t fromPos = lineStr.find("from");
+    if (importPos != std::string::npos && braceStart != std::string::npos && character > static_cast<int>(braceStart)) {
+        size_t braceEnd = lineStr.find('}', braceStart);
+        if (braceEnd == std::string::npos || character <= static_cast<int>(braceEnd)) {
+            if (fromPos != std::string::npos && fromPos > braceStart) {
+                size_t q1 = lineStr.find_first_of("\"'", fromPos);
+                if (q1 != std::string::npos) {
+                    char quote = lineStr[q1];
+                    size_t q2 = lineStr.find(quote, q1 + 1);
+                    if (q2 != std::string::npos) {
+                        std::string modPath = lineStr.substr(q1 + 1, q2 - q1 - 1);
+                        ResolvedModule mod = resolveModule(uri, modPath);
+                        for (const auto& sym : mod.symbols) {
+                            addCompletion(items, sym.name, sym.kind, sym.signature, sym.doc);
+                        }
+                        return items;
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. 模組別名或物件成員點運算子提示 (<alias>., <alias>.<filter>, <alias>.<Class>., etc.)
+    AccessChain ac = parseAccessChain(lineStr, character);
+    if (!ac.chain.empty()) {
+        const std::string& root = ac.chain[0];
+
+        auto addSymbols = [&](const std::vector<ExportedSymbol>& syms) {
+            for (const auto& sym : syms) {
+                addCompletion(items, sym.name, sym.kind, sym.signature, sym.doc);
+            }
+        };
+
+        // A. 尋找 root 是否為匯入的模組
+        const ImportInfo* matchedImp = nullptr;
+        for (const auto& imp : docImports) {
+            if (imp.alias == root) {
+                matchedImp = &imp;
+                break;
+            }
+        }
+
+        // A. 優先檢查 root 是否為全域別名類別 (例如 Terminal, Color, Prompt)
+        if (globalAliasSymbolMap.count(root)) {
+            const auto& sym = globalAliasSymbolMap[root];
+            if (!sym.members.empty()) {
+                addSymbols(sym.members);
+                return items;
+            }
+        }
+
+        ResolvedModule mod;
+        bool foundMod = false;
+        if (matchedImp) {
+            mod = resolveModule(uri, matchedImp->modulePath);
+            foundMod = true;
+        } else if (globalAliasModuleMap.count(root)) {
+            mod = resolveModule(uri, globalAliasModuleMap[root]);
+            foundMod = true;
+        }
+
+        if (foundMod) {
+            if (ac.chain.size() == 1) {
+                // <module>.<method/member>
+                addSymbols(mod.symbols);
+                return items;
+            } else if (ac.chain.size() == 2) {
+                // <module>.<Class>.<method> (例如 io.Terminal. 或 calc.Calculator.)
+                const std::string& memberClass = ac.chain[1];
+                for (const auto& sym : mod.symbols) {
+                    if (sym.name == memberClass && !sym.members.empty()) {
+                        addSymbols(sym.members);
+                        return items;
+                    }
+                }
+            }
+        }
+
+        // B. 檢查 root 是否為全域別名類別 (例如 Terminal, Color, Prompt)
+        if (globalAliasSymbolMap.count(root)) {
+            const auto& sym = globalAliasSymbolMap[root];
+            if (!sym.members.empty()) {
+                addSymbols(sym.members);
+                return items;
+            }
+        }
+
+        // C. 檢查 root 是否為具名匯入中的類別 (import { Calculator } from "./calc")
+        for (const auto& imp : docImports) {
+            if (std::find(imp.namedSymbols.begin(), imp.namedSymbols.end(), root) != imp.namedSymbols.end()) {
+                ResolvedModule namedMod = resolveModule(uri, imp.modulePath);
+                for (const auto& sym : namedMod.symbols) {
+                    if (sym.name == root && !sym.members.empty()) {
+                        addSymbols(sym.members);
+                        return items;
+                    }
+                }
+            }
+        }
+
+        // D. 檢查是否為基礎型別或容器方法 (Array, String, Number, Map, Range, Bool, Nil)
+        InferredType inferred = inferTypeFromText(text, root);
+        auto builtinMembers = getMembersForType(inferred);
+        for (const auto& bm : builtinMembers) {
+            if (ac.memberFilter.empty() || bm.name.find(ac.memberFilter) != std::string::npos) {
+                addCompletion(items, bm.name, bm.isMethod ? 2 : 10, bm.signature, bm.doc);
+            }
+        }
+
+        return items;
+    }
+
+    // 4. 通用關鍵字補全
+    const char* keywords[] = {
+        "fn", "function", "class", "extends", "let", "const", "var",
+        "if", "else", "while", "for", "in", "break", "continue", "return",
+        "try", "catch", "finally", "throw", "import", "export", "from",
+        "new", "this", "super", "true", "false", "null", "nil"
+    };
+    for (const char* kw : keywords) {
+        addCompletion(items, kw, 14, "keyword", "");
+    }
+
+    // 5. 內建函式與標準命名空間
+    addCompletion(items, "print", 3, "print(value: any): void", "Prints value to stdout with newline.");
+    addCompletion(items, "println", 3, "println(value: any): void", "Prints value to stdout with newline.");
+    addCompletion(items, "assert", 3, "assert(condition: bool, message = ''): void", "Asserts condition is true.");
+    std::unordered_set<std::string> seenGlobalAliases;
+    for (const auto& [alias, sym] : globalAliasSymbolMap) {
+        if (seenGlobalAliases.insert(alias).second) {
+            addCompletion(items, alias, sym.kind, sym.signature, sym.doc);
+        }
+    }
+    for (const auto& [alias, modPath] : globalAliasModuleMap) {
+        if (seenGlobalAliases.insert(alias).second) {
+            std::string doc = "module " + modPath;
+            if (djsonModules.count(modPath) && !djsonModules[modPath].doc.empty()) {
+                doc = djsonModules[modPath].doc;
+            }
+            addCompletion(items, alias, 9, "module " + modPath, doc);
+        }
+    }
+
+    // 6. 加入所有已匯入的別名與具名符號
+    for (const auto& imp : docImports) {
+        if (!imp.alias.empty()) {
+            addCompletion(items, imp.alias, 9, "module " + imp.alias, "Imported from " + imp.modulePath);
+        }
+        for (const auto& sym : imp.namedSymbols) {
+            addCompletion(items, sym, 3, sym, "Imported from " + imp.modulePath);
+        }
+    }
+
+    // 7. 掃描當前文檔的所有識別字
+    Lexer lexer(text);
+    std::vector<std::string> seen;
+    while (true) {
+        Token tok = lexer.nextToken();
+        if (tok.type == TokenType::TOKEN_EOF) break;
+        if (tok.type == TokenType::IDENTIFIER) {
+            std::string idStr(tok.lexeme);
+            if (idStr.size() >= 2 && std::find(seen.begin(), seen.end(), idStr) == seen.end()) {
+                seen.push_back(idStr);
+                addCompletion(items, idStr, 6, "identifier");
+            }
+        }
+    }
+
+    return items;
+}
+
+// -----------------------------------------------------------------------------
+// 懸停資訊 (Hover Tooltips)
+// -----------------------------------------------------------------------------
+
+Json LspServer::handleHover(const std::string& uri, int line, int character) {
+    auto it = documents.find(uri);
+    std::string text = (it != documents.end()) ? it->second : "";
+    if (text.empty()) return Json();
+
+    std::vector<ImportInfo> docImports = parseDocumentImports(text);
+
+    // 1. 檢查游標是否停在 import 路徑字串上
+    for (const auto& imp : docImports) {
+        if (imp.line == line && character >= imp.pathColStart && character <= imp.pathColEnd) {
+            ResolvedModule mod = resolveModule(uri, imp.modulePath);
+            std::string doc = "### Module: `" + imp.modulePath + "`\n\n";
+            doc += mod.isStandard ? "**Type**: Standard Library Module\n\n" : "**Type**: Local EasyScript Module\n\n";
+            if (!mod.symbols.empty()) {
+                doc += "**Exports (" + std::to_string(mod.symbols.size()) + "):**\n\n";
+                for (const auto& s : mod.symbols) {
+                    doc += "- `" + s.signature + "`\n";
+                }
+            }
+            Json result = Json::object();
+            Json contents = Json::object();
+            contents["kind"] = "markdown";
+            contents["value"] = doc;
+            result["contents"] = contents;
+            return result;
+        }
+    }
+
+    WordContext ctx = getWordContext(text, line, character);
+    if (ctx.word.empty()) return Json();
+
+    // 2. 檢查游標是否在 `<alias>.<member>` 上的 member
+    if (!ctx.parentObject.empty()) {
+        for (const auto& imp : docImports) {
+            if (imp.alias == ctx.parentObject) {
+                ResolvedModule mod = resolveModule(uri, imp.modulePath);
+                for (const auto& s : mod.symbols) {
+                    if (s.name == ctx.word) {
+                        std::string doc = "```easyscript\n" + s.signature + "\n```\n\n";
+                        doc += "*From module `" + imp.modulePath + "`*\n\n";
+                        if (!s.doc.empty()) doc += s.doc + "\n";
+                        Json result = Json::object();
+                        Json contents = Json::object();
+                        contents["kind"] = "markdown";
+                        contents["value"] = doc;
+                        result["contents"] = contents;
+                        return result;
+                    }
+                }
+            }
+        }
+
+        // 檢查模組成員 (包含 globalAlias 與 import 模組，例如 fs.readText, sample_plugin.greet)
+        std::string modPath;
+        if (globalAliasModuleMap.count(ctx.parentObject)) {
+            modPath = globalAliasModuleMap[ctx.parentObject];
+        } else if (djsonModules.count(ctx.parentObject)) {
+            modPath = ctx.parentObject;
+        } else {
+            for (const auto& imp : docImports) {
+                if (imp.alias == ctx.parentObject || imp.modulePath == ctx.parentObject) {
+                    modPath = imp.modulePath;
+                    break;
+                }
+            }
+        }
+
+        if (!modPath.empty()) {
+            ResolvedModule mod = resolveModule(uri, modPath);
+            for (const auto& s : mod.symbols) {
+                if (s.name == ctx.word) {
+                    std::string doc = "```easyscript\n" + s.signature + "\n```\n\n";
+                    doc += "*From `" + modPath + "`*\n\n";
+                    if (!s.doc.empty()) doc += s.doc + "\n";
+                    Json result = Json::object();
+                    Json contents = Json::object();
+                    contents["kind"] = "markdown";
+                    contents["value"] = doc;
+                    result["contents"] = contents;
+                    return result;
+                }
+            }
+        }
+
+        // 檢查 parentObject 是否為全域別名類別 (例如 Terminal.clear, Color.red, Prompt.ask)
+        if (globalAliasSymbolMap.count(ctx.parentObject)) {
+            const auto& sym = globalAliasSymbolMap[ctx.parentObject];
+            for (const auto& m : sym.members) {
+                if (m.name == ctx.word) {
+                    std::string doc = "```easyscript\n" + m.signature + "\n```\n\n";
+                    doc += "*From `" + sym.name + "`*\n\n";
+                    if (!m.doc.empty()) doc += m.doc + "\n";
+                    Json result = Json::object();
+                    Json contents = Json::object();
+                    contents["kind"] = "markdown";
+                    contents["value"] = doc;
+                    result["contents"] = contents;
+                    return result;
+                }
+            }
+        }
+
+        // 檢查 parentObject 是否為基礎型別或容器 (例如 arr.map, str.lines, x.toFixed, map.entries)
+        InferredType inferred = inferTypeFromText(text, ctx.parentObject);
+        auto builtinMembers = getMembersForType(inferred);
+        for (const auto& bm : builtinMembers) {
+            if (bm.name == ctx.word) {
+                std::string doc = "```easyscript\n";
+                doc += (bm.isMethod ? "(method) " : "(property) ") + bm.typeName + ".prototype." + bm.signature + "\n```\n\n";
+                if (!bm.doc.empty()) doc += bm.doc + "\n";
+                Json result = Json::object();
+                Json contents = Json::object();
+                contents["kind"] = "markdown";
+                contents["value"] = doc;
+                result["contents"] = contents;
+                return result;
+            }
+        }
+    }
+
+    // 3. 檢查游標是否在具名匯入符號上 (import { foo } from "...")
+    for (const auto& imp : docImports) {
+        if (std::find(imp.namedSymbols.begin(), imp.namedSymbols.end(), ctx.word) != imp.namedSymbols.end()) {
+            ResolvedModule mod = resolveModule(uri, imp.modulePath);
+            for (const auto& s : mod.symbols) {
+                if (s.name == ctx.word) {
+                    std::string doc = "```easyscript\n" + s.signature + "\n```\n\n";
+                    doc += "*Imported from `" + imp.modulePath + "`*\n\n";
+                    if (!s.doc.empty()) doc += s.doc + "\n";
+                    Json result = Json::object();
+                    Json contents = Json::object();
+                    contents["kind"] = "markdown";
+                    contents["value"] = doc;
+                    result["contents"] = contents;
+                    return result;
+                }
+            }
+        }
+        if (imp.alias == ctx.word) {
+            std::string doc = "### Module `" + imp.alias + "`\n\nImported from `" + imp.modulePath + "`";
+            Json result = Json::object();
+            Json contents = Json::object();
+            contents["kind"] = "markdown";
+            contents["value"] = doc;
+            result["contents"] = contents;
+            return result;
+        }
+    }
+
+    // 4. 關鍵字與內建型別/函式 hover
+    std::string doc;
+    if (ctx.word == "fn" || ctx.word == "function") {
+        doc = "**fn** (keyword)\n\nDeclares a function in EasyScript.\n\n```easyscript\nfn add(a, b) {\n    return a + b;\n}\n```";
+    } else if (ctx.word == "class") {
+        doc = "**class** (keyword)\n\nDeclares an object-oriented class with fields and methods.\n\n```easyscript\nclass Greeter {\n    greet(name) {\n        print('Hello ' + name);\n    }\n}\n```";
+    } else if (ctx.word == "print" || ctx.word == "println") {
+        doc = "**print(value: any): void**\n\nBuilt-in function to print formatted string to standard output.";
+    } else if (ctx.word == "assert") {
+        doc = "**assert(condition: bool, message = ''): void**\n\nAsserts condition is true, throwing error otherwise.";
+    } else if (globalAliasSymbolMap.count(ctx.word)) {
+        const auto& sym = globalAliasSymbolMap[ctx.word];
+        doc = "**" + sym.signature + "**\n\n" + sym.doc;
+    } else if (globalAliasModuleMap.count(ctx.word)) {
+        std::string modPath = globalAliasModuleMap[ctx.word];
+        if (djsonModules.count(modPath)) {
+            const auto& m = djsonModules[modPath];
+            doc = "**module " + m.path + "**\n\n" + m.doc;
+        }
+    }
+
+    if (doc.empty()) {
+        const auto& all = getBuiltinMembers();
+        std::vector<const BuiltinMemberInfo*> matches;
+        for (const auto& bm : all) {
+            if (bm.name == ctx.word) {
+                matches.push_back(&bm);
+            }
+        }
+        if (!matches.empty()) {
+            doc = "```easyscript\n";
+            for (const auto* m : matches) {
+                doc += (m->isMethod ? "(method) " : "(property) ") + m->typeName + ".prototype." + m->signature + "\n";
+            }
+            doc += "```\n\n";
+            doc += matches[0]->doc + "\n";
+        }
+    }
+
+    if (doc.empty()) return Json();
+
+    Json result = Json::object();
+    Json contents = Json::object();
+    contents["kind"] = "markdown";
+    contents["value"] = doc;
+    result["contents"] = contents;
+    return result;
+}
+
+// -----------------------------------------------------------------------------
+// 參數簽名提示 (Signature Help)
+// -----------------------------------------------------------------------------
+
+Json LspServer::handleSignatureHelp(const std::string& uri, int line, int character) {
+    auto it = documents.find(uri);
+    std::string text = (it != documents.end()) ? it->second : "";
+    if (text.empty()) return Json();
+
+    std::string lineStr = getLineText(text, line);
+    if (character > static_cast<int>(lineStr.size())) character = static_cast<int>(lineStr.size());
+
+    // 搜尋左括號 '('
+    int p = character - 1;
+    int parenDepth = 0;
+    int commaCount = 0;
+    while (p >= 0) {
+        char c = lineStr[p];
+        if (c == ')') {
+            parenDepth++;
+        } else if (c == '(') {
+            if (parenDepth == 0) {
+                break;
+            }
+            parenDepth--;
+        } else if (c == ',' && parenDepth == 0) {
+            commaCount++;
+        }
+        p--;
+    }
+
+    if (p < 0 || lineStr[p] != '(') return Json();
+
+    p--;
+    while (p >= 0 && (lineStr[p] == ' ' || lineStr[p] == '\t')) p--;
+    int wordEnd = p + 1;
+    while (p >= 0 && (std::isalnum(static_cast<unsigned char>(lineStr[p])) || lineStr[p] == '_' || lineStr[p] == '$')) p--;
+    int wordStart = p + 1;
+    if (wordEnd <= wordStart) return Json();
+    std::string fnName = lineStr.substr(wordStart, wordEnd - wordStart);
+
+    // 檢查是否有 parentObject (例如 fs.readText( 或 Terminal.setCursor()
+    std::string parentObj;
+    int parentP = wordStart - 1;
+    while (parentP >= 0 && (lineStr[parentP] == ' ' || lineStr[parentP] == '\t')) parentP--;
+    if (parentP >= 0 && lineStr[parentP] == '.') {
+        parentP--;
+        while (parentP >= 0 && (lineStr[parentP] == ' ' || lineStr[parentP] == '\t')) parentP--;
+        int pEnd = parentP + 1;
+        while (parentP >= 0 && (std::isalnum(static_cast<unsigned char>(lineStr[parentP])) || lineStr[parentP] == '_' || lineStr[parentP] == '$')) parentP--;
+        int pStart = parentP + 1;
+        if (pEnd > pStart) {
+            parentObj = lineStr.substr(pStart, pEnd - pStart);
+        }
+    }
+
+    Json result = Json::object();
+    Json signatures = Json::array();
+
+    // 1. 檢查模組函式 (包含 globalAlias 與 import 模組)
+    std::string modPath;
+    if (!parentObj.empty()) {
+        if (globalAliasModuleMap.count(parentObj)) {
+            modPath = globalAliasModuleMap[parentObj];
+        } else if (djsonModules.count(parentObj)) {
+            modPath = parentObj;
+        } else {
+            std::vector<ImportInfo> docImports = parseDocumentImports(text);
+            for (const auto& imp : docImports) {
+                if (imp.alias == parentObj || imp.modulePath == parentObj) {
+                    modPath = imp.modulePath;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (!modPath.empty()) {
+        ResolvedModule mod = resolveModule(uri, modPath);
+        for (const auto& sym : mod.symbols) {
+            if (sym.name == fnName) {
+                Json sig = Json::object();
+                sig["label"] = sym.signature;
+                if (!sym.doc.empty()) {
+                    Json d = Json::object();
+                    d["kind"] = "markdown";
+                    d["value"] = sym.doc;
+                    sig["documentation"] = d;
+                }
+                Json pars = Json::array();
+                for (const auto& pName : sym.parameters) {
+                    Json pObj = Json::object();
+                    pObj["label"] = pName;
+                    pars.push_back(pObj);
+                }
+                sig["parameters"] = pars;
+                signatures.push_back(sig);
+            }
+        }
+    }
+
+    // 2. 檢查 globalAlias 類別方法
+    if (!parentObj.empty() && globalAliasSymbolMap.count(parentObj)) {
+        const auto& clsSym = globalAliasSymbolMap[parentObj];
+        for (const auto& mem : clsSym.members) {
+            if (mem.name == fnName) {
+                Json sig = Json::object();
+                sig["label"] = mem.signature;
+                if (!mem.doc.empty()) {
+                    Json d = Json::object();
+                    d["kind"] = "markdown";
+                    d["value"] = mem.doc;
+                    sig["documentation"] = d;
+                }
+                Json pars = Json::array();
+                for (const auto& pName : mem.parameters) {
+                    Json pObj = Json::object();
+                    pObj["label"] = pName;
+                    pars.push_back(pObj);
+                }
+                sig["parameters"] = pars;
+                signatures.push_back(sig);
+            }
+        }
+    }
+
+    // 3. 檢查基礎型別內建方法
+    const auto& allMembers = getBuiltinMembers();
+    for (const auto& bm : allMembers) {
+        if (bm.isMethod && bm.name == fnName) {
+            Json sig = Json::object();
+            sig["label"] = bm.signature;
+            if (!bm.doc.empty()) {
+                Json doc = Json::object();
+                doc["kind"] = "markdown";
+                doc["value"] = bm.doc;
+                sig["documentation"] = doc;
+            }
+            Json params = Json::array();
+            for (const auto& pName : bm.paramNames) {
+                Json paramObj = Json::object();
+                paramObj["label"] = pName;
+                params.push_back(paramObj);
+            }
+            sig["parameters"] = params;
+            signatures.push_back(sig);
+        }
+    }
+
+    if (signatures.arrVal.empty()) return Json();
+
+    result["signatures"] = signatures;
+    result["activeSignature"] = 0;
+    result["activeParameter"] = commaCount;
+    return result;
+}
+
+// -----------------------------------------------------------------------------
+// 文件符號大綱 (Document Symbols)
+// -----------------------------------------------------------------------------
+
+Json LspServer::handleDocumentSymbol(const std::string& uri) {
+    auto it = documents.find(uri);
+    std::string text = (it != documents.end()) ? it->second : "";
+
+    Json symbols = Json::array();
+    Lexer lexer(text);
+    Token prev;
+    while (true) {
+        Token tok = lexer.nextToken();
+        if (tok.type == TokenType::TOKEN_EOF) break;
+
+        if (tok.type == TokenType::IDENTIFIER) {
+            int kind = 0;
+            if (prev.type == TokenType::FN) {
+                kind = 12; // Function
+            } else if (prev.type == TokenType::CLASS) {
+                kind = 5; // Class
+            } else if (prev.type == TokenType::LET || prev.type == TokenType::CONST) {
+                kind = 13; // Variable
+            }
+
+            if (kind != 0) {
+                Json sym = Json::object();
+                sym["name"] = std::string(tok.lexeme);
+                sym["kind"] = kind;
+
+                Json range = Json::object();
+                Json start = Json::object();
+                start["line"] = std::max(0, tok.line - 1);
+                start["character"] = std::max(0, tok.column - 1);
+                Json end = Json::object();
+                end["line"] = std::max(0, tok.line - 1);
+                end["character"] = std::max(0, tok.column - 1 + static_cast<int>(tok.lexeme.size()));
+                range["start"] = start;
+                range["end"] = end;
+
+                sym["range"] = range;
+                sym["selectionRange"] = range;
+                symbols.push_back(sym);
+            }
+        }
+        prev = tok;
+    }
+
+    return symbols;
+}
+
+// -----------------------------------------------------------------------------
+// 跳轉至定義 (Go to Definition)
+// -----------------------------------------------------------------------------
+
+Json LspServer::handleDefinition(const std::string& uri, int line, int character) {
+    auto it = documents.find(uri);
+    std::string text = (it != documents.end()) ? it->second : "";
+    if (text.empty()) return Json();
+
+    std::vector<ImportInfo> docImports = parseDocumentImports(text);
+
+    // 1. 檢查游標是否在 import 路徑字串上 -> 跨檔案跳轉到模組檔案開頭
+    for (const auto& imp : docImports) {
+        if (imp.line == line && character >= imp.pathColStart && character <= imp.pathColEnd) {
+            ResolvedModule mod = resolveModule(uri, imp.modulePath);
+            if (!mod.targetUri.empty()) {
+                Json loc = Json::object();
+                loc["uri"] = mod.targetUri;
+                Json range = Json::object();
+                Json start = Json::object();
+                start["line"] = 0;
+                start["character"] = 0;
+                Json end = Json::object();
+                end["line"] = 0;
+                end["character"] = 0;
+                range["start"] = start;
+                range["end"] = end;
+                loc["range"] = range;
+                return loc;
+            }
+        }
+    }
+
+    WordContext ctx = getWordContext(text, line, character);
+    if (ctx.word.empty()) return Json();
+
+    // 2. 跨模組成員跳轉: <alias>.<member> -> 跳轉至模組內的宣告行
+    if (!ctx.parentObject.empty()) {
+        for (const auto& imp : docImports) {
+            if (imp.alias == ctx.parentObject) {
+                ResolvedModule mod = resolveModule(uri, imp.modulePath);
+                for (const auto& s : mod.symbols) {
+                    if (s.name == ctx.word && !s.sourceUri.empty()) {
+                        Json loc = Json::object();
+                        loc["uri"] = s.sourceUri;
+                        Json range = Json::object();
+                        Json start = Json::object();
+                        start["line"] = s.line;
+                        start["character"] = s.column;
+                        Json end = Json::object();
+                        end["line"] = s.line;
+                        end["character"] = s.column + s.length;
+                        range["start"] = start;
+                        range["end"] = end;
+                        loc["range"] = range;
+                        return loc;
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. 具名匯入跳轉: import { foo } from "./mod" -> 跳轉至模組內的宣告行
+    for (const auto& imp : docImports) {
+        if (std::find(imp.namedSymbols.begin(), imp.namedSymbols.end(), ctx.word) != imp.namedSymbols.end()) {
+            ResolvedModule mod = resolveModule(uri, imp.modulePath);
+            for (const auto& s : mod.symbols) {
+                if (s.name == ctx.word && !s.sourceUri.empty()) {
+                    Json loc = Json::object();
+                    loc["uri"] = s.sourceUri;
+                    Json range = Json::object();
+                    Json start = Json::object();
+                    start["line"] = s.line;
+                    start["character"] = s.column;
+                    Json end = Json::object();
+                    end["line"] = s.line;
+                    end["character"] = s.column + s.length;
+                    range["start"] = start;
+                    range["end"] = end;
+                    loc["range"] = range;
+                    return loc;
+                }
+            }
+        }
+    }
+
+    // 4. 當前文檔內的定義跳轉 (fn, class, let, const)
+    Lexer lexer(text);
+    Token prev;
+    while (true) {
+        Token tok = lexer.nextToken();
+        if (tok.type == TokenType::TOKEN_EOF) break;
+
+        if (tok.type == TokenType::IDENTIFIER && tok.lexeme == ctx.word) {
+            if (prev.type == TokenType::FN || prev.type == TokenType::CLASS ||
+                prev.type == TokenType::LET || prev.type == TokenType::CONST) {
+                Json loc = Json::object();
+                loc["uri"] = uri;
+                Json range = Json::object();
+                Json start = Json::object();
+                start["line"] = std::max(0, tok.line - 1);
+                start["character"] = std::max(0, tok.column - 1);
+                Json end = Json::object();
+                end["line"] = std::max(0, tok.line - 1);
+                end["character"] = std::max(0, tok.column - 1 + static_cast<int>(tok.lexeme.size()));
+                range["start"] = start;
+                range["end"] = end;
+                loc["range"] = range;
+                return loc;
+            }
+        }
+        prev = tok;
+    }
+
+    return Json();
+}
+
+// -----------------------------------------------------------------------------
+// 語意上色標記 (Semantic Tokens Highlighting)
+// -----------------------------------------------------------------------------
+
+struct RawTokenInfo {
+    int line;
+    int character;
+    int length;
+    int tokenType;
+    int tokenModifiers;
+};
+
+Json LspServer::handleSemanticTokens(const std::string& uri) {
+    auto it = documents.find(uri);
+    std::string text = (it != documents.end()) ? it->second : "";
+
+    std::vector<RawTokenInfo> rawTokens;
+    Lexer lexer(text);
+    std::vector<Token> allTokens;
+    while (true) {
+        Token tok = lexer.nextToken();
+        allTokens.push_back(tok);
+        if (tok.type == TokenType::TOKEN_EOF) break;
+    }
+
+    for (size_t i = 0; i < allTokens.size(); ++i) {
+        const Token& tok = allTokens[i];
+        if (tok.type == TokenType::TOKEN_EOF) break;
+
+        Token prevTok = (i > 0) ? allTokens[i - 1] : Token();
+        Token nextTok = (i + 1 < allTokens.size()) ? allTokens[i + 1] : Token();
+
+        // 1. 基礎型別 (type: 0)
+        if (tok.type == TokenType::TYPE_INT || tok.type == TokenType::TYPE_DOUBLE ||
+            tok.type == TokenType::TYPE_BOOL || tok.type == TokenType::TYPE_STRING ||
+            tok.type == TokenType::TYPE_MAP || tok.type == TokenType::TYPE_VOID) {
+            rawTokens.push_back({tok.line - 1, tok.column - 1, static_cast<int>(tok.lexeme.size()), 0, 0});
+        } else if (tok.type == TokenType::IDENTIFIER) {
+            if (tok.lexeme == "any" || tok.lexeme == "number" || tok.lexeme == "Array" || tok.lexeme == "Function") {
+                rawTokens.push_back({tok.line - 1, tok.column - 1, static_cast<int>(tok.lexeme.size()), 0, 0});
+            } else if (tok.lexeme == "Terminal" || tok.lexeme == "Color" || tok.lexeme == "Prompt" || tok.lexeme == "Math") {
+                // 標準庫類別/模組 (class: 1, defaultLibrary: 4)
+                rawTokens.push_back({tok.line - 1, tok.column - 1, static_cast<int>(tok.lexeme.size()), 1, 4});
+            } else if (prevTok.type == TokenType::FN) {
+                // 函式宣告 (function: 2, declaration: 1)
+                rawTokens.push_back({tok.line - 1, tok.column - 1, static_cast<int>(tok.lexeme.size()), 2, 1});
+            } else if (prevTok.type == TokenType::CLASS) {
+                // 類別宣告 (class: 1, declaration: 1)
+                rawTokens.push_back({tok.line - 1, tok.column - 1, static_cast<int>(tok.lexeme.size()), 1, 1});
+            } else if (prevTok.type == TokenType::LET) {
+                // 變數宣告 (variable: 3, declaration: 1)
+                rawTokens.push_back({tok.line - 1, tok.column - 1, static_cast<int>(tok.lexeme.size()), 3, 1});
+            } else if (prevTok.type == TokenType::CONST) {
+                // 常數宣告 (variable: 3, declaration | readonly: 3)
+                rawTokens.push_back({tok.line - 1, tok.column - 1, static_cast<int>(tok.lexeme.size()), 3, 3});
+            } else if (prevTok.type == TokenType::DOT) {
+                if (nextTok.type == TokenType::LEFT_PAREN) {
+                    // 內建方法調用 (function: 2, defaultLibrary: 4)
+                    int mod = isBuiltinMethod(tok.lexeme) ? 4 : 0;
+                    rawTokens.push_back({tok.line - 1, tok.column - 1, static_cast<int>(tok.lexeme.size()), 2, mod});
+                } else {
+                    // 內建屬性讀取 (property: 5, defaultLibrary: 4)
+                    int mod = isBuiltinProperty(tok.lexeme) ? 4 : 0;
+                    rawTokens.push_back({tok.line - 1, tok.column - 1, static_cast<int>(tok.lexeme.size()), 5, mod});
+                }
+            } else if (nextTok.type == TokenType::LEFT_PAREN) {
+                // 函式調用 (function: 2)
+                int mod = isBuiltinMethod(tok.lexeme) ? 4 : 0;
+                rawTokens.push_back({tok.line - 1, tok.column - 1, static_cast<int>(tok.lexeme.size()), 2, mod});
+            } else {
+                // 一般變數存取 (variable: 3)
+                rawTokens.push_back({tok.line - 1, tok.column - 1, static_cast<int>(tok.lexeme.size()), 3, 0});
+            }
+        }
+    }
+
+    // 依行與列遞增排序
+    std::sort(rawTokens.begin(), rawTokens.end(), [](const RawTokenInfo& a, const RawTokenInfo& b) {
+        if (a.line != b.line) return a.line < b.line;
+        return a.character < b.character;
+    });
+
+    // 轉換為 LSP 差量五元組 [deltaLine, deltaStartChar, length, tokenType, tokenModifiers]
+    Json data = Json::array();
+    int prevLine = 0;
+    int prevChar = 0;
+    for (const auto& item : rawTokens) {
+        int deltaLine = item.line - prevLine;
+        int deltaChar = (deltaLine == 0) ? (item.character - prevChar) : item.character;
+
+        data.push_back(Json(deltaLine));
+        data.push_back(Json(deltaChar));
+        data.push_back(Json(item.length));
+        data.push_back(Json(item.tokenType));
+        data.push_back(Json(item.tokenModifiers));
+
+        prevLine = item.line;
+        prevChar = item.character;
+    }
+
+    Json result = Json::object();
+    result["data"] = data;
+    return result;
+}
+
+} // namespace lsp

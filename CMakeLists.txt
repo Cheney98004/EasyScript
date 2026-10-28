@@ -98,8 +98,10 @@ add_custom_target(easyscript_test DEPENDS easyscript epm sample_plugin std_fs st
 # -----------------------------------------------------------------------------
 include(GNUInstallDirs)
 
-install(TARGETS easyscript epm
+install(TARGETS easyscript epm easyscript_core
     RUNTIME DESTINATION bin
+    ARCHIVE DESTINATION lib
+    LIBRARY DESTINATION lib
 )
 
 install(TARGETS sample_plugin std_fs std_path std_os std_math std_io

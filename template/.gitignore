@@ -1,0 +1,23 @@
+# Build directories
+build/
+bin/
+out/
+.cache/
+
+# Compiled dynamic libraries & objects
+*.dll
+*.so
+*.dylib
+*.o
+*.obj
+*.a
+*.lib
+
+# IDE & Editor settings
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# EasyScript package manager modules
+easy_modules/

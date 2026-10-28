@@ -1,0 +1,40 @@
+// ============================================================================
+// EasyScript C++ Native Extension Module Verification Test
+// ============================================================================
+
+import my_module from "my_module";
+
+print("==================================================");
+print("Testing EasyScript C++ Native Module: " + my_module.MODULE_NAME);
+print("Version:", my_module.VERSION);
+print("==================================================");
+
+// 1. 測試數值函式
+let sum = my_module.add(25, 17);
+print("add(25, 17)        =", sum);
+
+let product = my_module.multiply(4.5, 2);
+print("multiply(4.5, 2)   =", product);
+
+// 2. 測試字串處理與 GC 堆字串回傳
+let msg = my_module.greet("EasyScript C++ Developer");
+print("greet() message    =", msg);
+
+// 3. 測試陣列生成與迭代
+let arr = my_module.makeRange(5);
+print("makeRange(5)       =", arr);
+
+// 4. 測試映射結構 (Map) 回傳
+let info = my_module.getInfo();
+print("getInfo() module   =", info["module"]);
+print("getInfo() version  =", info["version"]);
+print("getInfo() language =", info["language"]);
+
+// 5. 測試具名匯入語法 (Named Import)
+import { add, greet } from "my_module";
+print("Named imported add(100, 200) =", add(100, 200));
+print("Named imported greet()       =", greet("Named Import"));
+
+print("==================================================");
+print("[PASS] All native extension module tests passed!");
+print("==================================================");

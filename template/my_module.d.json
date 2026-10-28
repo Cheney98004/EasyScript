@@ -1,0 +1,72 @@
+{
+  "module": "my_module",
+  "version": "1.0.0",
+  "doc": "Template C++ native extension library for EasyScript.",
+  "globalAlias": ["my_module"],
+  "symbols": [
+    {
+      "name": "add",
+      "kind": "function",
+      "signature": "add(a: int, b: int): int",
+      "doc": "Calculates the sum of two integers.",
+      "parameters": [
+        { "name": "a", "type": "int", "doc": "First integer" },
+        { "name": "b", "type": "int", "doc": "Second integer" }
+      ],
+      "returnType": "int"
+    },
+    {
+      "name": "multiply",
+      "kind": "function",
+      "signature": "multiply(a: number, b: number): number",
+      "doc": "Calculates the product of two numbers (integers or floats).",
+      "parameters": [
+        { "name": "a", "type": "number", "doc": "First number" },
+        { "name": "b", "type": "number", "doc": "Second number" }
+      ],
+      "returnType": "number"
+    },
+    {
+      "name": "greet",
+      "kind": "function",
+      "signature": "greet(name: string): string",
+      "doc": "Returns a friendly greeting message from C++.",
+      "parameters": [
+        { "name": "name", "type": "string", "doc": "Name of the person to greet" }
+      ],
+      "returnType": "string"
+    },
+    {
+      "name": "makeRange",
+      "kind": "function",
+      "signature": "makeRange(count: int): Array<int>",
+      "doc": "Generates an array of integers from 0 to count - 1.",
+      "parameters": [
+        { "name": "count", "type": "int", "doc": "Number of elements to generate" }
+      ],
+      "returnType": "Array<int>"
+    },
+    {
+      "name": "getInfo",
+      "kind": "function",
+      "signature": "getInfo(): Map",
+      "doc": "Returns a map containing module metadata information.",
+      "parameters": [],
+      "returnType": "Map"
+    },
+    {
+      "name": "VERSION",
+      "kind": "constant",
+      "signature": "const VERSION: int = 100",
+      "doc": "Module version constant (100 = v1.0.0).",
+      "returnType": "int"
+    },
+    {
+      "name": "MODULE_NAME",
+      "kind": "constant",
+      "signature": "const MODULE_NAME: string = \"my_module\"",
+      "doc": "Name of the native module.",
+      "returnType": "string"
+    }
+  ]
+}

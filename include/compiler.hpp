@@ -16,7 +16,7 @@
 // -----------------------------------------------------------------------------
 enum class Precedence : uint8_t {
     NONE,
-    ASSIGNMENT,     // = += -=
+    ASSIGNMENT,     // = += -= *= /= %=
     OR,             // ||
     AND,            // &&
     EQUALITY,       // == !=
